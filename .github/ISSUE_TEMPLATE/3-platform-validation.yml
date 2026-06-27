@@ -1,0 +1,85 @@
+name: Platform validation report (help wanted)
+description: Report results of running XBus on macOS, Linux, or a cross-user Windows setup — the gaps we most need help proving.
+title: "[Validation]: "
+labels: ["validation", "help wanted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        XBus is **Windows-first**. macOS and Linux are *implemented* (Unix socket +
+        mode-based hardening) but **not yet runtime-validated**, and the
+        **cross-user Windows** boundary is unverified (no second-account test
+        environment was available during development).
+
+        Running the test suite — or the two-session quickstart — on one of those
+        configurations and reporting what you see is **high-value** and directly
+        moves a roadmap item. Thank you.
+
+        Please keep the report body-free: no real paths, usernames, or message
+        contents.
+  - type: dropdown
+    id: target
+    attributes:
+      label: What did you validate?
+      options:
+        - macOS runtime
+        - Linux runtime
+        - Windows cross-user (two OS accounts)
+        - Other configuration (describe below)
+    validations:
+      required: true
+  - type: input
+    id: platform-detail
+    attributes:
+      label: Platform detail
+      description: Distro/OS version, architecture, and (for cross-user) the account topology.
+      placeholder: "e.g. Ubuntu 24.04 x86_64 / macOS 15 arm64 / Windows 11 with two standard users"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      placeholder: "e.g. v22.5.0"
+    validations:
+      required: true
+  - type: input
+    id: xbus-version
+    attributes:
+      label: XBus version
+      placeholder: "e.g. 0.1.0-beta.2 (xbus-p1-stp1-s5)"
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - Passed - everything worked
+        - Partial - some things worked, some failed
+        - Failed - did not work
+    validations:
+      required: true
+  - type: textarea
+    id: suite
+    attributes:
+      label: Test suite result
+      description: Output (or summary) of `npm test`. For Unix platforms, the socket + mode-hardening paths are the interesting part.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: observations
+    attributes:
+      label: Observations
+      description: What worked, what didn't, anything surprising. For cross-user Windows, especially - did the ACL boundary hold, and could a second user reach the data dir / pipe?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`xbus doctor --json` output"
+      description: Body-free environment snapshot. Double-check it has no private paths before posting.
+      render: shell
+    validations:
+      required: false

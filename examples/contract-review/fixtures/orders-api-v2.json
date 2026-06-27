@@ -1,0 +1,62 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Orders API", "version": "2.0.0" },
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "listOrders",
+        "parameters": [
+          { "name": "status", "in": "query", "required": false, "schema": { "type": "string", "enum": ["open", "shipped", "delivered", "cancelled"] } },
+          { "name": "limit", "in": "query", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "list of orders", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderPage" } } } } }
+      },
+      "post": {
+        "operationId": "createOrder",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderCreate" } } } },
+        "responses": { "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Order" } } } } }
+      }
+    },
+    "/orders/{id}": {
+      "get": {
+        "operationId": "getOrder",
+        "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ],
+        "responses": { "200": { "description": "an order", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Order" } } } } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Order": {
+        "type": "object",
+        "required": ["id", "state", "total", "currency", "customer_id"],
+        "properties": {
+          "id": { "type": "string" },
+          "state": { "type": "string", "enum": ["open", "shipped", "delivered", "cancelled"] },
+          "total": { "type": "object", "required": ["amount_minor", "currency"], "properties": { "amount_minor": { "type": "integer" }, "currency": { "type": "string" } } },
+          "currency": { "type": "string" },
+          "customer_id": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      },
+      "OrderCreate": {
+        "type": "object",
+        "required": ["total", "customer_id", "idempotency_key"],
+        "properties": {
+          "total": { "type": "object", "required": ["amount_minor", "currency"], "properties": { "amount_minor": { "type": "integer" }, "currency": { "type": "string" } } },
+          "customer_id": { "type": "string" },
+          "idempotency_key": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      },
+      "OrderPage": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Order" } },
+          "next_cursor": { "type": "string", "nullable": true }
+        }
+      }
+    }
+  }
+}

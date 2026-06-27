@@ -1,0 +1,61 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Orders API", "version": "1.4.0" },
+  "paths": {
+    "/orders": {
+      "get": {
+        "operationId": "listOrders",
+        "parameters": [
+          { "name": "status", "in": "query", "required": false, "schema": { "type": "string", "enum": ["open", "shipped", "cancelled"] } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50 } }
+        ],
+        "responses": { "200": { "description": "list of orders", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderList" } } } } }
+      },
+      "post": {
+        "operationId": "createOrder",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderCreate" } } } },
+        "responses": { "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Order" } } } } }
+      }
+    },
+    "/orders/{id}": {
+      "get": {
+        "operationId": "getOrder",
+        "parameters": [ { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } } ],
+        "responses": { "200": { "description": "an order", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Order" } } } } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Order": {
+        "type": "object",
+        "required": ["id", "status", "total_cents", "currency", "customer_id"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["open", "shipped", "cancelled"] },
+          "total_cents": { "type": "integer" },
+          "currency": { "type": "string" },
+          "customer_id": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      },
+      "OrderCreate": {
+        "type": "object",
+        "required": ["total_cents", "currency", "customer_id"],
+        "properties": {
+          "total_cents": { "type": "integer" },
+          "currency": { "type": "string" },
+          "customer_id": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      },
+      "OrderList": {
+        "type": "object",
+        "required": ["orders"],
+        "properties": {
+          "orders": { "type": "array", "items": { "$ref": "#/components/schemas/Order" } }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,382 @@
+/**
+ * Transactional, checksum-verified migrations. Each migration is applied inside
+ * a transaction and recorded with a checksum; a checksum mismatch on a
+ * previously-applied migration aborts startup (tamper / version drift).
+ *
+ * For the vertical slice this carries the minimum schema for the A→B→ack→reply
+ * flow plus the identity/fencing/sequence tables the design requires.
+ */
+import { createHash } from 'node:crypto';
+import type { SqliteDriver } from './connection.js';
+import { XBusError, XBusErrorCode } from '../protocol/errors.js';
+
+export interface Migration {
+  version: number;
+  name: string;
+  sql: string;
+}
+
+export const MIGRATIONS: readonly Migration[] = [
+  {
+    version: 1,
+    name: 'initial_schema',
+    sql: `
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+
+      CREATE TABLE fencing_counter (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+      INSERT INTO fencing_counter (id, value) VALUES (1, 0);
+
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        active_instance_id TEXT,
+        generation INTEGER NOT NULL DEFAULT 0,
+        high_water_generation INTEGER NOT NULL DEFAULT 0,
+        fencing_token INTEGER,
+        bound_connection_id TEXT,
+        automatic_alias TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        project_alias TEXT,
+        cwd TEXT NOT NULL,
+        repository_root TEXT,
+        repository_remote_hash TEXT,
+        claude_code_version TEXT,
+        xbus_version TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        receive_mode TEXT NOT NULL DEFAULT 'disconnected',
+        state TEXT NOT NULL,
+        lease_expires_at TEXT,
+        last_checkpoint_at TEXT,
+        connected_at TEXT,
+        disconnected_at TEXT,
+        last_seen_at TEXT NOT NULL,
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE session_instances (
+        instance_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        process_id INTEGER NOT NULL,
+        broker_instance_id TEXT NOT NULL,
+        connection_id TEXT,
+        read_ceiling_seq INTEGER,
+        connected_at TEXT NOT NULL,
+        disconnected_at TEXT,
+        last_seen_at TEXT NOT NULL,
+        state TEXT NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+      );
+      CREATE INDEX idx_instances_session ON session_instances(session_id, generation);
+
+      CREATE TABLE aliases (
+        alias_id TEXT PRIMARY KEY,
+        alias TEXT NOT NULL,
+        alias_ci TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        project_id TEXT,
+        session_id TEXT NOT NULL,
+        active INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        retired_at TEXT,
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+      );
+      CREATE UNIQUE INDEX ux_alias_global ON aliases(alias_ci) WHERE scope='global' AND active=1;
+      CREATE UNIQUE INDEX ux_alias_project ON aliases(project_id, alias_ci) WHERE scope='project' AND active=1;
+
+      CREATE TABLE recipient_sequences (
+        recipient_session_id TEXT PRIMARY KEY,
+        next_sequence INTEGER NOT NULL,
+        FOREIGN KEY(recipient_session_id) REFERENCES sessions(session_id)
+      );
+
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY,
+        protocol_version INTEGER NOT NULL,
+        sender_session_id TEXT NOT NULL,
+        sender_alias TEXT NOT NULL,
+        recipient_session_id TEXT NOT NULL,
+        recipient_alias TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        causation_id TEXT,
+        parent_message_id TEXT,
+        recipient_sequence INTEGER NOT NULL,
+        idempotency_key TEXT,
+        body_text TEXT NOT NULL,
+        body_hash TEXT NOT NULL,
+        metadata_json TEXT,
+        requires_ack INTEGER NOT NULL,
+        requires_reply INTEGER NOT NULL,
+        not_before TEXT,
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        trace_id TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX ux_idem ON messages(sender_session_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+      CREATE UNIQUE INDEX ux_recipseq ON messages(recipient_session_id, recipient_sequence);
+      CREATE INDEX idx_msg_recipient ON messages(recipient_session_id);
+      CREATE INDEX idx_msg_correlation ON messages(correlation_id);
+
+      CREATE TABLE deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        recipient_session_id TEXT NOT NULL,
+        target_instance_id TEXT,
+        target_generation INTEGER,
+        fencing_token INTEGER,
+        delivery_attempt INTEGER NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL,
+        rejected_reason TEXT,
+        lease_acquired_at TEXT,
+        lease_expires_at TEXT,
+        transport_written_at TEXT,
+        application_accepted_at TEXT,
+        application_completed_at TEXT,
+        next_attempt_at TEXT,
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(message_id) REFERENCES messages(message_id)
+      );
+      CREATE INDEX idx_deliveries_state ON deliveries(state, next_attempt_at);
+      CREATE INDEX idx_deliveries_message ON deliveries(message_id);
+      CREATE INDEX idx_deliveries_recipient ON deliveries(recipient_session_id, state);
+
+      CREATE TABLE receipts (
+        receipt_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        receiver_session_id TEXT NOT NULL,
+        receiver_instance_id TEXT NOT NULL,
+        receiver_generation INTEGER NOT NULL,
+        receipt_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        note TEXT,
+        body_hash TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(message_id, receiver_session_id, receipt_type),
+        FOREIGN KEY(message_id) REFERENCES messages(message_id)
+      );
+
+      CREATE TABLE transport_write_log (
+        write_id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        recipient_instance_id TEXT,
+        attempt INTEGER NOT NULL,
+        bytes_written INTEGER NOT NULL,
+        ts TEXT NOT NULL
+      );
+      CREATE INDEX idx_write_log_delivery ON transport_write_log(delivery_id, attempt);
+
+      CREATE TABLE audit_events (
+        audit_id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        actor_session_id TEXT,
+        actor_instance_id TEXT,
+        message_id TEXT,
+        trace_id TEXT,
+        safe_metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_audit_ts ON audit_events(created_at);
+      CREATE INDEX idx_audit_message ON audit_events(message_id);
+    `,
+  },
+  {
+    version: 2,
+    name: 'component_epoch_identity',
+    sql: `
+      -- ADR 0003: explicit LogicalSession / SessionEpoch / ComponentInstance.
+      CREATE TABLE session_epochs (
+        session_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        epoch_token_hash TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        superseded_at TEXT,
+        supersede_reason TEXT,
+        PRIMARY KEY (session_id, epoch)
+      );
+
+      CREATE TABLE component_instances (
+        component_instance_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        process_id INTEGER NOT NULL,
+        connection_id TEXT,
+        build_id TEXT,
+        capabilities_json TEXT NOT NULL,
+        connected_at TEXT NOT NULL,
+        disconnected_at TEXT,
+        last_seen_at TEXT NOT NULL,
+        state TEXT NOT NULL
+      );
+      CREATE INDEX idx_components_session ON component_instances(session_id, epoch, role);
+      CREATE INDEX idx_components_conn ON component_instances(connection_id);
+
+      -- One-time receipt capability per context injection (ADR 0003 §3).
+      CREATE TABLE context_injections (
+        injection_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        recipient_session_id TEXT NOT NULL,
+        recipient_epoch INTEGER NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        injected_by_component_id TEXT NOT NULL,
+        receipt_capability_hash TEXT NOT NULL,
+        injected_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_op TEXT,
+        FOREIGN KEY(message_id) REFERENCES messages(message_id)
+      );
+      CREATE INDEX idx_injections_message ON context_injections(message_id);
+      CREATE UNIQUE INDEX ux_injection_cap ON context_injections(receipt_capability_hash);
+      -- replay guard: at most one injection row per (message, checkpoint)
+      CREATE UNIQUE INDEX ux_injection_checkpoint ON context_injections(message_id, checkpoint_id);
+
+      -- active epoch on sessions (reframes 'generation').
+      ALTER TABLE sessions ADD COLUMN active_epoch INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
+  {
+    version: 3,
+    name: 'scheduling_controls',
+    sql: `
+      -- ADR 0005: people-facing receipt controls.
+      CREATE TABLE session_controls (
+        session_id TEXT PRIMARY KEY,
+        receiving INTEGER NOT NULL DEFAULT 1,
+        paused_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE blocked_peers (
+        id TEXT PRIMARY KEY,
+        owner_session_id TEXT NOT NULL,
+        blocked_alias_ci TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(owner_session_id, blocked_alias_ci)
+      );
+      CREATE INDEX idx_blocked_owner ON blocked_peers(owner_session_id);
+    `,
+  },
+  {
+    version: 4,
+    name: 'injection_ledger_uniqueness',
+    sql: `
+      -- Reliability contract §6: the duplicate boundary is CONTEXT INJECTION, not
+      -- a DB row. One effective injection per (message, recipient_epoch) unless an
+      -- explicit redelivery policy bumps logical_injection_number.
+      ALTER TABLE context_injections ADD COLUMN logical_injection_number INTEGER NOT NULL DEFAULT 1;
+      CREATE UNIQUE INDEX ux_injection_logical ON context_injections(message_id, recipient_epoch, logical_injection_number);
+      -- Per-category attempt counters (transport / context-injection / ack-timeout / reply-delivery).
+      ALTER TABLE deliveries ADD COLUMN attempt_transport INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE deliveries ADD COLUMN attempt_injection INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE deliveries ADD COLUMN attempt_ack_timeout INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE deliveries ADD COLUMN attempt_reply INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE deliveries ADD COLUMN failure_category TEXT;
+      ALTER TABLE deliveries ADD COLUMN paused_accum_ms INTEGER NOT NULL DEFAULT 0;
+      -- Delivery leases (reliability contract §8): at most one eligible injection
+      -- lease per delivery at a time.
+      CREATE TABLE delivery_leases (
+        lease_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        recipient_session_id TEXT NOT NULL,
+        recipient_epoch INTEGER NOT NULL,
+        component_role TEXT NOT NULL,
+        component_instance_id TEXT NOT NULL,
+        lease_generation INTEGER NOT NULL,
+        operation TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT,
+        state TEXT NOT NULL DEFAULT 'held'
+      );
+      CREATE UNIQUE INDEX ux_lease_active ON delivery_leases(delivery_id) WHERE state='held';
+      CREATE INDEX idx_lease_expiry ON delivery_leases(state, expires_at);
+    `,
+  },
+  {
+    version: 5,
+    name: 'session_readiness',
+    sql: `
+      -- §2: explicit session readiness, SEPARATE from connection state + receive
+      -- mode. A registered-but-initializing session must not be injected a request
+      -- it cannot yet acknowledge. Default 'initializing' until an explicit signal.
+      ALTER TABLE sessions ADD COLUMN readiness TEXT NOT NULL DEFAULT 'initializing';
+      ALTER TABLE sessions ADD COLUMN readiness_updated_at TEXT;
+    `,
+  },
+];
+
+function checksum(sql: string): string {
+  return createHash('sha256').update(sql.replace(/\s+/g, ' ').trim(), 'utf8').digest('hex');
+}
+
+export interface MigrationResult {
+  appliedNow: number[];
+  currentVersion: number;
+}
+
+/** Apply pending migrations; verify checksums of already-applied ones. */
+export function runMigrations(db: SqliteDriver, nowIso: string): MigrationResult {
+  // Bootstrap: does schema_migrations exist?
+  const hasTable = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'`)
+    .get();
+
+  const applied = new Map<number, string>();
+  if (hasTable) {
+    for (const row of db.prepare('SELECT version, checksum FROM schema_migrations').all() as Array<{
+      version: number;
+      checksum: string;
+    }>) {
+      applied.set(row.version, row.checksum);
+    }
+  }
+
+  // Downgrade guard (§8 rollback case): the DB must NOT carry a schema version
+  // newer than this code knows. Running old code against a database an upgraded
+  // build already migrated forward risks silent corruption — fail closed and
+  // direct the user to the matching (or newer) build.
+  const codeMaxVersion = MIGRATIONS.reduce((mx, m) => Math.max(mx, m.version), 0);
+  const dbMaxVersion = applied.size > 0 ? Math.max(...applied.keys()) : 0;
+  if (dbMaxVersion > codeMaxVersion) {
+    throw new XBusError(XBusErrorCode.DATABASE_ERROR, 'database schema is newer than this XBus build; upgrade XBus or restore a compatible data directory', {
+      dbVersion: dbMaxVersion,
+      codeVersion: codeMaxVersion,
+    });
+  }
+
+  const appliedNow: number[] = [];
+  for (const m of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
+    const cs = checksum(m.sql);
+    if (applied.has(m.version)) {
+      if (applied.get(m.version) !== cs) {
+        throw new XBusError(XBusErrorCode.DATABASE_ERROR, 'migration checksum mismatch', {
+          version: m.version,
+        });
+      }
+      continue;
+    }
+    db.transaction(() => {
+      db.exec(m.sql);
+      db.prepare(
+        'INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)',
+      ).run(m.version, m.name, cs, nowIso);
+    });
+    appliedNow.push(m.version);
+  }
+
+  const current = (db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number | null }).v ?? 0;
+  return { appliedNow, currentVersion: current };
+}

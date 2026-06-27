@@ -1,0 +1,26 @@
+# Pin line endings so a checkout is byte-stable across platforms and
+# core.autocrlf settings (the package-lock checksum differed only by CRLF between
+# the source tree and a fresh clone with autocrlf=true). Text files are normalized
+# to LF in the repository and on checkout; this makes raw-file checksums (and thus
+# reproducible-build comparisons) deterministic.
+* text=auto eol=lf
+
+# Explicit: source, config, docs, lockfiles → LF.
+*.ts   text eol=lf
+*.js   text eol=lf
+*.cjs  text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Windows shims that genuinely need CRLF.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# Binary (never normalize).
+*.sqlite binary
+*.png    binary
+*.secret binary

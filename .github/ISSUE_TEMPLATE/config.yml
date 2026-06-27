@@ -1,0 +1,19 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/Kumaraman110/XBus/security/policy
+    about: >-
+      Do NOT open a public issue for security problems. XBUS-STP is internally
+      reviewed but not independently audited; please report privately per
+      SECURITY.md so it can be triaged before disclosure.
+  - name: Questions & discussion
+    url: https://github.com/Kumaraman110/XBus/discussions
+    about: >-
+      Usage questions, design discussion, "is this a bug or a known preview
+      limitation?", and protocol/threat-model review conversations. Open a
+      Discussion before filing a bug if you're unsure.
+  - name: Honest limitations & roadmap
+    url: https://github.com/Kumaraman110/XBus/blob/main/docs/roadmap.md
+    about: >-
+      Before requesting a feature, check what's a deliberate non-goal
+      (same-machine only, not a malware sandbox, not exactly-once execution).

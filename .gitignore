@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+*.log
+.xbus-test-home/
+.xbus-spike-home/
+coverage/
+*.sqlite
+*.sqlite-*
+*.tsbuildinfo
+spike/hooks/inbox/
+spike/hooks/*-ctr-*.txt
+spike/**/broker-store.json
+provenance.json
+
+# Private content-scan denylist — maintainer/CI only, NEVER committed to the public repo.
+.xbus-scan-denylist.json

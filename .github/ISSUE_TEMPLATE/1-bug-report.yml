@@ -1,0 +1,120 @@
+name: Bug report
+description: Report something in XBus that behaves incorrectly or crashes.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        **Before you start:** XBus is a Public Developer Preview — Windows-first,
+        same-machine / same-user, Bedrock = checkpoint delivery. Some behaviors
+        you might consider bugs are documented limitations; please skim the
+        [README "Honest limitations"](https://github.com/Kumaraman110/XBus#honest-limitations-read-these)
+        and [docs/delivery-semantics.md](https://github.com/Kumaraman110/XBus/blob/main/docs/delivery-semantics.md)
+        first.
+
+        **Do not report security vulnerabilities here.** Use the private
+        process in [SECURITY.md](https://github.com/Kumaraman110/XBus/blob/main/SECURITY.md).
+
+        **Do not paste secrets, real file paths, usernames, or message bodies.**
+        XBus is body-free in its operational surface; please keep your report that way too.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I read the README "Honest limitations" and this is not a documented preview limitation.
+          required: true
+        - label: This is a bug report, not a security vulnerability (those go to SECURITY.md).
+          required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: Which OS are you running XBus on?
+      options:
+        - Windows 10
+        - Windows 11
+        - macOS (note - not yet runtime-validated)
+        - Linux (note - not yet runtime-validated)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Claude Code provider
+      description: How is Claude Code authenticated? This affects delivery mode (Bedrock = checkpoint, no idle-wake).
+      options:
+        - Amazon Bedrock (CLAUDE_CODE_USE_BEDROCK=1)
+        - Anthropic API key / claude.ai (Console)
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: xbus-version
+    attributes:
+      label: XBus version
+      description: Output of `xbus version` (or the release tag, e.g. v0.1.0-beta.2). Include the compatibilityId if you have it.
+      placeholder: "e.g. 0.1.0-beta.2 (xbus-p1-stp1-s5)"
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`. XBus requires >=22.5 for the node:sqlite built-in.
+      placeholder: "e.g. v22.5.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-mode
+    attributes:
+      label: How are you running XBus?
+      options:
+        - From source (npm run build, no install)
+        - Installed package (xbus install)
+        - Isolated-profile trial (XBUS_DATA_DIR set to a temp dir)
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact, minimal steps. The two-session quickstart commands are a good template. Redact any real identifiers.
+      placeholder: |
+        1. xbus start; xbus doctor (output: ...)
+        2. Terminal A: xclaude; xbus_register { "alias": "architect" }
+        3. Terminal B: xclaude; xbus_register { "alias": "implementer" }
+        4. A: xbus_send { "to": "implementer", "text": "<redacted>", "requiresAck": true }
+        5. Observed: ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`xbus doctor --json` output"
+      description: Paste the output of `xbus doctor --json`. It is body-free, but double-check it contains no private paths before posting. This is auto-formatted - no backticks needed.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / error output
+      description: Any error text or operational metrics. Keep it body-free and free of real paths/usernames.
+      render: shell
+    validations:
+      required: false

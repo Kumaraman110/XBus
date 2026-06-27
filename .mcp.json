@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "xbus": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/channel/server.js"]
+    }
+  }
+}

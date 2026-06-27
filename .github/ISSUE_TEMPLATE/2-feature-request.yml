@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest an enhancement or new capability for XBus.
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. To keep the preview honest and focused, please check
+        the proposal against the project's stated direction first:
+
+        - [Roadmap](https://github.com/Kumaraman110/XBus/blob/main/docs/roadmap.md)
+          (what's next + what we're requesting review of)
+        - The roadmap's **Non-goals** — XBus is deliberately **same-machine** (no
+          cross-machine/networked bus), it is **not** a sandbox against malware
+          running as your own user, and it does **not** target exactly-once
+          *execution*. Requests in those directions will likely be declined and
+          closed with a pointer here, so it's worth reading first.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues / discussions and this is not a duplicate.
+          required: true
+        - label: I read the roadmap "Non-goals" and this request is not one of them (same-machine only, not a malware sandbox, not exactly-once execution).
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that XBus makes hard or impossible today? Describe the use case, not just the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like XBus to do. If it touches the protocol, schema, or MCP tool surface, say so — those are pre-1.0 and change deliberately.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why they fall short.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of XBus does this touch?
+      multiple: true
+      options:
+        - Broker / routing / scheduling
+        - Delivery semantics / dedup / readiness
+        - XBUS-STP secure transport
+        - MCP tools (xbus_*)
+        - CLI / launcher (xbus / xclaude)
+        - Checkpoint hook / providers / delivery modes
+        - Install / packaging / upgrade
+        - Observability / metrics
+        - Docs
+        - Other
+    validations:
+      required: false

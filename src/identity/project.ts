@@ -1,0 +1,48 @@
+/**
+ * Project identity. A stable id for the canonical working directory (or its git
+ * repository root). cwd is metadata, not a security identity (sender identity
+ * always comes from the authenticated connection).
+ */
+import { createHash } from 'node:crypto';
+import path from 'node:path';
+import fs from 'node:fs';
+import { safeRemoteHashInput } from '../observability/redaction.js';
+
+/** Canonicalize a path: resolve, normalize separators, lowercase drive on win32. */
+export function canonicalizePath(p: string): string {
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync.native(p);
+  } catch {
+    resolved = path.resolve(p);
+  }
+  if (process.platform === 'win32') {
+    // Normalize drive-letter casing and separators.
+    resolved = resolved.replace(/\\/g, '/');
+    resolved = resolved.replace(/^([a-zA-Z]):/, (_m, d: string) => `${d.toLowerCase()}:`);
+  }
+  return resolved;
+}
+
+/** Find the git repo root for a directory, if any (walk up looking for .git). */
+export function findRepositoryRoot(cwd: string): string | undefined {
+  let dir = canonicalizePath(cwd);
+  for (let i = 0; i < 64; i++) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/** Stable project id = sha256 of the repo root (if any) else the canonical cwd. */
+export function computeProjectId(cwd: string): string {
+  const root = findRepositoryRoot(cwd) ?? canonicalizePath(cwd);
+  return 'proj-' + createHash('sha256').update(root, 'utf8').digest('hex').slice(0, 16);
+}
+
+/** Hash a git remote URL with credentials stripped (never store raw remote). */
+export function repositoryRemoteHash(remoteUrl: string): string {
+  return createHash('sha256').update(safeRemoteHashInput(remoteUrl), 'utf8').digest('hex').slice(0, 16);
+}
