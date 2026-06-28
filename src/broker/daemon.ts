@@ -23,7 +23,8 @@ import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../ide
 import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
-import { evaluateRegistration, type AdapterRegistration } from '../adapter-broker/enforce.js';
+import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
+import { TrustedEvidenceRegistry } from '../adapter-broker/trusted-evidence.js';
 import type { AwardedSupport } from '../adapter/evidence.js';
 
 export interface DaemonOptions {
@@ -57,8 +58,15 @@ export class BrokerDaemon {
   private readonly reaperIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
-  /** In-memory awarded support per connection (adapter-aware registrations only; never persisted). */
+  /** In-memory awarded support per connection (adapter-aware registrations only; never persisted).
+   *  This is REGISTRATION-AWARD state: it records what the broker awarded at register time and is
+   *  consulted at register time to enforce the requested receive mode. It is NOT yet an
+   *  authorization gate for later operations (progress/streaming/live delivery); PR3 may consume
+   *  it in the Claude adapter path after separate authorization. */
   private connAwarded = new Map<string, AwardedSupport>();
+  /** Broker-OWNED trusted-evidence registry. Adapter frames can neither read nor write it;
+   *  only broker validation code records into it. In-memory only (no persistence). */
+  private readonly trustedEvidence = new TrustedEvidenceRegistry();
   private readonly authSecret: string | undefined;
   private readonly rootSecret: Buffer | undefined;
   private readonly serverTuning: Pick<DaemonOptions, 'maxConnections' | 'idleTimeoutMs' | 'globalBufferBudgetBytes' | 'connectRatePerSec' | 'handshakeTimeoutMs'>;
@@ -282,14 +290,29 @@ export class BrokerDaemon {
 
   private onRegister(conn: ServerConn, frame: Frame): void {
     if (!this.connHello.has(conn.id)) throw new XBusError(XBusErrorCode.AUTH_FAILED, 'hello required before register');
-    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistration };
+    // Clear any prior award at the START of every registration attempt, so a stale
+    // award can never survive a re-registration (adapter-aware → legacy, high → low,
+    // success → failed, identity change). A new award is set only on full success.
+    this.connAwarded.delete(conn.id);
+    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
     const role = p.role && isComponentRole(p.role) ? p.role : ComponentRole.MCP;
-    // OPT-IN adapter enforcement: engages ONLY when explicit structured adapter
-    // metadata is present. A legacy beta.2 registration (no adapterRegistration)
-    // takes a pure no-op path — evaluateRegistration returns null and nothing changes.
-    // May throw PROTOCOL_VIOLATION if an adapter over-claims a receive mode. Computed
-    // BEFORE store.register so an over-claim never persists a session.
-    const enforcement = evaluateRegistration(p.receiveMode, p.adapterRegistration);
+    // OPT-IN adapter enforcement. The adapter frame carries ONLY an untrusted
+    // DECLARATION (id/version/role/declaredCapabilities). The TRUSTED evidence used to
+    // verify those declarations is BROKER-OWNED — resolved from this.trustedEvidence by
+    // exact adapter identity, never deserialized from the frame. A legacy beta.2
+    // registration (no adapterRegistration) takes a pure no-op path. May throw
+    // PROTOCOL_VIOLATION/FORBIDDEN_ROLE; computed BEFORE store.register so a rejected
+    // adapter-aware registration never persists a session.
+    const declaration = p.adapterRegistration;
+    const resolved = declaration
+      ? this.trustedEvidence.resolve({ adapterId: declaration.adapterId, adapterVersion: declaration.adapterVersion, role: declaration.role, ...(declaration.buildId !== undefined ? { buildId: declaration.buildId } : {}) })
+      : undefined;
+    const enforcement = evaluateRegistration({
+      receiveMode: p.receiveMode,
+      declaration,
+      authority: { role, sessionId: p.sessionId },
+      trustedEvidence: resolved?.ok ? resolved.evidence : undefined,
+    });
     const auth = this.store.register({
       sessionId: p.sessionId,
       instanceId: p.instanceId,
@@ -537,6 +560,17 @@ export class BrokerDaemon {
 
   /** Build the body-free metrics snapshot (on-read snapshot queries + collector
    *  counters). Public so the host/doctor path can embed it. */
+  /**
+   * Record broker-OWNED trusted evidence for an adapter identity. This is the ONLY way
+   * the registration path obtains verified evidence; it is called by broker-owned
+   * validation code (the conformance runner under broker control, a real-runtime
+   * validator, or a policy step) — NEVER from an adapter registration frame. In-memory
+   * only; no persistence.
+   */
+  recordTrustedEvidence(ev: Parameters<TrustedEvidenceRegistry['record']>[0]): void {
+    this.trustedEvidence.record(ev);
+  }
+
   metricsSnapshot(): MetricsSnapshot {
     const g = this.ipc?.gauges() ?? { activeConnections: 0, maxConnections: 0, bufferBytesInUse: 0, bufferBudgetBytes: 0 };
     const deliveriesByState = this.countBy(

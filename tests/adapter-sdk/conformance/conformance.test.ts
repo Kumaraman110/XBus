@@ -185,18 +185,33 @@ describe('Conformance — Resilience (C20, C22) + shutdown (C24) + packaging (C2
   });
 });
 
-describe('Conformance — end-to-end broker award via evaluateRegistration', () => {
-  it('a confirmed checkpoint adapter is awarded T3/conformance_tested through the broker path', () => {
+describe('Conformance — end-to-end broker award via evaluateRegistration (trust-boundary model)', () => {
+  it('a confirmed checkpoint adapter is awarded T3/conformance_tested when BROKER-OWNED evidence exists', () => {
     const adapter = new SampleCheckpointAdapter();
-    const result = evaluateRegistration('hook_checkpoint', {
-      adapterId: adapter.manifest().adapter.id, adapterVersion: '0.0.1', role: ComponentRole.HOOK,
-      declaredCapabilities: adapter.manifest().declaredCapabilities,
-      evidenceSource: 'fake_runtime',
-      evidence: { bootedAndRegistered: true, sendVerified: true, manualReceiveVerified: true, checkpointReceiveVerified: true, ackReplyVerified: true },
-      structuredEvidence: { ...emptyStructuredEvidence(adapter.manifest().adapter.id, '0.0.1'), source: 'fake_runtime' },
-      fullConformancePassed: true,
+    const id = adapter.manifest().adapter.id;
+    // BROKER-OWNED evidence (the conformance runner records this; the adapter cannot).
+    const result = evaluateRegistration({
+      receiveMode: 'hook_checkpoint',
+      declaration: { adapterId: id, adapterVersion: '0.0.1', role: ComponentRole.HOOK, declaredCapabilities: adapter.manifest().declaredCapabilities },
+      authority: { role: ComponentRole.HOOK, sessionId: 's-1' },
+      trustedEvidence: {
+        source: 'conformance_runner', adapterId: id, adapterVersion: '0.0.1', role: ComponentRole.HOOK,
+        capabilities: { sendVerified: true, manualReceiveVerified: true, checkpointReceiveVerified: true, liveReceiveVerified: false, ackReplyVerified: true },
+        durability: { brokerRestartVerified: false, reconnectVerified: false, queuedDeliveryVerified: false },
+        security: { fencingVerified: false, redactionVerified: false, packagedRuntimeVerified: false },
+        conformanceVersion: 1,
+      },
     })!;
     expect(result.awarded.maximumDeliveryTier).toBe('T3');
     expect(result.awarded.validationLevel).toBe('conformance_tested');
+  });
+  it('the SAME adapter WITHOUT broker evidence is rejected (no self-award)', () => {
+    const adapter = new SampleCheckpointAdapter();
+    expect(() => evaluateRegistration({
+      receiveMode: 'hook_checkpoint',
+      declaration: { adapterId: adapter.manifest().adapter.id, adapterVersion: '0.0.1', role: ComponentRole.HOOK, declaredCapabilities: adapter.manifest().declaredCapabilities },
+      authority: { role: ComponentRole.HOOK, sessionId: 's-1' },
+      trustedEvidence: undefined,
+    })).toThrow(/no broker-owned evidence/);
   });
 });
