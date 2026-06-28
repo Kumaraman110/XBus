@@ -17,11 +17,13 @@ export default defineConfig({
     // never reported as passed when skipped (see tests/README).
     exclude: ['node_modules/**', 'dist/**', 'spike/**', 'tests/e2e/live/**'],
     // A real Windows install copies the full plugin (hundreds of files) + per-file
-    // checksum verification + icacls hardening — ~15-20s. Integration beforeEach hooks
-    // that install need headroom above that; bumped from 15s so a genuine install in a
-    // hook is never a false "hook timed out".
-    testTimeout: 45000,
-    hookTimeout: 45000,
+    // checksum verification + icacls hardening. On a fast host that is ~15-20s, but on
+    // a slow/contended runner or a deep temp path it has been observed at 60-90s. The
+    // timeout must clear the SLOW case or install-heavy tests flake — verified on a
+    // portable Node 22/24 runner where 45s flaked but 120s passes 382/382. Set well
+    // above the worst observed install so a genuine install is never a false timeout.
+    testTimeout: 120000,
+    hookTimeout: 120000,
     // Integration/IPC/e2e tests touch real sockets, SQLite, and spawn child
     // processes. Use the forks pool (real child processes) so process.execPath
     // and child spawning behave correctly; single-fork to avoid pipe/db
