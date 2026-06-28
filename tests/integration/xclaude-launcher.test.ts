@@ -109,4 +109,32 @@ describe('xclaude launcher (compiled entry)', () => {
     // The launcher's announced args contain only --plugin-dir + user args.
     expect(r.out).not.toMatch(/root\.secret/);
   });
+
+  it('§6 ADVERSARIAL: with require-fake set and NO CLAUDE_CODE_EXECPATH, the launcher FAILS CLOSED before spawning claude', () => {
+    // Simulate "a real claude exists on PATH": put a fake `claude` on a PATH dir, but
+    // do NOT set CLAUDE_CODE_EXECPATH. With XBUS_TEST_REQUIRE_FAKE_CLAUDE=1 the launcher
+    // must refuse to resolve/spawn ANY claude (real or PATH-resolved) — proving the
+    // test harness can never launch the user's real Claude Code.
+    const pathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-fakepath-'));
+    const onPath = path.join(pathDir, process.platform === 'win32' ? 'claude.cmd' : 'claude');
+    if (process.platform === 'win32') fs.writeFileSync(onPath, '@echo off\r\necho SHOULD_NOT_RUN\r\n');
+    else { fs.writeFileSync(onPath, '#!/bin/sh\necho SHOULD_NOT_RUN\n', { mode: 0o755 }); }
+    const r = (() => {
+      try {
+        const out = execFileSync(process.execPath, [LAUNCHER], {
+          // require-fake ON, execpath ABSENT, and a claude IS discoverable on PATH:
+          env: { ...process.env, XBUS_INSTALL_ROOT: root, XBUS_TEST_REQUIRE_FAKE_CLAUDE: '1', CLAUDE_CODE_EXECPATH: '', PATH: `${pathDir}${path.delimiter}${process.env.PATH}` },
+          cwd: workdir, encoding: 'utf8', timeout: 15000,
+        });
+        return { code: 0, out };
+      } catch (e) {
+        const err = e as { status?: number; stdout?: string; stderr?: string };
+        return { code: err.status ?? 1, out: (err.stdout ?? '') + (err.stderr ?? '') };
+      }
+    })();
+    fs.rmSync(pathDir, { recursive: true, force: true });
+    expect(r.code).not.toBe(0);                       // failed closed
+    expect(r.out).toMatch(/test mode requires CLAUDE_CODE_EXECPATH/i);
+    expect(r.out).not.toContain('SHOULD_NOT_RUN');    // the PATH claude was NEVER spawned
+  });
 });

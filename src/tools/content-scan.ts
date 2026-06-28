@@ -75,27 +75,69 @@ export function loadPrivateDenylist(cwd: string = process.cwd()): PrivateDenylis
  * and a git-context SHA detector that rejects UNKNOWN hashes by default while
  * allowlisting the current public commit + obvious synthetic fixtures.
  */
+/**
+ * Recognize a THIRD-PARTY npm dependency version field carrying a pre-release, so the
+ * generic rc-prerelease rule does not false-positive on legitimate lockfile/package
+ * metadata (e.g. a transitive std-env at ^4.0.0 prerelease). Deliberately NARROW:
+ *  - matches a quoted JSON value that is a pure semver(-range) prerelease;
+ *  - does NOT match a resolved/repository/url line (those can carry a private SHA),
+ *    a git ref, or any prose value with words/spaces — so private RC provenance stays
+ *    flagged. Every space-separated token in the value must itself be a semver
+ *    comparator/version, so a prose value like "rebased onto <rc-tag> candidate" is
+ *    NOT cleared (it has bare words).
+ */
+export function isThirdPartyNpmVersionField(line: string): boolean {
+  // A resolved/URL/integrity line is never cleared by this allowance.
+  if (/"(?:resolved|repository|url|tarball|integrity|from)"\s*:/i.test(line)) return false;
+  if (/git\+|github:|https?:\/\//i.test(line)) return false;
+  // "<key>": "<value>"  — extract the quoted value.
+  const m = /"[^"]+"\s*:\s*"([^"]+)"\s*,?\s*$/.exec(line.trim());
+  if (!m) return false;
+  const value = m[1]!.trim();
+  if (!/-rc\.[0-9]+\b/i.test(value)) return false; // the prerelease must be a semver -rc.N tail
+  // EVERY whitespace-separated token must be a semver comparator/version — a single
+  // optional range operator (^ ~ >= <= > < =) + a dotted version with an OPTIONAL
+  // semver prerelease/build suffix. No bare words, paths, or @scope junk.
+  const SEMVER_TOKEN = /^(?:[\^~]|>=?|<=?|=)?v?\d+(?:\.\d+){0,2}(?:-[0-9a-z.]+)?(?:\+[0-9a-z.]+)?$|^[*x]$|^\|\|$/i;
+  return value.split(/\s+/).every((tok) => SEMVER_TOKEN.test(tok));
+}
+
 export const STRUCTURAL_RULES: ScanRule[] = [
   {
     id: 'windows-user-path',
-    pattern: /[A-Za-z]:\\Users\\[A-Za-z0-9._-]+/i,
+    // Match a Windows user-profile path with EITHER raw or JSON-escaped backslashes
+    // (lockfiles/JSON store backslashes doubled), so a workstation path in
+    // package-lock.json is caught as well as in source.
+    pattern: /[A-Za-z]:\\+Users\\+[A-Za-z0-9._-]+/i,
     // Allow a deliberately-generic placeholder used in docs.
-    allow: (l) => /<user>|YourName|%USERNAME%|\\Users\\you\b/i.test(l),
+    allow: (l) => /<user>|YourName|%USERNAME%|\\+Users\\+you\b/i.test(l),
   },
   { id: 'unix-home-path', pattern: /\/(?:home|Users)\/[A-Za-z0-9._-]+\//, allow: (l) => /\/Users\/you\b|<user>/.test(l) },
   { id: 'pem-block', pattern: /-----BEGIN (?:RSA |EC )?(?:PRIVATE KEY|CERTIFICATE)-----/ },
   // A long base64 run on a line that also mentions secret/key/token.
-  { id: 'inline-secret', pattern: /(secret|api[_-]?key|token|password)\s*[:=]\s*['"]?[A-Za-z0-9+/]{24,}/i, allow: (l) => /example|REDACTED|xxxx|<your|placeholder|\$\{/i.test(l) },
-  // STRUCTURAL: pre-release "rc.N" version/tag strings. Generic pattern (no private
-  // value); flags any internal release-candidate label that should not ship publicly.
-  // Allowlisted only where annotated as a synthetic/example fixture.
-  { id: 'prerelease-rc-tag', pattern: /\b(?:v?\d+\.\d+\.\d+-)?rc\.[0-9]+\b/i, allow: (l) => /synthetic|placeholder|fixture|example|e\.g\./i.test(l) },
+  { id: 'inline-secret', pattern: /(secret|api[_-]?key|token|password)["']?\s*[:=]\s*['"]?[A-Za-z0-9+/]{24,}/i, allow: (l) => /example|REDACTED|xxxx|<your|placeholder|\$\{/i.test(l) },
+  // STRUCTURAL: pre-release release-candidate version/tag strings. Generic pattern (no
+  // private value); flags any internal release-candidate label that should not ship
+  // publicly. Allowlisted where annotated as a synthetic/example fixture, OR where the
+  // prerelease tag is a THIRD-PARTY npm dependency version inside a lockfile/package
+  // version field (see isThirdPartyNpmVersionField). The npm-version-field allowance is
+  // NARROW: it clears only a quoted semver(-range) value, so a private RC tag in
+  // prose/provenance/a resolved git URL is still flagged, and private commit SHAs are
+  // caught by the unrecognized-git-sha + denylist rules regardless.
+  {
+    id: 'prerelease-rc-tag',
+    pattern: /\b(?:v?\d+\.\d+\.\d+-)?rc\.[0-9]+\b/i,
+    allow: (l) => /synthetic|placeholder|fixture|example|e\.g\./i.test(l) || isThirdPartyNpmVersionField(l),
+  },
   // STRUCTURAL: any git-context SHA-like value (>=7 hex) appearing next to a
   // git/commit/HEAD/tag/build cue. Rejects UNKNOWN hashes by default; the
   // allowlist below clears synthetic fixtures + the current public commit.
   {
     id: 'unrecognized-git-sha',
-    pattern: /\b(?:commit|HEAD|sha|tag|build|rev|ref)\b[^\n]{0,40}\b[0-9a-f]{7,40}\b|\b[0-9a-f]{7,40}\b[^\n]{0,20}\b(?:commit|sha)\b/i,
+    // git-cue (commit/HEAD/sha/tag/build/rev/ref/resolved) within 40 chars of a >=7-hex
+    // run; OR a hex run immediately followed by commit/sha; OR a `#<7-40 hex>` URL
+    // fragment (npm `resolved` git refs pin a commit as `…repo.git#<sha>`).
+    pattern: /\b(?:commit|HEAD|sha|tag|build|rev|ref|resolved)\b[^\n]{0,40}\b[0-9a-f]{7,40}\b|\b[0-9a-f]{7,40}\b[^\n]{0,20}\b(?:commit|sha)\b|#[0-9a-f]{7,40}\b/i,
     allow: (l) => {
       // Allow obviously-synthetic placeholder fixtures (all-same-digit runs),
       // crypto test vectors (hex without a git cue is handled by the pattern's

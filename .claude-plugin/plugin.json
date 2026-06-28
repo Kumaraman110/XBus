@@ -3,7 +3,9 @@
   "name": "xbus",
   "version": "0.1.0-beta.3",
   "description": "XBus — durable cross-session messaging between Claude Code sessions on one machine (hook_checkpoint delivery). Independent, unofficial; not affiliated with Anthropic.",
-  "author": { "name": "Aman Kumar" },
+  "author": {
+    "name": "Aman Kumar"
+  },
   "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.json"
 }
