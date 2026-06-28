@@ -15,6 +15,7 @@ export const SHARDS: Shard[] = [
   { name: 'security', dir: 'tests/security' },
   { name: 'integration', dir: 'tests/integration' },
   { name: 'e2e', dir: 'tests/e2e' },
+  { name: 'adapter-sdk', dir: 'tests/adapter-sdk' },
 ];
 
 /** vitest excludes (must match vitest.config.ts). */
