@@ -25,6 +25,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 import { SHARDS, shardCoverage, listAllTestFiles } from './shards.js';
 
 const REPO = process.env.XBUS_REPO_ROOT ?? process.cwd();
@@ -148,8 +149,28 @@ async function main(): Promise<void> {
       try { d2ok = (dr2.status ?? 1) === 0 && (JSON.parse((dr2.stdout ?? '').slice((dr2.stdout ?? '').indexOf('{'))) as { ok?: boolean }).ok === true; } catch { d2ok = false; }
       record('artifact-first-installable', d2ok, d2ok ? 'xbus install --dry-run accepts the packaged artifact' : 'packaged artifact is NOT installable (RC2-INSTALL-1 regression)');
       void dok;
+
+      // 6c) DETERMINISTIC release ZIP (§7): build the archive TWICE from the same
+      //     staged artifact; the two SHA-256s must be identical (reproducibility),
+      //     and each build self-verifies every entry against SHA256SUMS. A
+      //     nondeterministic or unverified archive fails the gate.
+      const zipEntry = path.join(REPO, 'dist', 'tools', 'package-release-zip.js');
+      const zip1 = path.join(isoHome, 'release-1.zip');
+      const zip2 = path.join(isoHome, 'release-2.zip');
+      const rz1 = sh(node, [zipEntry, staging, zip1]);
+      const rz2 = sh(node, [zipEntry, staging, zip2]);
+      let zipOk = false, zipDetail = 'release-zip failed';
+      if (rz1.code === 0 && rz2.code === 0 && fs.existsSync(zip1) && fs.existsSync(zip2)) {
+        const s1 = createHash('sha256').update(fs.readFileSync(zip1)).digest('hex');
+        const s2 = createHash('sha256').update(fs.readFileSync(zip2)).digest('hex');
+        const verified = /round-trip: VERIFIED/.test(rz1.out) && /round-trip: VERIFIED/.test(rz2.out);
+        zipOk = s1 === s2 && verified;
+        zipDetail = zipOk ? `reproducible (SHA ${s1.slice(0, 12)}…), round-trip VERIFIED` : `nondeterministic or unverified (s1=${s1.slice(0, 12)} s2=${s2.slice(0, 12)} verified=${verified})`;
+      }
+      record('release-zip-deterministic', zipOk, zipDetail);
     } else {
       record('artifact-first-installable', false, 'skipped — packaging incomplete');
+      record('release-zip-deterministic', false, 'skipped — packaging incomplete');
     }
   }
 

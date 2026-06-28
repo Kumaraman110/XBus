@@ -200,12 +200,18 @@ export function buildPackage(stagingDir: string): PackageResult {
 
   // 4b) Build manifest — provenance of THIS artifact. NOTE: `buildId`
   //     here is the legacy COMPATIBILITY tuple (wire value); the EXACT build id is
-  //     in provenance.json (4c). builtOnPlatform/node are NON-deterministic build
-  //     facts — kept for human provenance but NOT part of the deterministic
-  //     identity (provenance.json is the deterministic, checksum-covered one).
+  //     in provenance.json (4c). This file is checksum-covered (step 6), so it MUST
+  //     be byte-reproducible across any supported builder Node/OS: it carries ONLY
+  //     deterministic source facts (name/version/commit/compat tuple). The builder's
+  //     Node version + platform are NON-deterministic build environment — they
+  //     belong in out-of-band release provenance emitted ALONGSIDE the release ZIP
+  //     (package-release-zip.ts writes release-provenance.json next to the archive),
+  //     NEVER inside the checksum-covered, reproducible artifact. (Earlier builds
+  //     embedded process.version/platform here, which silently made the artifact
+  //     manifest checksum vary by builder Node — the exact reproducibility defect
+  //     this gate exists to catch.)
   fs.writeFileSync(path.join(stagingDir, 'build-manifest.json'), JSON.stringify({
     name: repoPkg.name, version: repoPkg.version, commit, buildId: BUILD_ID,
-    builtOnPlatform: `${process.platform}/${process.arch}`, node: process.version,
   }, null, 2) + '\n');
 
   // 4c) The NORMATIVE provenance manifest (ADR 0011). DETERMINISTIC: only

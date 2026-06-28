@@ -46,6 +46,20 @@ describe('§7 isolated Windows packaging', () => {
     expect(rt.enginesRange).toBeTruthy();
   });
 
+  it('build-manifest.json carries NO builder-environment fields (cross-Node reproducibility)', () => {
+    // build-manifest.json is checksum-covered, so any builder-specific field
+    // (process.version, platform, a timestamp) would make the artifact manifest
+    // checksum vary by who/where it was built — a reproducibility defect. It must
+    // carry ONLY deterministic source facts.
+    const bm = JSON.parse(fs.readFileSync(path.join(staging, 'build-manifest.json'), 'utf8'));
+    expect(bm.version).toBeTruthy();
+    expect(bm.commit).toBeTruthy();
+    expect(bm.buildId).toBeTruthy();
+    expect(bm.node).toBeUndefined();
+    expect(bm.builtOnPlatform).toBeUndefined();
+    expect(Object.keys(bm).sort()).toEqual(['buildId', 'commit', 'name', 'version']);
+  });
+
   it('generates a SHA256SUMS covering every shipped file, all verifiable', () => {
     const sums = fs.readFileSync(path.join(staging, 'SHA256SUMS'), 'utf8').trim().split('\n');
     expect(sums.length).toBe(result.checksums);

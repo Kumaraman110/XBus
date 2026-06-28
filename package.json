@@ -18,6 +18,7 @@
     "test:security": "vitest run tests/security",
     "bench": "npm run build && node dist/tools/secure-transport-bench.js",
     "package:win": "npm run build && node dist/tools/package-win.js",
+    "package:release-zip": "node dist/tools/package-release-zip.js",
     "verify:release": "npm run build && node dist/tools/verify-release.js",
     "accept:clean-machine": "npm run build && node scripts/clean-machine-accept.mjs"
   },
