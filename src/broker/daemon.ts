@@ -23,6 +23,8 @@ import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../ide
 import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
+import { evaluateRegistration, type AdapterRegistration } from '../adapter-broker/enforce.js';
+import type { AwardedSupport } from '../adapter/evidence.js';
 
 export interface DaemonOptions {
   authSecret?: string;
@@ -55,6 +57,8 @@ export class BrokerDaemon {
   private readonly reaperIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
+  /** In-memory awarded support per connection (adapter-aware registrations only; never persisted). */
+  private connAwarded = new Map<string, AwardedSupport>();
   private readonly authSecret: string | undefined;
   private readonly rootSecret: Buffer | undefined;
   private readonly serverTuning: Pick<DaemonOptions, 'maxConnections' | 'idleTimeoutMs' | 'globalBufferBudgetBytes' | 'connectRatePerSec' | 'handshakeTimeoutMs'>;
@@ -174,6 +178,7 @@ export class BrokerDaemon {
     }
     this.connAuth.delete(id);
     this.connHello.delete(id);
+    this.connAwarded.delete(id);
   }
 
   private requireAuth(conn: ServerConn): SessionAuthority {
@@ -277,8 +282,14 @@ export class BrokerDaemon {
 
   private onRegister(conn: ServerConn, frame: Frame): void {
     if (!this.connHello.has(conn.id)) throw new XBusError(XBusErrorCode.AUTH_FAILED, 'hello required before register');
-    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean };
+    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistration };
     const role = p.role && isComponentRole(p.role) ? p.role : ComponentRole.MCP;
+    // OPT-IN adapter enforcement: engages ONLY when explicit structured adapter
+    // metadata is present. A legacy beta.2 registration (no adapterRegistration)
+    // takes a pure no-op path — evaluateRegistration returns null and nothing changes.
+    // May throw PROTOCOL_VIOLATION if an adapter over-claims a receive mode. Computed
+    // BEFORE store.register so an over-claim never persists a session.
+    const enforcement = evaluateRegistration(p.receiveMode, p.adapterRegistration);
     const auth = this.store.register({
       sessionId: p.sessionId,
       instanceId: p.instanceId,
@@ -294,7 +305,14 @@ export class BrokerDaemon {
       ...(p.claudeCodeVersion !== undefined ? { claudeCodeVersion: p.claudeCodeVersion } : {}),
     });
     this.connAuth.set(conn.id, auth);
-    this.reply(conn, 'register_session_ack', { sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId, role: auth.role, epoch: auth.epoch, generation: auth.generation }, frame.requestId);
+    // Awarded support is in-memory only (no schema change); surfaced in the ack ONLY
+    // for adapter-aware registrations, so a legacy ack is byte-identical to before.
+    const ackPayload: Record<string, unknown> = { sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId, role: auth.role, epoch: auth.epoch, generation: auth.generation };
+    if (enforcement) {
+      this.connAwarded.set(conn.id, enforcement.awarded);
+      ackPayload.awardedSupport = enforcement.awarded;
+    }
+    this.reply(conn, 'register_session_ack', ackPayload, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {
