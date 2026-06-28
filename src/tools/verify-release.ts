@@ -11,7 +11,7 @@
  *   3. TypeScript strict check (tsc --noEmit)
  *   3b. ESLint (flat-config, zero findings — §4)
  *   4. shard exhaustiveness + non-overlap (shards.ts)
- *   5. test shards (unit, security, integration, e2e) — combined totals
+ *   5. test shards (unit, security, integration, e2e, adapter-sdk) — combined totals
  *   6. packaging (build artifact) + artifact content/secret scan + SBOM + checksums
  *   7. documentation-command validation (the README commands exist as bins/entries)
  *
