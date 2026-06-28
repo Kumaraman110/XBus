@@ -37,12 +37,15 @@ function record(stage: string, ok: boolean, detail: string): void {
   process.stdout.write(`  [${ok ? 'PASS' : 'FAIL'}] ${stage}${detail ? ' — ' + detail : ''}\n`);
 }
 
-function sh(cmd: string, args: string[], opts: { env?: Record<string, string>; shell?: boolean } = {}): { code: number; out: string } {
-  const r = spawnSync(cmd, args, { cwd: REPO, encoding: 'utf8', env: { ...process.env, ...opts.env }, timeout: 600_000, shell: opts.shell ?? false });
+function sh(cmd: string, args: string[], opts: { env?: Record<string, string>; shell?: boolean; timeoutMs?: number } = {}): { code: number; out: string } {
+  // Default 10min per command; a slow/contended Windows runner where each real
+  // install is 60-90s can push the install-heavy integration shard past that, so
+  // callers (the per-shard runner) may raise it. Still bounded to catch a true hang.
+  const r = spawnSync(cmd, args, { cwd: REPO, encoding: 'utf8', env: { ...process.env, ...opts.env }, timeout: opts.timeoutMs ?? 600_000, shell: opts.shell ?? false });
   return { code: r.status ?? 1, out: (r.stdout ?? '') + (r.stderr ?? '') };
 }
 
-function npx(args: string[], env: Record<string, string> = {}): { code: number; out: string } {
+function npx(args: string[], env: Record<string, string> = {}, timeoutMs?: number): { code: number; out: string } {
   // Run the local CLIs via their JS entry with `node` so no .cmd shim (which
   // can't be spawned without a shell on Windows) is involved.
   const tool = args[0] ?? '';
@@ -52,10 +55,10 @@ function npx(args: string[], env: Record<string, string> = {}): { code: number; 
     eslint: 'node_modules/eslint/bin/eslint.js',
   };
   const entry = jsEntry[tool];
-  if (entry) return sh(node, [path.join(REPO, entry), ...args.slice(1)], { env });
+  if (entry) return sh(node, [path.join(REPO, entry), ...args.slice(1)], { env, ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
   // Fallback: shell out (Windows .cmd).
   const bin = path.join(REPO, 'node_modules', '.bin', tool);
-  return sh(bin, args.slice(1), { env, shell: process.platform === 'win32' });
+  return sh(bin, args.slice(1), { env, shell: process.platform === 'win32', ...(timeoutMs !== undefined ? { timeoutMs } : {}) });
 }
 
 // eslint-disable-next-line @typescript-eslint/require-await -- async entrypoint: invoked as main().catch(...) at the bottom of this file, so it must return a Promise even though the gate stages are synchronous (spawnSync).
@@ -104,7 +107,9 @@ async function main(): Promise<void> {
   let totalFiles = 0, totalTests = 0, totalFailed = 0, totalSkipped = 0;
   for (const shard of SHARDS) {
     const reportFile = path.join(isoHome, `vitest-${shard.name}.json`);
-    const r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], testEnv);
+    // 30min per shard: the install-heavy integration shard on a slow Windows runner
+    // (each real install 60-90s) can exceed the default 10min; bounded to catch a hang.
+    const r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], testEnv, 1_800_000);
     let files = 0, tests = 0, passed = 0, failed = 0, skipped = 0;
     try {
       const j = JSON.parse(fs.readFileSync(reportFile, 'utf8')) as {
