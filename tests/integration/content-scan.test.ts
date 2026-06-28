@@ -57,6 +57,66 @@ describe('content scan — whole-repo (no private terms / paths / secrets / prov
     expect(hits).toHaveLength(0);
   });
 
+  it('no internal RC commit SHA or pre-release tag string is reachable in tracked source', () => {
+    // Durable regression guard for the beta.2 scrub: the public tree must never
+    // (re)gain an internal release-candidate commit SHA (loaded from the external
+    // denylist's commitShas — no literal here) or an `rc.N` pre-release tag string
+    // (a structural pattern, no private value). Excludes the scanner's own source
+    // (it defines the patterns) + the gitignored denylist + tests fixtures' synthetic
+    // values. dist/ is generated and scanned over the artifact separately.
+    const fs = require('node:fs') as typeof import('node:fs');
+    const cp = require('node:child_process') as typeof import('node:child_process');
+    const dl = loadPrivateDenylist(REPO);
+    const shaRules = denylistRules({ identifiers: [], commitShas: dl.commitShas });
+    const rcTag = new RegExp('\\b(?:v?\\d+\\.\\d+\\.\\d+-)?rc\\.[0-9]+\\b', 'i');
+    const tracked = cp.execFileSync('git', ['-C', REPO, 'ls-files'], { encoding: 'utf8' }).split('\n').filter(Boolean);
+    const skip = (f: string) => /src\/tools\/content-scan\.ts$|\.xbus-scan-denylist\.json$|\/tests\/|^tests\//.test(f.replace(/\\/g, '/'));
+    const hits: string[] = [];
+    for (const f of tracked) {
+      if (skip(f)) continue;
+      let text: string;
+      try { text = fs.readFileSync(path.join(REPO, f), 'utf8'); } catch { continue; }
+      const lines = text.split(/\r?\n/);
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i]!;
+        if (rcTag.test(ln) && !/synthetic|placeholder|fixture|example|e\.g\./i.test(ln)) hits.push(`rc-tag  ${f}:${i + 1}  ${ln.trim().slice(0, 70)}`);
+        for (const r of shaRules) if (r.pattern.test(ln)) hits.push(`rc-sha  ${f}:${i + 1}  ${ln.trim().slice(0, 70)}`);
+      }
+    }
+    if (hits.length) throw new Error(`internal RC provenance leaked back into tracked source:\n  ${hits.join('\n  ')}`);
+    expect(hits).toHaveLength(0);
+  });
+
+  it('the private publication audit FAILS CLOSED when the external denylist is absent', () => {
+    // §3: the regression guard skips silently on an ordinary end-user build (no
+    // external denylist present) — correct, because the denylist is not shipped.
+    // But the PRIVATE PUBLICATION AUDIT must NEVER pass silently: before publishing,
+    // the maintainer asserts the denylist is present, so a missing denylist is a
+    // hard FAIL (it would otherwise mean "scanned for nothing"). This guard proves
+    // the publication-audit contract: requirePublicationDenylist() throws when the
+    // denylist resolves empty, and returns the populated denylist otherwise.
+    // (It is a no-literal structural check; it never embeds a private value.)
+    function requirePublicationDenylist(cwd: string): { identifiers: string[]; commitShas: string[] } {
+      const dl = loadPrivateDenylist(cwd);
+      if (dl.identifiers.length === 0 && dl.commitShas.length === 0) {
+        throw new Error('PUBLICATION AUDIT FAIL-CLOSED: external denylist (.xbus-scan-denylist.json) is absent or empty; refusing to certify a publication scan that checked nothing.');
+      }
+      return dl;
+    }
+    const fs = require('node:fs') as typeof import('node:fs');
+    const os = require('node:os') as typeof import('node:os');
+    // (a) An empty/denylist-less dir must FAIL CLOSED.
+    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-no-denylist-'));
+    expect(() => requirePublicationDenylist(emptyDir)).toThrow(/FAIL-CLOSED/);
+    // (b) The real repo (denylist present locally) must pass; on a fresh clone with
+    //     no denylist the publication audit is INTENTIONALLY not runnable — only the
+    //     maintainer with the gitignored denylist may certify a publication.
+    const real = loadPrivateDenylist(REPO);
+    if (real.identifiers.length > 0 || real.commitShas.length > 0) {
+      expect(() => requirePublicationDenylist(REPO)).not.toThrow();
+    }
+  });
+
   it('the scanner SOURCE itself ships no private value (no literal, no reversible char-code payload)', () => {
     // Regression guard for the beta.1→beta.2 finding: content-scan.ts must not embed
     // private identifiers as literals OR as reversible char-code arrays. This guard
