@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { readInstallManifest, defaultInstallRoot, resolveDataDir } from './install-paths.js';
+import { assertSupportedNode } from '../shared/node-support.js';
 
 function fail(msg: string): never {
   process.stderr.write(`xclaude: ${msg}\n`);
@@ -39,7 +40,7 @@ function resolvePluginDir(): string {
   const root = defaultInstallRoot();
   const manifest = readInstallManifest(root);
   if (!manifest) {
-    fail(`XBus is not installed (no manifest under ${root}).\n  Run: xbus install\n  Or set XBUS_PLUGIN_DIR to a plugin directory.`);
+    fail(`XBus is not installed (no manifest under ${root}).\n  Run: node <checkout>/dist/cli/main.js install  (install is PATH-free; there is no global 'xbus' command)\n  Or set XBUS_PLUGIN_DIR to a plugin directory.`);
   }
   const pluginDir = manifest.pluginDir;
   if (!fs.existsSync(path.join(pluginDir, '.claude-plugin', 'plugin.json'))) {
@@ -67,7 +68,16 @@ export function cmdQuoteArg(arg: string): string {
 function main(): void {
   const userArgs = process.argv.slice(2);
   const pluginDir = resolvePluginDir();
-  const claudeBin = process.env.CLAUDE_CODE_EXECPATH || 'claude';
+  // §6 test-mode guard: when XBUS_TEST_REQUIRE_FAKE_CLAUDE=1, the launcher REFUSES
+  // to fall back to a real `claude` on PATH — it requires CLAUDE_CODE_EXECPATH to
+  // point at an explicit (fake) executable. This makes it impossible for an
+  // automated test to ever resolve or launch the user's real Claude Code.
+  const requireFake = process.env.XBUS_TEST_REQUIRE_FAKE_CLAUDE === '1';
+  const explicitBin = process.env.CLAUDE_CODE_EXECPATH;
+  if (requireFake && !explicitBin) {
+    fail('test mode requires CLAUDE_CODE_EXECPATH to point at a fake claude executable; refusing to resolve the real `claude`.');
+  }
+  const claudeBin = explicitBin || 'claude';
   const args = buildClaudeArgs(pluginDir, userArgs);
 
   // Activation is explicit + visible.
@@ -113,6 +123,7 @@ function main(): void {
 
 // Run only as the CLI entry (argv[1] is the compiled launcher).
 if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('launcher/xclaude.js')) {
+  assertSupportedNode(); // §8: actionable unsupported-Node error before spawning anything
   main();
 }
 

@@ -4,6 +4,37 @@ All notable changes to XBus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project is in
 pre-1.0 Developer Preview, so the public surface may still change.
 
+## [0.1.0-beta.3] — first-run correctness hotfix
+
+A release-correctness hotfix for the Windows first-user experience. **No protocol,
+XBUS-STP, schema, crypto, or broker behavior change** (`compatibilityId xbus-p1-stp1-s5`
+unchanged). Scope:
+
+- **Install bootstrap corrected.** Install is **PATH-free by design** — there is no
+  global `xbus` command. README / installation / quickstart now document the actual
+  `node ./dist/cli/main.js install` source bootstrap (and installed-plugin absolute
+  paths), and no longer claim PATH modification or lead with a bare `xbus install`.
+  Added an `install.ps1` release-asset helper.
+- **Install reliability fix.** The product version was duplicated across
+  `package.json`, `XBUS_VERSION`, and `.claude-plugin/plugin.json`; a divergence made
+  a clean install fail contract validation and roll back (leaving no plugin). All three
+  are now reconciled and a version-consistency guard test prevents regressions.
+- **Node support boundary.** `engines` is `>=22.5 <25`. **Node 25+ is not yet
+  supported** (not validated by the clean-machine suite); the CLI/launcher now print an
+  actionable unsupported-Node error early instead of failing deep.
+- **Test isolation.** The integration suite can no longer launch the user's real Claude
+  Code: the launcher refuses real-`claude` fallback in test mode, the harness clears
+  inherited `CLAUDE_*` env and pins an isolated legacy data root (never the real
+  `~/.claude/xbus`), and `npm test` is explicitly not an install step.
+- **Fail-fast artifact gate.** The artifact-first suite asserts the installed plugin
+  is complete immediately after install and stops (retaining the dir) on failure, so
+  later MCP/hook/launcher tests never run against a missing plugin.
+- **Dependency audit.** `npm audit` is clean (vitest upgraded to 4.x; the prior findings
+  were all dev-only and never shipped — the packaged artifact bundles only `uuid` + `zod`).
+- **Clean-machine acceptance.** New `npm run accept:clean-machine` runs the documented
+  flow end-to-end (install → doctor → fake-host MCP init → broker → two-session
+  send/ack/correlated-reply → stop → uninstall) using only installed files.
+
 ## [0.1.0-beta.2] — first public developer preview
 
 The first public artifact. Same product behavior as the internally-hardened build

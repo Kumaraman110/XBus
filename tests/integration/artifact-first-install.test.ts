@@ -26,6 +26,7 @@ let base: string;        // temp root WITH A SPACE in the name (see §5.8)
 let artifact: string;    // packaged artifact (copied under the spaces-path)
 let installRoot: string;
 let legacyDir: string;   // hermetic, empty legacy data root so install never depends on the real ~/.claude/xbus
+let retainForDiagnosis = false; // §7: when an install gate fails, keep the temp tree for inspection
 
 function run(cmd: string, args: string[], opts: { cwd?: string; env?: Record<string, string> } = {}): { code: number; out: string } {
   try {
@@ -86,7 +87,10 @@ beforeAll(() => {
   legacyDir = path.join(base, 'isolated legacy root');
 }, 180_000);
 
-afterAll(() => { try { fs.rmSync(base, { recursive: true, force: true }); } catch { /* ignore */ } });
+afterAll(() => {
+  if (retainForDiagnosis) { process.stderr.write(`[artifact-first] retaining temp tree for diagnosis: ${base}\n`); return; }
+  try { fs.rmSync(base, { recursive: true, force: true }); } catch { /* ignore */ }
+});
 
 describe('artifact-first — contract + composition (tests 1-4)', () => {
   it('1-3: artifact contains plugin metadata (.claude-plugin/plugin.json, .mcp.json, hooks/hooks.json)', () => {
@@ -111,6 +115,61 @@ describe('artifact-first — contract + composition (tests 1-4)', () => {
 });
 
 describe('artifact-first — install lifecycle (tests 5-11)', () => {
+  // §7 FAIL-FAST GATE: do the real install ONCE up front and assert the installed
+  // plugin is complete. If install fails or rolls back, this throws with the full
+  // diagnostics (installer/health/contract/rollback) AND retains the install dir —
+  // and because it runs before the MCP/hook/launcher tests below, those never run
+  // against a missing plugin (the "artifact-first tests execute missing installed
+  // files" failure class).
+  let installGateError: string | null = null;
+  beforeAll(() => {
+    const r = run(process.execPath, [path.join(artifact, 'dist', 'cli', 'main.js'), 'install', '--json'],
+      { cwd: artifact, env: { XBUS_INSTALL_ROOT: installRoot, HOME: path.join(base, 'home'), XBUS_LEGACY_DATA_DIR: legacyDir } });
+    let j: { ok?: boolean; error?: string; health?: { ok?: boolean; detail?: string }; rolledBack?: boolean } = {};
+    try { j = JSON.parse(r.out); } catch { /* leave j empty; r.out captured below */ }
+    if (r.code !== 0 || !j.ok) {
+      installGateError = `INSTALL FAILED — aborting artifact-first lifecycle.\n`
+        + `  exit=${r.code} ok=${j.ok} rolledBack=${j.rolledBack}\n`
+        + `  error=${j.error ?? '(none)'}\n`
+        + `  health=${JSON.stringify(j.health ?? null)}\n`
+        + `  install dir RETAINED for diagnosis: ${installRoot}\n`
+        + `  raw: ${r.out.slice(0, 600)}`;
+      retainForDiagnosis = true;
+      return; // do not throw here; the it() below reports it as a clean failure
+    }
+    // Assert every required installed file exists + the contract is valid.
+    const pluginDir = path.join(installRoot, 'plugin');
+    const required = [
+      path.join('dist', 'channel', 'server.js'),
+      path.join('dist', 'channel', 'hook-entry.js'),
+      path.join('dist', 'cli', 'main.js'),
+      path.join('dist', 'launcher', 'xclaude.js'),
+      path.join('.claude-plugin', 'plugin.json'),
+    ];
+    const missing = required.filter((f) => !fs.existsSync(path.join(pluginDir, f)));
+    const manifestOk = fs.existsSync(path.join(installRoot, 'install-manifest.json'));
+    const contract = validateArtifact(pluginDir, { scope: 'plugin' });
+    if (missing.length || !manifestOk || !contract.ok) {
+      installGateError = `INSTALLED PLUGIN INCOMPLETE — aborting artifact-first lifecycle.\n`
+        + `  missing files: ${missing.join(', ') || '(none)'}\n`
+        + `  install-manifest present: ${manifestOk}\n`
+        + `  contract valid: ${contract.ok} violations=${JSON.stringify(contract.violations ?? [])}\n`
+        + `  install dir RETAINED for diagnosis: ${installRoot}`;
+      retainForDiagnosis = true;
+    }
+  }, 120_000);
+
+  it('FAIL-FAST: install succeeded and the installed plugin has all required files (gates the rest)', () => {
+    if (installGateError) throw new Error(installGateError);
+    // explicit positive assertions (also documents the §7 required set)
+    const pluginDir = path.join(installRoot, 'plugin');
+    for (const f of ['dist/channel/server.js', 'dist/channel/hook-entry.js', 'dist/cli/main.js', 'dist/launcher/xclaude.js', '.claude-plugin/plugin.json']) {
+      expect(fs.existsSync(path.join(pluginDir, ...f.split('/'))), `installed ${f}`).toBe(true);
+    }
+    expect(fs.existsSync(path.join(installRoot, 'install-manifest.json'))).toBe(true);
+    expect(validateArtifact(pluginDir, { scope: 'plugin' }).ok).toBe(true);
+  });
+
   it('5: xbus install --dry-run accepts a freshly built artifact (a previously failing case)', () => {
     const r = run(process.execPath, [path.join(artifact, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'],
       { cwd: artifact, env: { XBUS_INSTALL_ROOT: installRoot, XBUS_LEGACY_DATA_DIR: legacyDir } });
@@ -161,7 +220,7 @@ describe('artifact-first — install lifecycle (tests 5-11)', () => {
       });
     } catch (e) { out = (e as { stdout?: string }).stdout ?? ''; }
     expect(out).toContain('"name":"xbus"');
-    expect(out).toContain('"version":"0.1.0-beta.2"');
+    expect(out).toContain('"version":"0.1.0-beta.3"');
   });
 
   it('12+13: installed UserPromptSubmit and Stop hooks execute from the INSTALLED path', () => {

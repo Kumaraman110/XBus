@@ -23,6 +23,7 @@ function isExcluded(norm: string): boolean {
   return /\.xbus-scan-denylist\.json$/.test(norm)      // EXTERNAL gitignored denylist — holds the values by design, never committed
     || /src\/tools\/package-win\.ts$/.test(norm)       // references forbidden-dep names
     || /tests\/integration\/content-scan\.test\.ts$/.test(norm) // this file
+    || /(^|\/)package-lock\.json$/.test(norm)          // generated lockfile of THIRD-PARTY dep versions (e.g. a dep's own X.Y.Z-rc.1) — not XBus source/provenance
     || /\/build\//.test(norm)                          // transient packaging output
     || /\/dist\//.test(norm)                           // generated output — scanned separately over the built artifact
     || /\/tests\//.test(norm);                         // fixtures build real temp paths at runtime
@@ -70,7 +71,7 @@ describe('content scan — whole-repo (no private terms / paths / secrets / prov
     const shaRules = denylistRules({ identifiers: [], commitShas: dl.commitShas });
     const rcTag = new RegExp('\\b(?:v?\\d+\\.\\d+\\.\\d+-)?rc\\.[0-9]+\\b', 'i');
     const tracked = cp.execFileSync('git', ['-C', REPO, 'ls-files'], { encoding: 'utf8' }).split('\n').filter(Boolean);
-    const skip = (f: string) => /src\/tools\/content-scan\.ts$|\.xbus-scan-denylist\.json$|\/tests\/|^tests\//.test(f.replace(/\\/g, '/'));
+    const skip = (f: string) => /src\/tools\/content-scan\.ts$|\.xbus-scan-denylist\.json$|(^|\/)package-lock\.json$|\/tests\/|^tests\//.test(f.replace(/\\/g, '/'));
     const hits: string[] = [];
     for (const f of tracked) {
       if (skip(f)) continue;

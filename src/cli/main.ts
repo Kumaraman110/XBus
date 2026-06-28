@@ -19,6 +19,7 @@ import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir } from '../launcher/install-paths.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
+import { assertSupportedNode } from '../shared/node-support.js';
 
 /** This process's exact identity: prefer the packaged provenance.json next to the
  *  installed binaries (works with no git/source), else a labelled source identity.
@@ -487,5 +488,8 @@ export async function run(argv: string[]): Promise<void> {
 }
 
 if (process.argv[1] && process.argv[1].endsWith('main.js')) {
+  // §8: fail fast with an actionable message on an unsupported Node, BEFORE any
+  // install/broker machinery runs (rather than failing deep inside it).
+  assertSupportedNode();
   void run(process.argv.slice(2));
 }

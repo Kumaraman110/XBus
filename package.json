@@ -1,6 +1,6 @@
 {
   "name": "xbus",
-  "version": "0.1.0-beta.2",
+  "version": "0.1.0-beta.3",
   "description": "XBus — a durable local coordination layer for independent coding-agent sessions on one machine. Independent, unofficial; not affiliated with Anthropic.",
   "type": "module",
   "bin": {
@@ -18,10 +18,11 @@
     "test:security": "vitest run tests/security",
     "bench": "npm run build && node dist/tools/secure-transport-bench.js",
     "package:win": "npm run build && node dist/tools/package-win.js",
-    "verify:release": "npm run build && node dist/tools/verify-release.js"
+    "verify:release": "npm run build && node dist/tools/verify-release.js",
+    "accept:clean-machine": "npm run build && node scripts/clean-machine-accept.mjs"
   },
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.5 <25"
   },
   "dependencies": {
     "uuid": "11.1.1",
@@ -34,7 +35,7 @@
     "fast-check": "3.23.2",
     "typescript": "5.7.3",
     "typescript-eslint": "8.62.0",
-    "vitest": "2.1.8"
+    "vitest": "^4.1.9"
   },
   "license": "MIT",
   "private": true
