@@ -156,6 +156,15 @@ export function buildPackage(stagingDir: string): PackageResult {
   copyDir(path.join(REPO, '.claude-plugin'), path.join(stagingDir, '.claude-plugin'));
   fs.copyFileSync(path.join(REPO, '.mcp.json'), path.join(stagingDir, '.mcp.json'));
   copyDir(path.join(REPO, 'hooks'), path.join(stagingDir, 'hooks'));
+  // The PATH-free release-asset installer (Windows). Lets an archive user run
+  // `.\install.ps1` instead of typing the `node .\dist\cli\main.js install` bootstrap.
+  if (fs.existsSync(path.join(REPO, 'install.ps1'))) {
+    fs.copyFileSync(path.join(REPO, 'install.ps1'), path.join(stagingDir, 'install.ps1'));
+  }
+  // LICENSE notice for the archive.
+  if (fs.existsSync(path.join(REPO, 'LICENSE'))) {
+    fs.copyFileSync(path.join(REPO, 'LICENSE'), path.join(stagingDir, 'LICENSE'));
+  }
 
   // 2) Pinned PRODUCTION deps only.
   for (const dep of PROD_DEPS) {
