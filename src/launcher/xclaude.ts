@@ -44,7 +44,10 @@ function resolvePluginDir(): string {
   }
   const pluginDir = manifest.pluginDir;
   if (!fs.existsSync(path.join(pluginDir, '.claude-plugin', 'plugin.json'))) {
-    fail(`installed plugin dir is missing or corrupt: ${pluginDir}\n  Re-run: xbus install`);
+    // PATH-free: point at the real CLI entry (sibling of this launcher), not a
+    // bare `xbus` command that does not exist on PATH.
+    const cliJs = path.join(path.dirname(process.argv[1] ?? ''), '..', 'cli', 'main.js');
+    fail(`installed plugin dir is missing or corrupt: ${pluginDir}\n  Re-run: node "${cliJs}" install`);
   }
   return pluginDir;
 }

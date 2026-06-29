@@ -5,6 +5,7 @@
  * shell-profile integration remain separate, explicitly-requested steps.
  */
 import fs from 'node:fs';
+import path from 'node:path';
 import { IpcClient } from '../ipc/client.js';
 import { defaultEndpoint } from '../ipc/transport.js';
 import { startBrokerHost } from '../broker/host.js';
@@ -14,7 +15,7 @@ import { doHello, clientHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
 import { classifyShutdown, readStateFile, stateFilePath, pidIsAlive } from '../broker/state-file.js';
 import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
-import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, type CliResult } from './output.js';
+import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, invocationHint, type CliResult } from './output.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir } from '../launcher/install-paths.js';
@@ -45,8 +46,13 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
     return { human: lines.join('\n'), json: { ...r }, exitCode: 0 };
   }
   if (!r.ok) {
-    return { human: `xbus install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: xbus doctor`, json: { ...r }, exitCode: 1 };
+    return { human: `xbus install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: ${invocationHint('doctor')}`, json: { ...r }, exitCode: 1 };
   }
+  // PATH-free install: there is NO bare `xbus`/`xclaude` command. Print the exact
+  // copy-pasteable `node <path>` invocations (the installed plugin's own entries),
+  // never a bare command the installer did not put on PATH.
+  const launcherJs = path.join(r.plan.pluginDir, 'dist', 'launcher', 'xclaude.js');
+  const cliJs = path.join(r.plan.pluginDir, 'dist', 'cli', 'main.js');
   return {
     human: [
       `XBus installed.`,
@@ -55,8 +61,11 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
       `  health:     ${r.health?.detail}`,
       `  manifest:   ${r.manifestPath}`,
       ``,
-      `Launch Claude with XBus:  xclaude`,
-      `(PATH / shell-profile integration was NOT changed — request it separately if wanted.)`,
+      `Verify:  node "${cliJs}" doctor`,
+      `Launch Claude with XBus:  node "${launcherJs}"`,
+      `(Install is PATH-free: there is no bare 'xbus'/'xclaude' command. PATH /`,
+      ` shell-profile integration was NOT changed — request it separately if wanted.)`,
+      `See INSTALL.txt in the release asset for verify, launch, and uninstall steps.`,
     ].join('\n'),
     json: { ...r }, exitCode: 0,
   };
@@ -145,7 +154,7 @@ async function cmdDoctor(): Promise<CliResult> {
     c.close();
   } catch {
     brokerOk = false;
-    brokerInfo = 'not reachable (start with: xbus start)';
+    brokerInfo = `not reachable (start with: ${invocationHint('start')})`;
   }
   checks.push({ name: 'broker', ok: brokerOk, detail: `${brokerInfo}` });
   checks.push({ name: 'broker_pid', ok: true, detail: brokerPid });
@@ -335,7 +344,7 @@ async function cmdStop(): Promise<CliResult> {
         return { human: `Could not signal verified broker pid ${pid}: ${(ke as Error).message}`, json: { ok: false, pid }, exitCode: 1 };
       }
     }
-    return { human: `Broker not reachable and pid not alive; run: xbus doctor`, json: { ok: false }, exitCode: 1 };
+    return { human: `Broker not reachable and pid not alive; run: ${invocationHint('doctor')}`, json: { ok: false }, exitCode: 1 };
   }
 }
 
