@@ -82,13 +82,27 @@ export class Reaper {
    */
   private reapAckTimeouts(): { ackTimedOut: number; deadLettered: number } {
     const now = this.clock.nowIso();
+    // ELIGIBILITY: only ACK-REQUIRED messages may enter the ack-timeout path. A
+    // message with requires_ack=0 (fire-and-forget, or no-ack-reply-required) is
+    // NOT awaiting an acknowledgement, so its lease_expires_at must never trigger
+    // a requeue/dead-letter — doing so redelivers a message that was already
+    // terminal-by-contract. The JOIN + `m.requires_ack=1` filter is the fix; the
+    // per-statement guarded UPDATE (with the same requires_ack subquery) backstops
+    // it against a race where a message's eligibility changed between SELECT and
+    // UPDATE.
     const rows = this.db.prepare(
-      `SELECT message_id, recipient_session_id, attempt_ack_timeout
-       FROM deliveries
-       WHERE state='${DeliveryState.TRANSPORT_WRITTEN}'
-         AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
-       ORDER BY updated_at ASC`,
+      `SELECT d.message_id AS message_id, d.recipient_session_id AS recipient_session_id, d.attempt_ack_timeout AS attempt_ack_timeout
+       FROM deliveries d JOIN messages m ON m.message_id=d.message_id
+       WHERE d.state='${DeliveryState.TRANSPORT_WRITTEN}'
+         AND m.requires_ack=1
+         AND d.lease_expires_at IS NOT NULL AND d.lease_expires_at <= ?
+       ORDER BY d.updated_at ASC`,
     ).all(now) as Array<{ message_id: string; recipient_session_id: string; attempt_ack_timeout: number }>;
+
+    // Reusable guard fragment: the UPDATE only fires if the delivery is still
+    // transport_written AND its message still requires ack. A non-ack message can
+    // never be requeued/dead-lettered even if it raced into this loop.
+    const ackGuard = `AND (SELECT m.requires_ack FROM messages m WHERE m.message_id=deliveries.message_id)=1`;
 
     let ackTimedOut = 0;
     let deadLettered = 0;
@@ -102,7 +116,7 @@ export class Reaper {
       if (nextAttempt >= this.backoff.maxAttempts) {
         // Exhausted: dead-letter (the receiver never acknowledged within budget).
         const res = this.db.prepare(
-          `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', attempt_ack_timeout=?, failure_category='ack_timeout_exhausted', lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}'`,
+          `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', attempt_ack_timeout=?, failure_category='ack_timeout_exhausted', lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}' ${ackGuard}`,
         ).run(nextAttempt, now, r.message_id);
         if (res.changes > 0) { deadLettered++; this.audit('ACK_TIMEOUT_DEAD_LETTER', r.message_id, { attempt: nextAttempt }); }
       } else {
@@ -114,7 +128,7 @@ export class Reaper {
         const delayMs = nextBackoffMs(nextAttempt - 1, this.backoff, this.rng);
         const nextAttemptAt = new Date(this.clock.nowMs() + delayMs).toISOString();
         const res = this.db.prepare(
-          `UPDATE deliveries SET state='${DeliveryState.RETRY_WAIT}', attempt_ack_timeout=?, failure_category='ack_timeout', transport_written_at=NULL, lease_expires_at=NULL, target_instance_id=NULL, next_attempt_at=?, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}'`,
+          `UPDATE deliveries SET state='${DeliveryState.RETRY_WAIT}', attempt_ack_timeout=?, failure_category='ack_timeout', transport_written_at=NULL, lease_expires_at=NULL, target_instance_id=NULL, next_attempt_at=?, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}' ${ackGuard}`,
         ).run(nextAttempt, nextAttemptAt, now, r.message_id);
         if (res.changes > 0) {
           // Release any held lease for this delivery so a retry can re-acquire.

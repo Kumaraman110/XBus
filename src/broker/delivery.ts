@@ -123,6 +123,50 @@ export class DeliveryOps {
   }
 
   /**
+   * The ACK deadline anchored at injection time. ONLY a message that requires an
+   * ack gets one — a non-ack message has nothing to time out, so it must never
+   * carry a lease_expires_at (which is exactly what the ack-timeout reaper keys
+   * on). Returns the ISO deadline for an ack-required message, else null.
+   */
+  private ackDeadlineFor(requiresAck: boolean): string | null {
+    return requiresAck ? new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString() : null;
+  }
+
+  /**
+   * Reliability lifecycle close-out for a message that has JUST been successfully
+   * injected (selected, marked transport_written, transport-logged, injection
+   * recorded, and ABOUT TO BE returned in the checkpoint response). MUST be called
+   * only after the body is committed to the returned output.
+   *
+   * A message that requires NEITHER ack NOR reply is terminal the moment its body
+   * reaches the checkpoint: it transitions transport_written -> completed
+   * atomically (CAS guarded on state + requires_ack=0 via the state machine's
+   * `complete` edge), records application_completed_at, and clears the ack timer +
+   * any stale retry fields. A message that requires a reply (with or without ack)
+   * is left in its post-injection state to await the correlated reply; only the
+   * ack-required variant keeps an armed lease_expires_at.
+   *
+   * Returns true if it completed the delivery (fire-and-forget), else false.
+   */
+  private completeIfNoResponseRequired(messageId: string, requiresAck: boolean, requiresReply: boolean, now: string): boolean {
+    if (requiresAck || requiresReply) return false;
+    // CAS: transport_written -> completed, guarded so it can ONLY complete a
+    // non-ack delivery and only from the just-written state. Clears the ack timer
+    // and any stale retry fields (a fresh injection should carry none, but this
+    // makes the terminal row unambiguous and reaper-inert).
+    const res = this.db
+      .prepare(
+        `UPDATE deliveries SET state='${DeliveryState.COMPLETED}', application_completed_at=?, lease_expires_at=NULL, next_attempt_at=NULL, failure_category=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}' AND (SELECT requires_ack FROM messages WHERE message_id=?)=0`,
+      )
+      .run(now, now, messageId, messageId);
+    if (res.changes > 0) {
+      this.audit('DELIVERY_COMPLETED_NO_RESPONSE_REQUIRED', { messageId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Verify the caller's EPOCH is the session's current epoch (ADR 0003). This
    * replaces the connection-pinned fence: many components (mcp/hook) share one
    * epoch on different connections, so authority is epoch-scoped, not
@@ -184,9 +228,10 @@ export class DeliveryOps {
     return this.db.transaction(() => {
       const pending = this.pendingForSessionId(auth.sessionId, cappedLimit);
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const out: PendingMessage[] = [];
       for (const m of pending) {
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(m.requiresAck);
         const res = this.db
           .prepare(`UPDATE deliveries SET state='${DeliveryState.TRANSPORT_WRITTEN}', transport_written_at=?, lease_expires_at=?, target_instance_id=?, target_generation=?, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`)
           .run(now, deadline, auth.componentInstanceId, auth.epoch, now, m.messageId);
@@ -198,6 +243,9 @@ export class DeliveryOps {
         if (injection) md[INJECTION_METADATA_KEY] = injection.injectionId;
         out.push({ ...m, metadata: md });
         this.audit('TRANSPORT_WRITTEN', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId, messageId: m.messageId });
+        // Body is now committed to the returned response → a fire-and-forget
+        // message (no ack, no reply) becomes terminal immediately.
+        this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
       return out;
     });
@@ -223,9 +271,10 @@ export class DeliveryOps {
     return this.db.transaction(() => {
       const pending = this.pendingForSessionId(auth.sessionId, cappedLimit);
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const out: PendingMessage[] = [];
       for (const m of pending) {
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(m.requiresAck);
         const res = this.db
           .prepare(`UPDATE deliveries SET state='${DeliveryState.TRANSPORT_WRITTEN}', transport_written_at=?, lease_expires_at=?, target_instance_id=?, target_generation=?, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`)
           .run(now, deadline, auth.componentInstanceId, auth.epoch, now, m.messageId);
@@ -235,6 +284,7 @@ export class DeliveryOps {
         const md = { ...(m.metadata ?? {}) } as Record<string, string>;
         if (injection) md[INJECTION_METADATA_KEY] = injection.injectionId;
         out.push({ ...m, metadata: md });
+        this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
       return out;
     });
@@ -287,14 +337,25 @@ export class DeliveryOps {
       .all(auth.epoch, auth.sessionId, now, limit) as Array<Record<string, unknown>>;
     for (const r of rows) {
       if (freshIds.has(r.message_id as string)) continue;
+      const requiresAck = (r.requires_ack as number) === 1;
+      const requiresReply = (r.requires_reply as number) === 1;
+      // A non-ack message in transport_written is NOT "unacknowledged" — it is
+      // never going to be acked. (Fire-and-forget messages have already left
+      // transport_written for `completed`, so any non-ack row here is awaiting a
+      // reply.) Don't offer ack/reject for it, and don't label it as awaiting an
+      // ack the contract never required.
+      const state: InboxEntryState = requiresAck ? 'context_injected_unacknowledged' : 'application_accepted';
+      const allowedActions = requiresAck
+        ? ['ack', 'reject', 'reply', 'request-explicit-redelivery']
+        : [...(requiresReply ? ['reply'] : []), 'request-explicit-redelivery'];
       entries.push({
         messageId: r.message_id as string, injectionId: (r.injection_id as string) ?? null,
         senderAlias: r.sender_alias as string, recipientAlias: r.recipient_alias as string, kind: r.kind as string,
         correlationId: r.correlation_id as string, causationId: (r.causation_id as string) ?? null, sequence: r.recipient_sequence as number,
-        requiresAck: (r.requires_ack as number) === 1, requiresReply: (r.requires_reply as number) === 1,
-        state: 'context_injected_unacknowledged', bodyAlreadyPresented: true, bodyIncluded: false,
+        requiresAck, requiresReply,
+        state, bodyAlreadyPresented: true, bodyIncluded: false,
         createdAt: r.created_at as string, expiresAt: (r.expires_at as string) ?? null,
-        allowedActions: ['ack', 'reject', 'reply', 'request-explicit-redelivery'],
+        allowedActions,
       });
     }
     return entries;
@@ -432,9 +493,16 @@ export class DeliveryOps {
   markInjectedFor(auth: SessionAuthority, messageIds: string[]): string[] {
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const marked: string[] = [];
       for (const messageId of messageIds) {
+        // The message's response requirements decide whether an ack timer is armed
+        // and whether the delivery completes on injection. Read them once here.
+        const flags = this.db.prepare('SELECT requires_ack, requires_reply FROM messages WHERE message_id=?').get(messageId) as { requires_ack: number; requires_reply: number } | undefined;
+        if (!flags) continue; // unknown message id — nothing to inject
+        const requiresAck = flags.requires_ack === 1;
+        const requiresReply = flags.requires_reply === 1;
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(requiresAck);
         // CAS: only from queued/retry_wait -> transport_written.
         const res = this.db
           .prepare(
@@ -447,6 +515,10 @@ export class DeliveryOps {
             .run(this.ids.next(), messageId, auth.instanceId, 0, now, messageId);
           marked.push(messageId);
           this.audit('TRANSPORT_WRITTEN', { sessionId: auth.sessionId, instanceId: auth.instanceId, messageId });
+          // markInjectedFor returns only the marked ids (the legacy contract path
+          // doesn't return bodies), but the lifecycle close-out is the same: a
+          // fire-and-forget message becomes terminal immediately on injection.
+          this.completeIfNoResponseRequired(messageId, requiresAck, requiresReply, now);
         }
       }
       return marked;
