@@ -161,6 +161,15 @@ export function buildPackage(stagingDir: string): PackageResult {
   if (fs.existsSync(path.join(REPO, 'install.ps1'))) {
     fs.copyFileSync(path.join(REPO, 'install.ps1'), path.join(stagingDir, 'install.ps1'));
   }
+  // Self-contained install guide for the RELEASE ASSET — a clean-profile user must
+  // be able to install/verify/launch/uninstall from instructions INSIDE the asset,
+  // with no source checkout and no maintainer knowledge. (install.ps1 + xclaude
+  // reference THIS file, not the repo-only docs/installation.md which is not shipped.)
+  if (fs.existsSync(path.join(REPO, 'INSTALL.txt'))) {
+    fs.copyFileSync(path.join(REPO, 'INSTALL.txt'), path.join(stagingDir, 'INSTALL.txt'));
+  } else {
+    throw new Error('INSTALL.txt not found at repo root — the release asset must ship a self-contained install guide');
+  }
   // LICENSE notice for the archive.
   if (fs.existsSync(path.join(REPO, 'LICENSE'))) {
     fs.copyFileSync(path.join(REPO, 'LICENSE'), path.join(stagingDir, 'LICENSE'));
@@ -260,7 +269,7 @@ export function buildPackage(stagingDir: string): PackageResult {
   // 9) Verify EXPECTED outputs are present — never report success on an empty/
   //    partial dir. (Superseded by the contract validator below, kept
   //    as a fast fail-fast.)
-  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod'];
+  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'INSTALL.txt', 'install.ps1', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod'];
   const missingOutputs = expected.filter((e) => !fs.existsSync(path.join(stagingDir, e)));
 
   // 8b) NORMATIVE artifact-contract validation: the SAME validator the

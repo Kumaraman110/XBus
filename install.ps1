@@ -7,7 +7,7 @@
   bootstraps the supported entrypoint: it verifies Node, then runs the built CLI's
   `install` from THIS directory. It does NOT modify PATH, the registry, or a shell
   profile. After install, invoke XBus via `node .\dist\cli\main.js <command>` or the
-  installed plugin's absolute path (see docs/installation.md).
+  installed plugin's absolute path (see INSTALL.txt in this folder).
 
 .NOTES
   Requires Node.js >= 22.5 and < 25 (Node 25+ is not yet supported).
@@ -43,7 +43,7 @@ if ($DryRun) {
     Write-Host "Installed. XBus did NOT modify PATH. Invoke it with:"
     Write-Host "  node `"$cli`" doctor"
     Write-Host "  node `"$here\dist\launcher\xclaude.js`""
-    Write-Host "See docs/installation.md for the installed-plugin absolute paths."
+    Write-Host "See INSTALL.txt (in this folder) for verify, launch, and uninstall steps."
   }
 }
 exit $LASTEXITCODE

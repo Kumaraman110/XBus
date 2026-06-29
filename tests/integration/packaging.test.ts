@@ -110,4 +110,32 @@ describe('§7 isolated Windows packaging', () => {
     expect(pkg.scripts).toBeUndefined();
     expect(pkg.engines.node).toBeTruthy();
   });
+
+  it('ships a self-contained install guide and references NO unshipped repo docs', () => {
+    // A clean-profile user must be able to install/verify/launch/uninstall from
+    // instructions INSIDE the asset, with no source checkout and no maintainer
+    // knowledge. (Regression: the asset once shipped install.ps1 that pointed at
+    // docs/installation.md, which is not packaged — a circular/missing-instruction
+    // BLOCK condition.)
+    const guide = path.join(staging, 'INSTALL.txt');
+    expect(fs.existsSync(guide), 'INSTALL.txt must ship in the asset').toBe(true);
+    const guideText = fs.readFileSync(guide, 'utf8');
+    // It must cover the full lifecycle a human acceptance run exercises.
+    for (const cmd of ['install.ps1', 'doctor', 'xclaude', 'uninstall']) {
+      expect(guideText, `INSTALL.txt must mention ${cmd}`).toContain(cmd);
+    }
+    // INSTALL.txt is checksum-covered like every other shipped file.
+    const sums = fs.readFileSync(path.join(staging, 'SHA256SUMS'), 'utf8');
+    expect(sums).toMatch(/ {2}INSTALL\.txt$/m);
+    // No shipped install instruction may point at a repo-only docs/ path that is
+    // not packaged (install.ps1 + INSTALL.txt are the user-facing entrypoints).
+    for (const f of ['install.ps1', 'INSTALL.txt']) {
+      const p = path.join(staging, f);
+      if (fs.existsSync(p)) {
+        const text = fs.readFileSync(p, 'utf8');
+        const refsRepoDocs = /docs\/[A-Za-z0-9._-]+\.md/.exec(text);
+        expect(refsRepoDocs, `${f} references unshipped repo doc ${refsRepoDocs?.[0] ?? ''}`).toBeNull();
+      }
+    }
+  });
 });

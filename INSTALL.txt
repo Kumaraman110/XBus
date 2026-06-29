@@ -1,0 +1,122 @@
+XBus — Windows release asset
+=============================
+
+XBus is a durable local coordination layer that lets independently-launched
+Claude Code CLI sessions on ONE computer, under ONE OS user, discover each other
+and exchange messages. It is an independent, unofficial open-source project by
+Aman Kumar; it is not affiliated with or endorsed by Anthropic.
+
+This file is the self-contained install guide for the RELEASE ASSET (this ZIP).
+You do NOT need a source checkout, a git clone, "npm install", or any network
+access to install from this asset. Everything needed is already inside this
+folder.
+
+
+Requirements
+------------
+  - Windows.
+  - Node.js >= 22.5 and < 25  (Node 22 LTS or Node 24; Node 25+ is NOT yet
+    supported and will be refused with an actionable message).
+  - Do NOT set XBUS_ALLOW_UNSUPPORTED_NODE — supported runtimes do not need it.
+
+Check your Node:
+    node --version
+
+
+Install (PATH-free)
+-------------------
+From a PowerShell window opened IN this extracted folder:
+
+    .\install.ps1
+
+That is the whole install. It verifies Node, then runs the bundled CLI's
+`install` from this folder. It is reversible and it does NOT modify PATH, the
+registry, or your PowerShell profile.
+
+To preview first without writing anything:
+
+    .\install.ps1 -DryRun
+
+If you prefer to call the CLI directly (equivalent to the above):
+
+    node .\dist\cli\main.js install --dry-run    # preview, writes nothing
+    node .\dist\cli\main.js install              # user-scope install
+
+
+What install does
+-----------------
+  1. Copies the XBus plugin to a user-scope install root
+     (default: %USERPROFILE%\.claude\xbus-install\plugin).
+  2. Registers the XBus MCP server + checkpoint hook for Claude Code (user scope).
+  3. Creates an ACL-restricted per-user data directory with a per-install secret
+     (default: %USERPROFILE%\.claude\xbus-install\data).
+
+It writes ONLY under your user scope. It does NOT change PATH, the registry, or
+any shell profile. There is intentionally no global `xbus` command in this
+preview — you invoke XBus with `node <path>` as shown below.
+
+
+Verify the install
+-------------------
+    node .\dist\cli\main.js doctor
+
+`doctor` reports the installed build identity (productVersion, buildId,
+compatibilityId, installedArtifactManifestSha256) and broker health.
+
+
+Launch Claude Code with XBus enabled
+------------------------------------
+    node .\dist\launcher\xclaude.js
+
+`xclaude` spawns your own `claude` with `--plugin-dir <installed plugin>` and
+forwards your arguments verbatim. If `claude` is not on your PATH, set
+CLAUDE_CODE_EXECPATH to its full path first, e.g.:
+
+    $env:CLAUDE_CODE_EXECPATH = "C:\path\to\claude.cmd"
+    node .\dist\launcher\xclaude.js
+
+On Amazon Bedrock, delivery is at the receiver's next checkpoint (its next
+prompt); idle sessions are not woken. See the project README for the honest
+delivery-semantics notes.
+
+
+Invoke an installed XBus by absolute path
+-----------------------------------------
+After install you can run the installed copy directly (no need to keep this
+extracted folder):
+
+    node "$HOME\.claude\xbus-install\plugin\dist\cli\main.js" doctor
+    node "$HOME\.claude\xbus-install\plugin\dist\launcher\xclaude.js"
+
+
+Uninstall (reversible)
+----------------------
+    node .\dist\cli\main.js uninstall --dry-run    # preview what would be removed
+    node .\dist\cli\main.js uninstall              # remove plugin + manifest; KEEPS data
+
+By default your broker data dir + secret are RETAINED. To remove those too:
+
+    node .\dist\cli\main.js uninstall --remove-data
+
+Uninstall removes the plugin payload + install manifest + the MCP/hook
+registration. It does NOT need to undo any PATH or shell-profile change, because
+install never made one.
+
+
+Integrity
+---------
+SHA256SUMS lists a SHA-256 for every payload file in this asset. To verify a
+file on Windows:
+
+    Get-FileHash .\dist\cli\main.js -Algorithm SHA256
+
+provenance.json records the exact, deterministic build identity (productVersion,
+buildId, sourceCommit, compatibilityId) that `doctor` reports at runtime.
+
+
+More
+----
+Full project documentation, security model, and the secure-transport spec live
+in the public repository: https://github.com/Kumaraman110/XBus
+
+License: MIT (see the LICENSE file in this asset).
