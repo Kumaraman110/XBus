@@ -21,6 +21,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { readInstallManifest, defaultInstallRoot, resolveDataDir } from './install-paths.js';
 import { assertSupportedNode } from '../shared/node-support.js';
+import { resolveClaudeExecutable, isResolved } from './resolve-claude.js';
 
 function fail(msg: string): never {
   process.stderr.write(`xclaude: ${msg}\n`);
@@ -80,8 +81,19 @@ function main(): void {
   if (requireFake && !explicitBin) {
     fail('test mode requires CLAUDE_CODE_EXECPATH to point at a fake claude executable; refusing to resolve the real `claude`.');
   }
-  const claudeBin = explicitBin || 'claude';
   const args = buildClaudeArgs(pluginDir, userArgs);
+
+  // Resolve a LAUNCHABLE claude. An explicit CLAUDE_CODE_EXECPATH wins; otherwise
+  // we find it on PATH the way Windows actually would (where.exe per concrete file
+  // name, preferring claude.cmd), NOT by spawning the bare token `claude` (which
+  // Node's non-shell spawn cannot launch on Windows → ENOENT). No shell injection.
+  const resolved = resolveClaudeExecutable({ explicitPath: explicitBin, env: process.env, platform: process.platform });
+  if (!isResolved(resolved)) {
+    // Actionable: names the lookup strategy + attempts; never claims Claude is
+    // missing when Windows command lookup can actually find it.
+    fail(resolved.message);
+  }
+  const claudeBin = resolved.execPath;
 
   // Activation is explicit + visible.
   process.stderr.write(`xclaude: launching Claude Code with XBus plugin: ${pluginDir}\n`);
@@ -96,13 +108,12 @@ function main(): void {
   // installed data dir — not a divergent default. A user-set XBUS_DATA_DIR wins.
   env.XBUS_DATA_DIR = resolveDataDir();
 
-  // Windows: a .cmd/.bat shim (e.g. claude.cmd) cannot be spawned directly
-  // (EINVAL); route it through cmd.exe with each token explicitly quoted so
-  // spaces/special chars survive intact. Everything else spawns directly (Node
-  // quotes argv itself). We never build a shell string for the non-batch path.
-  const isWinBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(claudeBin);
+  // A .cmd/.bat shim cannot be spawned directly on Windows (EINVAL/ENOENT); route
+  // it through cmd.exe with each token explicitly quoted so spaces/special chars
+  // survive intact. A native executable is spawned directly (Node quotes argv
+  // itself). We never build a shell string for the direct path.
   let child;
-  if (isWinBatch) {
+  if (resolved.launchVia === 'cmd') {
     // `cmd /s /c "<line>"`: with /s, cmd strips exactly one leading and one
     // trailing quote from the whole line and runs the remainder verbatim. So we
     // quote every token (preserving embedded spaces — e.g. a plugin dir under
@@ -114,7 +125,7 @@ function main(): void {
   }
   child.on('error', (e: NodeJS.ErrnoException) => {
     if (e.code === 'ENOENT') {
-      fail(`could not find the 'claude' executable. Install Claude Code, or set CLAUDE_CODE_EXECPATH.`);
+      fail(`could not launch the resolved 'claude' at ${claudeBin} (ENOENT). It may have been moved or be the wrong kind of file. Set CLAUDE_CODE_EXECPATH to a launchable Claude Code executable (advanced).`);
     }
     fail(`failed to launch claude: ${e.message}`);
   });
