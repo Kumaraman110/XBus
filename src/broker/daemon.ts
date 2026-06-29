@@ -12,7 +12,7 @@ import type { Clock, IdGen } from '../shared/clock.js';
 import { IpcServer, type ServerConn, type ServerOptions } from '../ipc/server.js';
 import { makeFrame, type Frame, type FrameType, type RegisterPayload } from '../protocol/commands.js';
 import { BrokerStore, type SessionAuthority } from './store.js';
-import { DeliveryOps } from './delivery.js';
+import { DeliveryOps, INJECTION_METADATA_KEY } from './delivery.js';
 import { Reaper, type SweepResult } from './reaper.js';
 import { DeadLetterStore } from './deadletter.js';
 import { ControlsStore, type ReceiveControl } from './controls.js';
@@ -326,11 +326,19 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number };
     const pending = this.delivery.pendingForSession(auth, p.limit !== undefined ? { limit: p.limit } : {});
-    // Mark them injected (transport_written) — ack deadline starts now.
+    // Mark them injected (transport_written) — ack deadline starts now. markInjected
+    // reports only NEWLY-injected ids; an already-injected message re-selected after
+    // an ack-timeout requeue is re-armed but NOT reported, so its body is not
+    // re-presented (Layer-3 invariant). Each newly-injected message has a valid
+    // injection record — surface its id so a returned body NEVER lacks one.
     const marked = this.delivery.markInjected(auth, pending.map((m) => m.messageId));
     const markedSet = new Set(marked);
     this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
-    this.reply(conn, 'checkpoint_pull_ack', { messages: pending.filter((m) => markedSet.has(m.messageId)) }, frame.requestId);
+    const messages = pending.filter((m) => markedSet.has(m.messageId)).map((m) => {
+      const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
+      return injectionId ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } } : m;
+    });
+    this.reply(conn, 'checkpoint_pull_ack', { messages }, frame.requestId);
   }
 
   /**

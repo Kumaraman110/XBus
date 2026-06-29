@@ -201,12 +201,17 @@ describe('non-ack redelivery regression', () => {
 
     // Re-inject and time out again until exhaustion -> dead_letter. Advance PAST
     // the backoff window FIRST (the requeue armed a future next_attempt_at, and
-    // injection-selection gates on next_attempt_at <= now), then re-inject, then
-    // let the ack deadline lapse and sweep.
+    // injection-selection gates on next_attempt_at <= now), then re-inject (which
+    // re-arms the ack deadline so escalation proceeds — the body is NOT re-presented
+    // on re-injection, per the Layer-3 invariant; escalation is verified by STATE),
+    // then let the ack deadline lapse and sweep.
     for (let i = 1; i < 3; i++) {
       clock.advance(60_000); // clear the backoff window (maxDelay cap = 60s)
-      const got = delivery.checkpointPull(hookAuth(authB), `cp-${i}`, 10);
-      expect(got.find((m) => m.messageId === messageId)).toBeTruthy();
+      delivery.checkpointPull(hookAuth(authB), `cp-${i}`, 10);
+      // Re-injection re-arms the ack deadline (transport_written) so the reaper can
+      // time it out again — the escalation engine, not a body re-presentation.
+      expect(deliveryRow(messageId).state).toBe('transport_written');
+      expect(deliveryRow(messageId).lease_expires_at).not.toBeNull();
       clock.advance(ACK_DEADLINE_MS + 1000);
       reaper.sweep();
     }

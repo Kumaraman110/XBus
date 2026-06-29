@@ -152,9 +152,16 @@ describe('durability + fencing', () => {
 
     // Queued messages survived.
     const pull = await B2.request('checkpoint_pull', { limit: 10 });
-    const texts = (pull.payload as { messages: Array<{ text: string }> }).messages.map((m) => m.text);
+    const pulledMsgs = (pull.payload as { messages: Array<{ text: string; metadata: Record<string, string> | null }> }).messages;
+    const texts = pulledMsgs.map((m) => m.text);
     expect(texts).toContain('msg-1');
     expect(texts).toContain('msg-2');
+    // Layer-3: every returned body carries a valid (non-empty) injection id — a
+    // normal checkpoint must never return a body without one.
+    for (const m of pulledMsgs) {
+      expect(typeof m.text === 'string' && m.text.length > 0).toBe(true);
+      expect(m.metadata?.xbus_injection_id, 'returned body must carry a valid injection id').toBeTruthy();
+    }
 
     // Sequence did NOT reset: a new send gets sequence 3.
     const s3 = await A2.request('send_message', { to: 'implementer', text: 'msg-3', requiresAck: true });
