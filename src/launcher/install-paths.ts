@@ -42,12 +42,16 @@ export interface InstallManifest {
    *  on user-scope Claude config entries so uninstall removes only what we created. */
   installId?: string;
   /** Beta.4: record of the user-scope Claude MCP+hooks registration (so uninstall
-   *  can reverse it, and doctor/repair can detect drift). Absent if not registered. */
+   *  can reverse it, and doctor/repair can detect drift). Absent if not registered.
+   *  MCP servers live in configPath (~/.claude.json); hooks live in settingsPath
+   *  (~/.claude/settings.json) — two distinct files Claude Code reads separately. */
   userScope?: {
     configPath: string;
+    settingsPath: string;
     registeredAt: string;
-    /** Pre-install backup of the user's config (restorable). */
+    /** Pre-install backups (restorable). */
     backupPath?: string;
+    settingsBackupPath?: string;
   };
 }
 

@@ -24,7 +24,7 @@ import { XBUS_VERSION } from '../protocol/version.js';
 import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, type InstallManifest } from '../launcher/install-paths.js';
 import { validateArtifact } from '../shared/artifact-contract.js';
 import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
-import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath } from './user-scope-config.js';
+import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
 
 export interface InstallOptions {
   /** Source plugin root (the built repo, or a staged artifact). Default cwd. */
@@ -41,8 +41,11 @@ export interface InstallOptions {
    *  plain `claude` discovers it (no --plugin-dir). Default true. Tests/CI may set
    *  false (plugin-only install) or point `claudeConfigPath` at a temp file. */
   registerUserScope?: boolean;
-  /** Override the user Claude config path (tests). Default: platform ~/.claude.json. */
+  /** Override the user Claude MCP config path (tests). Default: platform ~/.claude.json. */
   claudeConfigPath?: string;
+  /** Override the user Claude SETTINGS path where hooks live (tests). Default:
+   *  platform ~/.claude/settings.json. */
+  claudeSettingsPath?: string;
   /** Absolute node executable path written into the user-scope MCP/hook command.
    *  Default: the current process's node. */
   nodePath?: string;
@@ -269,8 +272,10 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     if (wantUserScope) {
       const installId = `xbus-${now.replace(/[:.]/g, '-')}-${process.pid}`;
       const configPath = opts.claudeConfigPath ?? defaultClaudeConfigPath();
+      const settingsPath = opts.claudeSettingsPath ?? defaultClaudeSettingsPath();
       const usr = registerUserScope({
         configPath,
+        settingsPath,
         nodePath: opts.nodePath ?? process.execPath,
         serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
@@ -282,7 +287,7 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
         const rb = rollback(installRoot, partial);
         return { ok: false, dryRun: false, plan, rolledBack: rb, error: `user-scope config registration failed: ${usr.error}` };
       }
-      userScope = { configPath, registeredAt: now, ...(usr.backupPath ? { backupPath: usr.backupPath } : {}) };
+      userScope = { configPath, settingsPath, registeredAt: now, ...(usr.backupPath ? { backupPath: usr.backupPath } : {}), ...(usr.settingsBackupPath ? { settingsBackupPath: usr.settingsBackupPath } : {}) };
       // Persist the userScope record + installId into the manifest (rewrite it).
       const updated: InstallManifest = { ...manifest, installId, userScope };
       fs.writeFileSync(manifestPath(installRoot), JSON.stringify(updated, null, 2) + '\n');
@@ -396,6 +401,7 @@ export function uninstall(opts: UninstallOptions = {}): UninstallResult {
     try {
       const u = unregisterUserScope({
         configPath: manifest.userScope.configPath,
+        settingsPath: manifest.userScope.settingsPath,
         nodePath: process.execPath,
         serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),

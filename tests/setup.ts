@@ -37,5 +37,10 @@ if (!process.env.XBUS_LEGACY_DATA_DIR) {
 // behavior sets its own CLAUDE_CONFIG_PATH (or passes claudeConfigPath to install()).
 if (!process.env.CLAUDE_CONFIG_PATH) {
   const isolatedCfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-test-claudecfg-'));
-  process.env.CLAUDE_CONFIG_PATH = path.join(isolatedCfgDir, 'claude.json');
+  process.env.CLAUDE_CONFIG_PATH = path.join(isolatedCfgDir, '.claude.json');
+  // Hooks live in a SEPARATE file (~/.claude/settings.json). Pin it under the same
+  // isolated dir so no test ever writes the developer's real settings.json either.
+  if (!process.env.CLAUDE_SETTINGS_PATH) {
+    process.env.CLAUDE_SETTINGS_PATH = path.join(isolatedCfgDir, '.claude', 'settings.json');
+  }
 }

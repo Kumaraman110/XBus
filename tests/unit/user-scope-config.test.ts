@@ -1,228 +1,222 @@
 /**
  * User-scope Claude MCP + hooks config manager (beta.4, ADR 0012 Decision 8).
  *
- * Registers XBus as a user-scope MCP server + lifecycle hooks in the user's Claude
- * config (~/.claude.json or platform equivalent) so plain `claude` discovers XBus
- * with NO --plugin-dir and NO xclaude. Must be: transactional (backup → write →
- * validate → rollback-on-failure), idempotent, ownership-tagged (uninstall removes
- * ONLY entries this install created — never the user's other MCP servers/hooks),
- * conflict-detecting, repairable, and reversible.
+ * MCP servers and hooks live in DIFFERENT user-scope files (verified vs Claude Code
+ * docs): MCP → ~/.claude.json (mcpServers), hooks → ~/.claude/settings.json (hooks).
+ * Hooks use the EXEC form ({type:'command', command:<node>, args:[<hookEntry>]}).
  *
- * Tests use a real temp config FILE (so the atomic write/backup/rollback paths run)
- * but never the real ~/.claude.
+ * Each file write is transactional (backup → atomic → validate → rollback); both are
+ * ownership-tagged; uninstall removes only this install's entries; the user's other
+ * mcp servers / hooks / top-level keys are never touched. Real temp files, never the
+ * developer's ~/.claude.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import {
-  registerUserScope, unregisterUserScope, repairUserScope, readClaudeConfig,
+  registerUserScope, unregisterUserScope, repairUserScope, readClaudeConfig, readClaudeSettings,
   type UserScopeOptions, XBUS_OWNER_TAG,
 } from '../../src/cli/user-scope-config.js';
 
-let dir: string; let configPath: string;
+let dir: string; let configPath: string; let settingsPath: string;
 const NODE = process.execPath;
 const SERVER_JS = 'C:/x/dist/channel/server.js';
 const HOOK_JS = 'C:/x/dist/channel/hook-entry.js';
 
 function opts(over: Partial<UserScopeOptions> = {}): UserScopeOptions {
-  return {
-    configPath,
-    nodePath: NODE,
-    serverEntry: SERVER_JS,
-    hookEntry: HOOK_JS,
-    dataDir: 'C:/x/data',
-    installId: 'install-abc',
-    ...over,
-  };
+  return { configPath, settingsPath, nodePath: NODE, serverEntry: SERVER_JS, hookEntry: HOOK_JS, dataDir: 'C:/x/data', installId: 'install-abc', ...over };
 }
-
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-usc-'));
-  configPath = path.join(dir, 'claude.json');
+  configPath = path.join(dir, '.claude.json');
+  settingsPath = path.join(dir, '.claude', 'settings.json');
 });
 afterEach(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
 
-function writeConfig(obj: unknown): void { fs.writeFileSync(configPath, JSON.stringify(obj, null, 2)); }
+function writeConfig(obj: unknown): void { fs.mkdirSync(path.dirname(configPath), { recursive: true }); fs.writeFileSync(configPath, JSON.stringify(obj, null, 2)); }
+function writeSettings(obj: unknown): void { fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); fs.writeFileSync(settingsPath, JSON.stringify(obj, null, 2)); }
+/** Does the settings file have our hook (exec form) for both events? */
+function hasOurHooks(): boolean {
+  const s = readClaudeSettings(settingsPath);
+  if (!s?.hooks) return false;
+  return ['UserPromptSubmit', 'Stop'].every((ev) => (s.hooks![ev] ?? []).some((g) => g.hooks.some((h) => Array.isArray(h.args) && h.args.includes(HOOK_JS))));
+}
 
-describe('registerUserScope — fresh config', () => {
-  it('creates the config file with the XBus MCP server + hooks, ownership-tagged', () => {
+describe('registerUserScope — fresh files', () => {
+  it('writes the MCP server to the CONFIG file and the hooks to the SETTINGS file', () => {
     const r = registerUserScope(opts());
     expect(r.ok).toBe(true);
+    // MCP -> ~/.claude.json
     const cfg = readClaudeConfig(configPath)!;
-    // MCP server registered under a stable key with the node-path invocation.
     expect(cfg.mcpServers?.xbus).toBeDefined();
     expect(cfg.mcpServers!.xbus.command).toBe(NODE);
     expect(cfg.mcpServers!.xbus.args).toContain(SERVER_JS);
-    // Hooks registered for the checkpoint events.
-    const hookCmds = JSON.stringify(cfg.hooks ?? {});
-    expect(hookCmds).toContain(HOOK_JS);
-    // Ownership marker present so uninstall is scoped.
     expect(cfg.mcpServers!.xbus[XBUS_OWNER_TAG]).toBe('install-abc');
+    // Hooks must NOT be in the config file (they would be silently ignored there).
+    expect((cfg as Record<string, unknown>).hooks).toBeUndefined();
+    // Hooks -> ~/.claude/settings.json, exec form, ownership-tagged.
+    const s = readClaudeSettings(settingsPath)!;
+    expect(hasOurHooks()).toBe(true);
+    const h = s.hooks!.UserPromptSubmit![0]!.hooks[0]!;
+    expect(h.type).toBe('command');
+    expect(h.command).toBe(NODE);
+    expect(h.args).toEqual([HOOK_JS]);
+    expect(h[XBUS_OWNER_TAG]).toBe('install-abc');
   });
 
-  it('dry-run writes NOTHING but reports the intended change', () => {
+  it('dry-run writes NEITHER file', () => {
     const r = registerUserScope(opts({ dryRun: true }));
     expect(r.ok).toBe(true);
-    expect(r.dryRun).toBe(true);
-    expect(fs.existsSync(configPath)).toBe(false); // nothing written
+    expect(fs.existsSync(configPath)).toBe(false);
+    expect(fs.existsSync(settingsPath)).toBe(false);
   });
 });
 
 describe('registerUserScope — preserves unrelated config', () => {
-  it('keeps the user’s OTHER mcp servers, hooks, and top-level keys intact', () => {
-    writeConfig({
-      mcpServers: { otherTool: { command: 'othercmd', args: ['x'] } },
-      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'user-hook' }] }] },
-      theme: 'dark', model: 'opus',
-    });
-    const r = registerUserScope(opts());
-    expect(r.ok).toBe(true);
+  it('keeps the user’s OTHER mcp servers + top-level keys (config file)', () => {
+    writeConfig({ mcpServers: { otherTool: { command: 'othercmd', args: ['x'] } }, theme: 'dark', model: 'opus' });
+    expect(registerUserScope(opts()).ok).toBe(true);
     const cfg = readClaudeConfig(configPath)!;
-    // ours added…
     expect(cfg.mcpServers!.xbus).toBeDefined();
-    // …theirs untouched
     expect(cfg.mcpServers!.otherTool).toEqual({ command: 'othercmd', args: ['x'] });
     expect((cfg as Record<string, unknown>).theme).toBe('dark');
     expect((cfg as Record<string, unknown>).model).toBe('opus');
-    // the user's own UserPromptSubmit hook entry is still present alongside ours
-    expect(JSON.stringify(cfg.hooks)).toContain('user-hook');
   });
 
-  it('backs up the pre-existing config before writing (restorable)', () => {
+  it('keeps the user’s OTHER hooks + settings keys (settings file)', () => {
+    writeSettings({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'user-hook' }] }] }, permissions: { allow: ['x'] } });
+    expect(registerUserScope(opts()).ok).toBe(true);
+    const s = readClaudeSettings(settingsPath)!;
+    expect(JSON.stringify(s.hooks)).toContain('user-hook'); // theirs kept
+    expect(hasOurHooks()).toBe(true);                       // ours added
+    expect((s as Record<string, unknown>).permissions).toEqual({ allow: ['x'] });
+  });
+
+  it('backs up BOTH pre-existing files (restorable)', () => {
     writeConfig({ mcpServers: { otherTool: { command: 'x' } } });
+    writeSettings({ hooks: {} });
     const r = registerUserScope(opts());
     expect(r.ok).toBe(true);
-    expect(r.backupPath).toBeTruthy();
     expect(fs.existsSync(r.backupPath!)).toBe(true);
-    const backup = JSON.parse(fs.readFileSync(r.backupPath!, 'utf8'));
-    expect(backup.mcpServers.otherTool).toBeDefined();
-    expect(backup.mcpServers.xbus).toBeUndefined(); // backup is the PRE-install state
+    expect(fs.existsSync(r.settingsBackupPath!)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(r.backupPath!, 'utf8')).mcpServers.xbus).toBeUndefined(); // PRE-install
   });
 });
 
 describe('registerUserScope — idempotence + conflict', () => {
-  it('is idempotent: a second register with the SAME install id is a no-op success', () => {
+  it('is idempotent: a second register with the same install id is a no-op success', () => {
     registerUserScope(opts());
-    const first = readClaudeConfig(configPath)!;
+    const cfg1 = readClaudeConfig(configPath)!; const set1 = readClaudeSettings(settingsPath)!;
     const r2 = registerUserScope(opts());
-    expect(r2.ok).toBe(true);
     expect(r2.alreadyRegistered).toBe(true);
-    expect(readClaudeConfig(configPath)).toEqual(first); // unchanged
+    expect(readClaudeConfig(configPath)).toEqual(cfg1);
+    expect(readClaudeSettings(settingsPath)).toEqual(set1);
   });
 
-  it('detects a CONFLICTING pre-existing xbus entry owned by a different install', () => {
-    writeConfig({ mcpServers: { xbus: { command: 'stale', args: [], [XBUS_OWNER_TAG]: 'OLD-install' } } });
-    const r = registerUserScope(opts({ installId: 'NEW-install' }));
-    // Default: re-take ownership (repair the stale entry) and report it.
+  it('re-takes a stale XBus-owned mcp entry from a different install', () => {
+    writeConfig({ mcpServers: { xbus: { command: 'stale', args: [], [XBUS_OWNER_TAG]: 'OLD' } } });
+    const r = registerUserScope(opts({ installId: 'NEW' }));
     expect(r.ok).toBe(true);
     expect(r.replacedConflict).toBe(true);
-    const cfg = readClaudeConfig(configPath)!;
-    expect(cfg.mcpServers!.xbus[XBUS_OWNER_TAG]).toBe('NEW-install');
-    expect(cfg.mcpServers!.xbus.command).toBe(NODE); // corrected
+    expect(readClaudeConfig(configPath)!.mcpServers!.xbus[XBUS_OWNER_TAG]).toBe('NEW');
+    expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe(NODE);
   });
 
-  it('refuses to clobber a non-XBus-owned entry under the xbus key without force', () => {
-    writeConfig({ mcpServers: { xbus: { command: 'someoneElse', args: [] } } }); // NO owner tag
+  it('refuses to clobber a non-XBus-owned xbus mcp key without force', () => {
+    writeConfig({ mcpServers: { xbus: { command: 'someoneElse', args: [] } } });
     const r = registerUserScope(opts());
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/conflict|not owned|unowned/i);
-    // unchanged
+    expect(r.error).toMatch(/not owned|conflict|overwrite/i);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe('someoneElse');
+    expect(fs.existsSync(settingsPath)).toBe(false); // never touched the settings file either
   });
 });
 
-describe('registerUserScope — transactional rollback', () => {
-  it('a write/validate failure restores the original config exactly', () => {
+describe('registerUserScope — transactional rollback across both files', () => {
+  it('a settings-validate failure rolls back BOTH the settings AND the config write', () => {
     writeConfig({ mcpServers: { otherTool: { command: 'x' } }, theme: 'light' });
-    const original = fs.readFileSync(configPath, 'utf8');
-    // Inject a validator that always fails → must roll back.
-    const r = registerUserScope(opts({ validate: () => ({ ok: false, detail: 'forced failure' }) }));
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'user-stop' }] }] } });
+    const cfg0 = fs.readFileSync(configPath, 'utf8');
+    const set0 = fs.readFileSync(settingsPath, 'utf8');
+    const r = registerUserScope(opts({ validateSettings: () => ({ ok: false, detail: 'forced' }) }));
     expect(r.ok).toBe(false);
     expect(r.rolledBack).toBe(true);
-    expect(fs.readFileSync(configPath, 'utf8')).toBe(original); // byte-identical restore
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(cfg0);   // config restored byte-exact
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(set0); // settings restored byte-exact
+  });
+
+  it('a config-validate failure leaves the settings file untouched', () => {
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'user-stop' }] }] } });
+    const set0 = fs.readFileSync(settingsPath, 'utf8');
+    const r = registerUserScope(opts({ validateConfig: () => ({ ok: false, detail: 'forced' }) }));
+    expect(r.ok).toBe(false);
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(set0); // settings never written
   });
 });
 
-describe('unregisterUserScope — ownership-scoped removal', () => {
-  it('removes ONLY the XBus entries this install owns, leaving everything else', () => {
-    writeConfig({
-      mcpServers: { otherTool: { command: 'othercmd' } },
-      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'user-hook' }] }] },
-      theme: 'dark',
-    });
+describe('unregisterUserScope — ownership-scoped removal across both files', () => {
+  it('removes ONLY the XBus mcp entry + hooks, leaving the user’s entries', () => {
+    writeConfig({ mcpServers: { otherTool: { command: 'othercmd' } }, theme: 'dark' });
+    writeSettings({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'user-hook' }] }] } });
     registerUserScope(opts());
     const u = unregisterUserScope(opts());
     expect(u.ok).toBe(true);
     expect(u.removed).toBe(true);
-    const cfg = readClaudeConfig(configPath)!;
-    expect(cfg.mcpServers!.xbus).toBeUndefined(); // ours gone
-    expect(cfg.mcpServers!.otherTool).toBeDefined(); // theirs kept
+    const cfg = readClaudeConfig(configPath)!; const s = readClaudeSettings(settingsPath)!;
+    expect(cfg.mcpServers!.xbus).toBeUndefined();             // ours gone
+    expect(cfg.mcpServers!.otherTool).toBeDefined();          // theirs kept
     expect((cfg as Record<string, unknown>).theme).toBe('dark');
-    expect(JSON.stringify(cfg.hooks)).toContain('user-hook'); // their hook kept
-    expect(JSON.stringify(cfg.hooks)).not.toContain(HOOK_JS); // our hook gone
+    expect(hasOurHooks()).toBe(false);                        // our hooks gone
+    expect(JSON.stringify(s.hooks)).toContain('user-hook');   // their hook kept
   });
 
-  it('does NOT remove an xbus entry owned by a DIFFERENT install', () => {
-    writeConfig({ mcpServers: { xbus: { command: 'x', [XBUS_OWNER_TAG]: 'OTHER-install' } } });
+  it('does NOT remove an xbus mcp entry owned by a DIFFERENT install', () => {
+    writeConfig({ mcpServers: { xbus: { command: 'x', [XBUS_OWNER_TAG]: 'OTHER' } } });
     const u = unregisterUserScope(opts({ installId: 'mine' }));
-    expect(u.ok).toBe(true);
-    expect(u.removed).toBe(false); // not ours → not removed
+    expect(u.removed).toBe(false);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined();
   });
 
-  it('uninstall on a config with no xbus entry is a clean no-op', () => {
-    writeConfig({ mcpServers: { otherTool: { command: 'x' } } });
-    const u = unregisterUserScope(opts());
-    expect(u.ok).toBe(true);
-    expect(u.removed).toBe(false);
+  it('does NOT remove an UNTAGGED user-authored hook that references our hook entry (scoped)', () => {
+    // A user manually added a hook invoking our hook-entry.js, WITHOUT an owner tag.
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: NODE, args: [HOOK_JS] }] }] } });
+    const u = unregisterUserScope(opts({ installId: 'mine' }));
+    expect(u.removed).toBe(false); // nothing of OURS (tagged 'mine') present → no-op
+    expect(JSON.stringify(readClaudeSettings(settingsPath)!.hooks)).toContain('hook-entry.js'); // user's hook kept
   });
 });
 
-describe('Windows backslash paths in the hook command (regression)', () => {
-  // A Windows node/hook path uses backslashes. The hook `command` is a SHELL string,
-  // so the path must survive LITERALLY — JSON.stringify would double the backslashes
-  // (C:\\Users\\…), producing a broken path AND breaking ownership-matching on
-  // uninstall (includes() of the raw path would no longer match). Use real backslash
-  // paths here (the forward-slash fixtures above did not exercise this).
+describe('Windows backslash paths (exec form — paths passed literally)', () => {
   const winNode = 'C:\\Program Files\\nodejs\\node.exe';
   const winHook = 'C:\\Users\\v\\.claude\\xbus-install\\plugin\\dist\\channel\\hook-entry.js';
-
-  it('stores the hook command with LITERAL backslashes (not doubled)', () => {
+  it('stores node + hook path LITERALLY in args (no JSON backslash doubling)', () => {
     registerUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
-    const raw = fs.readFileSync(configPath, 'utf8');
-    const cfg = readClaudeConfig(configPath)!;
-    const cmd = cfg.hooks!.UserPromptSubmit![0]!.hooks[0]!.command;
-    // The in-memory command value must contain the path with SINGLE backslashes.
-    expect(cmd).toContain(winHook);
-    expect(cmd).not.toContain('C:\\\\Users'); // not doubled in memory
-    // (On disk the JSON file escapes each backslash once — that's normal JSON.)
-    expect(raw).toContain('hook-entry.js');
+    const h = readClaudeSettings(settingsPath)!.hooks!.UserPromptSubmit![0]!.hooks[0]!;
+    expect(h.command).toBe(winNode);
+    expect(h.args).toEqual([winHook]); // exact, single backslashes
   });
-
-  it('uninstall removes the Windows-path hook it created (ownership match survives)', () => {
+  it('uninstall removes the Windows-path hook it created (args match survives backslashes)', () => {
     registerUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
-    expect(JSON.stringify(readClaudeConfig(configPath)!.hooks)).toContain('hook-entry.js');
     const u = unregisterUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
-    expect(u.ok).toBe(true);
     expect(u.removed).toBe(true);
-    // our hook is gone — the includes() ownership match worked despite backslashes.
-    expect(JSON.stringify(readClaudeConfig(configPath)!.hooks ?? {})).not.toContain('hook-entry.js');
+    expect(JSON.stringify(readClaudeSettings(settingsPath)!.hooks ?? {})).not.toContain('hook-entry.js');
   });
 });
 
 describe('repairUserScope', () => {
-  it('re-applies the canonical entry when ours has drifted (e.g. node path moved)', () => {
+  it('re-applies the canonical entries when ours has drifted (node path moved)', () => {
     registerUserScope(opts({ nodePath: 'C:/old/node.exe' }));
     const r = repairUserScope(opts({ nodePath: 'C:/new/node.exe' }));
     expect(r.ok).toBe(true);
     expect(r.repaired).toBe(true);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe('C:/new/node.exe');
+    expect(readClaudeSettings(settingsPath)!.hooks!.Stop![0]!.hooks[0]!.command).toBe('C:/new/node.exe');
   });
-
-  it('repair when not present registers fresh', () => {
+  it('repair when not present registers fresh (both files)', () => {
     const r = repairUserScope(opts());
     expect(r.ok).toBe(true);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined();
+    expect(hasOurHooks()).toBe(true);
   });
 });

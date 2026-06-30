@@ -19,7 +19,7 @@ import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, inv
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../launcher/install-paths.js';
-import { repairUserScope, defaultClaudeConfigPath } from './user-scope-config.js';
+import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
 
@@ -93,8 +93,10 @@ function cmdRepair(): CliResult {
     return { human: `XBus is not installed (nothing to repair). Run: node "<pluginDir>/dist/cli/main.js" install`, json: { ok: false, notInstalled: true }, exitCode: 1 };
   }
   const configPath = manifest.userScope?.configPath ?? defaultClaudeConfigPath();
+  const settingsPath = manifest.userScope?.settingsPath ?? defaultClaudeSettingsPath();
   const r = repairUserScope({
     configPath,
+    settingsPath,
     nodePath: process.execPath,
     serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
     hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
