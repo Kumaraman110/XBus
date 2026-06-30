@@ -136,6 +136,35 @@ describe('15-day expiry sweep', () => {
     expect(got).toHaveLength(0);
   });
 
+  it('an expired session resuming via the NORMAL (non-supersede) reconnect recovers cleanly (no zombie)', () => {
+    // The real `claude --resume` path: CLAUDE_CODE_SESSION_ID is stable, and the MCP
+    // server re-registers WITHOUT supersede. A naive join would leave expired_at set
+    // → a zombie (sends rejected, name stuck 'retired'). ADR 0012 D6 promises recovery.
+    const sender = ready('zr-snd');
+    const rcv = ready('zr-rcv');
+    const { messageId } = store.send(sender, { to: 'zr-rcv', text: 'old', kind: 'request', requiresAck: true, requiresReply: false });
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep(); // expires rcv + dead-letters the queued message
+    expect(sessRow(rcv.sessionId).expired_at).not.toBeNull();
+    // Resume: SAME sessionId, NO supersede flag (exactly what mcp-server.ts sends).
+    const resumed = store.register({ sessionId: rcv.sessionId, instanceId: 'i2', connectionId: 'c-zr2', processId: 7, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'zr-rcv' });
+    store.signalReadiness(resumed, { ackAvailable: true, versionOk: true });
+    const row = sessRow(rcv.sessionId);
+    // Recovered: tombstone cleared, name re-claimed active, NOT readiness-stuck.
+    expect(row.expired_at).toBeNull();
+    expect(row.reason).toBeNull();
+    expect(row.state).toBe('active'); // name re-claimed (it was free)
+    expect(resumed.epoch).toBeGreaterThan(rcv.epoch); // fresh epoch
+    // Now routable again: a fresh send to it succeeds (not RECIPIENT_SESSION_EXPIRED).
+    const ok = store.send(sender, { to: 'zr-rcv', text: 'new', kind: 'request', requiresAck: false, requiresReply: false });
+    expect(ok.recipientSessionId).toBe(rcv.sessionId);
+    // But the OLD dead-lettered body is NOT resurrected into the new epoch.
+    expect((db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(messageId) as { state: string }).state).toBe('dead_letter');
+    const got = delivery.checkpointPull({ ...resumed, role: 'hook' as never }, 'cp-new', 10);
+    expect(got.find((m) => m.messageId === messageId)).toBeUndefined(); // old body gone
+    expect(got.find((m) => m.text === 'new')).toBeDefined(); // new body delivered
+  });
+
   it('is idempotent — a second sweep does not double-expire', () => {
     ready('idem');
     clock.advance(15 * DAY + 1000);

@@ -204,8 +204,18 @@ export class BrokerStore {
       const role = input.role ?? ComponentRole.MCP;
       const componentInstanceId = this.ids.next();
       const existing = this.db
-        .prepare('SELECT session_id, active_epoch FROM sessions WHERE session_id = ?')
-        .get(input.sessionId) as { session_id: string; active_epoch: number } | undefined;
+        .prepare('SELECT session_id, active_epoch, expired_at FROM sessions WHERE session_id = ?')
+        .get(input.sessionId) as { session_id: string; active_epoch: number; expired_at: string | null } | undefined;
+
+      // Beta.4 (ADR 0012 D6): an EXPIRED session resuming under its (stable)
+      // CLAUDE_CODE_SESSION_ID must come back as a FRESH lifecycle — a new epoch with
+      // its expiry tombstone cleared and its name re-claimed — NOT a passive join into
+      // the dead epoch (which would leave expired_at set: a zombie whose sends are all
+      // rejected and whose name stays 'retired'). The normal MCP reconnect never sets
+      // supersede, so we detect the expired-resume here and route it through the same
+      // fresh-lifecycle reset. The old queue stays dead-lettered (no resurrection).
+      const isExpiredResume = !!existing && existing.expired_at !== null;
+      const freshLifecycle = !!input.supersede || isExpiredResume;
 
       let epoch: number;
       if (!existing) {
@@ -224,22 +234,24 @@ export class BrokerStore {
         this.db.prepare('INSERT OR IGNORE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, 1)').run(input.sessionId);
         this.upsertAliasRow(auto, 'global', null, input.sessionId, now);
         this.db.prepare('INSERT INTO session_epochs (session_id, epoch, epoch_token_hash, started_at) VALUES (?,?,?,?)').run(input.sessionId, epoch, this.nextEpochToken(), now);
-      } else if (input.supersede) {
-        // Genuine takeover: advance the epoch.
+      } else if (freshLifecycle) {
+        // Genuine takeover (supersede) OR an expired session resuming: advance the epoch.
         epoch = existing.active_epoch + 1;
-        this.db.prepare('UPDATE session_epochs SET superseded_at=?, supersede_reason=? WHERE session_id=? AND epoch=? AND superseded_at IS NULL').run(now, 'supersede', input.sessionId, existing.active_epoch);
+        this.db.prepare('UPDATE session_epochs SET superseded_at=?, supersede_reason=? WHERE session_id=? AND epoch=? AND superseded_at IS NULL').run(now, isExpiredResume ? 'expired_resume' : 'supersede', input.sessionId, existing.active_epoch);
         this.db.prepare('INSERT INTO session_epochs (session_id, epoch, epoch_token_hash, started_at) VALUES (?,?,?,?)').run(input.sessionId, epoch, this.nextEpochToken(), now);
         // New epoch ⇒ new owner: readiness resets to initializing until it signals (§2).
-        // Beta.4: a true supersede is a FRESH lifecycle — clear any prior expiry
-        // tombstone fields + name binding so the new epoch is routable again and the
-        // name is re-claimed below (ADR 0012). The old queue is NOT resurrected (the
-        // expiry sweep already dead-lettered it; superseding only re-queues
-        // transport_written rows of the PRIOR — now replaced — owner, handled below).
+        // Beta.4: a fresh lifecycle clears any prior expiry tombstone fields + name
+        // binding so the new epoch is routable again and the name is re-claimed below
+        // (ADR 0012). The old queue is NOT resurrected for an EXPIRED resume — the
+        // expiry sweep already dead-lettered it, and we only re-home transport_written
+        // rows (in-flight to the prior live owner), which an expired session has none of.
         this.db.prepare(`UPDATE sessions SET active_epoch=?, generation=?, high_water_generation=?, fencing_token=?, state='connected', readiness='initializing', readiness_updated_at=?, expired_at=NULL, expiration_reason=NULL, session_name_state='unnamed', session_name=NULL, normalized_session_name=NULL, pending_name_expires_at=NULL, last_seen_at=?, updated_at=? WHERE session_id=?`).run(epoch, epoch, epoch, epoch, now, now, now, input.sessionId);
         this.db.prepare(`UPDATE component_instances SET state='superseded', disconnected_at=? WHERE session_id=? AND state='live'`).run(now, input.sessionId);
-        // On a TRUE epoch change, re-queue any in-flight injection (the prior
-        // owner is gone). Lease-expiry no longer matters — the epoch is replaced.
+        // Re-queue any in-flight injection of the PRIOR (now replaced) live owner.
+        // For an expired resume there are none (the sweep dead-lettered the queue),
+        // so this is a no-op there — old dead_letter rows are NOT touched.
         this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, target_instance_id=NULL, updated_at=? WHERE recipient_session_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}'`).run(now, input.sessionId);
+        if (isExpiredResume) this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
       } else {
         // Split-brain guard (ADR 0008): at most ONE live writable (mcp) component
         // per session epoch. A SECOND concurrent mcp registration on a DIFFERENT
@@ -280,10 +292,11 @@ export class BrokerStore {
         .run(componentInstanceId, input.sessionId, epoch, role, input.processId, input.connectionId, input.buildId ?? null, JSON.stringify(input.capabilities), now, now);
 
       // Beta.4 (ADR 0012): name claim + meaningful-activity stamp happen only on a
-      // GENUINELY NEW session lifecycle (first registration or a true supersede),
-      // never on a passive component join/reconnect — joining is not "activity",
-      // and a reconnecting hook must not re-roll the name or extend the idle timer.
-      const isNewLifecycle = !existing || input.supersede === true;
+      // GENUINELY NEW session lifecycle (first registration, a true supersede, or an
+      // expired session resuming) — never on a passive component join/reconnect, where
+      // joining is not "activity" and a reconnecting hook must not re-roll the name or
+      // extend the idle timer.
+      const isNewLifecycle = !existing || freshLifecycle;
       let nameStatus: SessionNameStatus;
       if (isNewLifecycle) {
         nameStatus = this.claimNameForRegister(input.sessionId, input.requestedSessionName, now);
