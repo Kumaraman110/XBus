@@ -43,6 +43,7 @@ export interface ReaperTotals {
   deadLettered: number;
   expired: number;
   leasesReclaimed: number;
+  sessionsExpired: number;
 }
 
 /** Point-in-time gauges supplied by the daemon on read (snapshot queries). */
@@ -89,7 +90,7 @@ export class BrokerMetrics {
   readonly handshakes: HandshakeCounters = { ok: 0, authFailed: 0, protoMismatch: 0, timedOut: 0 };
   readonly refusals: RefusalCounters = { connLimit: 0, rateLimit: 0 };
   readonly frames: FrameRejectCounters = { preHandshakeRejected: 0, secureOpenFailed: 0 };
-  readonly reaperTotals: ReaperTotals = { ackTimedOut: 0, deadLettered: 0, expired: 0, leasesReclaimed: 0 };
+  readonly reaperTotals: ReaperTotals = { ackTimedOut: 0, deadLettered: 0, expired: 0, leasesReclaimed: 0, sessionsExpired: 0 };
   private sweepsTotal = 0;
   private lastSweepAt: string | null = null;
   private lastSweepDurationMs = 0;
@@ -123,6 +124,7 @@ export class BrokerMetrics {
     this.reaperTotals.deadLettered += r.deadLettered;
     this.reaperTotals.expired += r.expired;
     this.reaperTotals.leasesReclaimed += r.leasesReclaimed;
+    this.reaperTotals.sessionsExpired += r.sessionsExpired;
     this.sweepsTotal++;
     this.lastSweepAt = new Date(this.now()).toISOString();
     this.lastSweepDurationMs = durationMs;

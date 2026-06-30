@@ -230,7 +230,12 @@ export class BrokerStore {
         this.db.prepare('UPDATE session_epochs SET superseded_at=?, supersede_reason=? WHERE session_id=? AND epoch=? AND superseded_at IS NULL').run(now, 'supersede', input.sessionId, existing.active_epoch);
         this.db.prepare('INSERT INTO session_epochs (session_id, epoch, epoch_token_hash, started_at) VALUES (?,?,?,?)').run(input.sessionId, epoch, this.nextEpochToken(), now);
         // New epoch ⇒ new owner: readiness resets to initializing until it signals (§2).
-        this.db.prepare(`UPDATE sessions SET active_epoch=?, generation=?, high_water_generation=?, fencing_token=?, state='connected', readiness='initializing', readiness_updated_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(epoch, epoch, epoch, epoch, now, now, now, input.sessionId);
+        // Beta.4: a true supersede is a FRESH lifecycle — clear any prior expiry
+        // tombstone fields + name binding so the new epoch is routable again and the
+        // name is re-claimed below (ADR 0012). The old queue is NOT resurrected (the
+        // expiry sweep already dead-lettered it; superseding only re-queues
+        // transport_written rows of the PRIOR — now replaced — owner, handled below).
+        this.db.prepare(`UPDATE sessions SET active_epoch=?, generation=?, high_water_generation=?, fencing_token=?, state='connected', readiness='initializing', readiness_updated_at=?, expired_at=NULL, expiration_reason=NULL, session_name_state='unnamed', session_name=NULL, normalized_session_name=NULL, pending_name_expires_at=NULL, last_seen_at=?, updated_at=? WHERE session_id=?`).run(epoch, epoch, epoch, epoch, now, now, now, input.sessionId);
         this.db.prepare(`UPDATE component_instances SET state='superseded', disconnected_at=? WHERE session_id=? AND state='live'`).run(now, input.sessionId);
         // On a TRUE epoch change, re-queue any in-flight injection (the prior
         // owner is gone). Lease-expiry no longer matters — the epoch is replaced.
@@ -494,6 +499,18 @@ export class BrokerStore {
       }
 
       const recipient = this.resolveRecipient(input.to);
+
+      // Beta.4 (ADR 0012 Decision 6): a recipient that has expired (>15 days idle)
+      // is unroutable. Reject the send FINAL / non-retryable — never queue silently
+      // for a session whose name was released. This is AFTER the idempotency
+      // short-circuit (above), so a retried send to an expired recipient does not
+      // quietly "succeed" off a prior row. Resolving an expired session is only
+      // possible by raw session id (its name was released); guard it explicitly.
+      const exp = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(recipient.sessionId) as { expired_at: string | null } | undefined;
+      if (exp?.expired_at) {
+        this.audit('SEND_REJECTED_RECIPIENT_EXPIRED', { sessionId: auth.sessionId, recipient: recipient.alias });
+        throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'recipient session expired (no activity for 15 days); it must re-register', { recipient: recipient.alias });
+      }
 
       // Blocked-sender policy (ADR 0009): reject BEFORE persistence if the
       // recipient has blocked this sender's alias. Do not return normal success.

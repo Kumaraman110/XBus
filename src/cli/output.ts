@@ -79,7 +79,7 @@ export function formatMetrics(m: {
   broker: { instanceId: string; buildId: string; uptimeMs: number; secureTransport: boolean };
   transport: { connections: { active: number; max: number }; buffer: { bytesInUse: number; budgetBytes: number }; handshakes: { ok: number; authFailed: number; protoMismatch: number; timedOut: number }; refusals: { connLimit: number; rateLimit: number }; frames: { preHandshakeRejected: number; secureOpenFailed: number } };
   deliveries: Record<string, number>;
-  reaper: { sweepsTotal: number; lastSweepAt: string | null; totals: { ackTimedOut: number; deadLettered: number; expired: number; leasesReclaimed: number } };
+  reaper: { sweepsTotal: number; lastSweepAt: string | null; totals: { ackTimedOut: number; deadLettered: number; expired: number; leasesReclaimed: number; sessionsExpired: number } };
   sessions: { byReadiness: Record<string, number> };
   injections: { total: number; redeliveries: number };
 }): string {
@@ -94,7 +94,7 @@ export function formatMetrics(m: {
     `  handshakes:   ok=${h.ok} auth_failed=${h.authFailed} proto_mismatch=${h.protoMismatch} timed_out=${h.timedOut}`,
     `  refusals:     conn_limit=${rf.connLimit} rate_limit=${rf.rateLimit}  frames pre_handshake=${f.preHandshakeRejected} secure_open=${f.secureOpenFailed}`,
     `  deliveries:   queued=${dl('queued')} retry_wait=${dl('retry_wait')} transport_written=${dl('transport_written')} accepted=${dl('accepted')} completed=${dl('completed')} expired=${dl('expired')} dead_letter=${dl('dead_letter')} cancelled=${dl('cancelled')}`,
-    `  reaper:       sweeps=${m.reaper.sweepsTotal} ack_timed_out=${rt.ackTimedOut} dead_lettered=${rt.deadLettered} expired=${rt.expired} leases_reclaimed=${rt.leasesReclaimed} last=${m.reaper.lastSweepAt ?? '-'}`,
+    `  reaper:       sweeps=${m.reaper.sweepsTotal} ack_timed_out=${rt.ackTimedOut} dead_lettered=${rt.deadLettered} expired=${rt.expired} leases_reclaimed=${rt.leasesReclaimed} sessions_expired=${rt.sessionsExpired} last=${m.reaper.lastSweepAt ?? '-'}`,
     `  sessions:     ${ready}`,
     `  injections:   total=${m.injections.total} redeliveries=${m.injections.redeliveries}`,
   ].join('\n');
