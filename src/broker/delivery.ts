@@ -123,6 +123,50 @@ export class DeliveryOps {
   }
 
   /**
+   * The ACK deadline anchored at injection time. ONLY a message that requires an
+   * ack gets one — a non-ack message has nothing to time out, so it must never
+   * carry a lease_expires_at (which is exactly what the ack-timeout reaper keys
+   * on). Returns the ISO deadline for an ack-required message, else null.
+   */
+  private ackDeadlineFor(requiresAck: boolean): string | null {
+    return requiresAck ? new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString() : null;
+  }
+
+  /**
+   * Reliability lifecycle close-out for a message that has JUST been successfully
+   * injected (selected, marked transport_written, transport-logged, injection
+   * recorded, and ABOUT TO BE returned in the checkpoint response). MUST be called
+   * only after the body is committed to the returned output.
+   *
+   * A message that requires NEITHER ack NOR reply is terminal the moment its body
+   * reaches the checkpoint: it transitions transport_written -> completed
+   * atomically (CAS guarded on state + requires_ack=0 via the state machine's
+   * `complete` edge), records application_completed_at, and clears the ack timer +
+   * any stale retry fields. A message that requires a reply (with or without ack)
+   * is left in its post-injection state to await the correlated reply; only the
+   * ack-required variant keeps an armed lease_expires_at.
+   *
+   * Returns true if it completed the delivery (fire-and-forget), else false.
+   */
+  private completeIfNoResponseRequired(messageId: string, requiresAck: boolean, requiresReply: boolean, now: string): boolean {
+    if (requiresAck || requiresReply) return false;
+    // CAS: transport_written -> completed, guarded so it can ONLY complete a
+    // non-ack delivery and only from the just-written state. Clears the ack timer
+    // and any stale retry fields (a fresh injection should carry none, but this
+    // makes the terminal row unambiguous and reaper-inert).
+    const res = this.db
+      .prepare(
+        `UPDATE deliveries SET state='${DeliveryState.COMPLETED}', application_completed_at=?, lease_expires_at=NULL, next_attempt_at=NULL, failure_category=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}' AND (SELECT requires_ack FROM messages WHERE message_id=?)=0`,
+      )
+      .run(now, now, messageId, messageId);
+    if (res.changes > 0) {
+      this.audit('DELIVERY_COMPLETED_NO_RESPONSE_REQUIRED', { messageId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Verify the caller's EPOCH is the session's current epoch (ADR 0003). This
    * replaces the connection-pinned fence: many components (mcp/hook) share one
    * epoch on different connections, so authority is epoch-scoped, not
@@ -135,6 +179,16 @@ export class DeliveryOps {
       this.audit('EPOCH_MISMATCH_REJECTED', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId });
       throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
     }
+  }
+
+  /** The non-secret injection id for a message's CURRENT (highest-logical)
+   *  injection in an epoch, or null if it was never injected for that epoch. Used
+   *  to surface a valid injection reference on a returned body (never an empty id). */
+  injectionIdFor(messageId: string, epoch: number): string | null {
+    const r = this.db
+      .prepare('SELECT injection_id FROM context_injections WHERE message_id=? AND recipient_epoch=? ORDER BY logical_injection_number DESC LIMIT 1')
+      .get(messageId, epoch) as { injection_id: string } | undefined;
+    return r?.injection_id ?? null;
   }
 
   /** Current readiness of a session (defaults to 'disconnected' if unknown/legacy). */
@@ -184,20 +238,37 @@ export class DeliveryOps {
     return this.db.transaction(() => {
       const pending = this.pendingForSessionId(auth.sessionId, cappedLimit);
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const out: PendingMessage[] = [];
       for (const m of pending) {
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(m.requiresAck);
         const res = this.db
           .prepare(`UPDATE deliveries SET state='${DeliveryState.TRANSPORT_WRITTEN}', transport_written_at=?, lease_expires_at=?, target_instance_id=?, target_generation=?, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`)
           .run(now, deadline, auth.componentInstanceId, auth.epoch, now, m.messageId);
         if (res.changes === 0) continue; // already injected (dedup)
         this.db.prepare('INSERT INTO transport_write_log (write_id, delivery_id, message_id, recipient_instance_id, attempt, bytes_written, ts) SELECT ?, delivery_id, ?, ?, attempt, ?, ? FROM deliveries WHERE message_id=?').run(this.ids.next(), m.messageId, auth.componentInstanceId, 0, now, m.messageId);
         const injection = this.receipts.issue({ messageId: m.messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId, componentId: auth.componentInstanceId });
+        this.audit('TRANSPORT_WRITTEN', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId, messageId: m.messageId });
+        // LAYER-3 INVARIANT (docs/delivery-semantics.md): a normal automatic
+        // checkpoint must NEVER re-present a body, and must NEVER return a
+        // checkpoint message without a valid injection id. `issue()` returns null
+        // when an injection ALREADY exists for this (message, epoch, logical#1) —
+        // i.e. the body was already presented this epoch. This happens when the
+        // ack-timeout reaper requeued an already-injected ack message: the re-mark
+        // re-arms the ack deadline (so dead-letter escalation still proceeds), but
+        // the body must NOT be presented again here. Only explicit redelivery may
+        // re-present a body (under a new logical number, with a valid id).
+        if (!injection) {
+          this.audit('REINJECTION_BODY_SUPPRESSED', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId, messageId: m.messageId });
+          continue;
+        }
         const md = { ...(m.metadata ?? {}) } as Record<string, string>;
         // Non-secret reference only (ADR 0006): safe in transcripts/exports/logs.
-        if (injection) md[INJECTION_METADATA_KEY] = injection.injectionId;
+        md[INJECTION_METADATA_KEY] = injection.injectionId;
         out.push({ ...m, metadata: md });
-        this.audit('TRANSPORT_WRITTEN', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId, messageId: m.messageId });
+        // Body is now committed to the returned response → a fire-and-forget
+        // message (no ack, no reply) becomes terminal immediately.
+        this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
       return out;
     });
@@ -223,18 +294,27 @@ export class DeliveryOps {
     return this.db.transaction(() => {
       const pending = this.pendingForSessionId(auth.sessionId, cappedLimit);
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const out: PendingMessage[] = [];
       for (const m of pending) {
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(m.requiresAck);
         const res = this.db
           .prepare(`UPDATE deliveries SET state='${DeliveryState.TRANSPORT_WRITTEN}', transport_written_at=?, lease_expires_at=?, target_instance_id=?, target_generation=?, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`)
           .run(now, deadline, auth.componentInstanceId, auth.epoch, now, m.messageId);
         if (res.changes === 0) continue;
         this.db.prepare('INSERT INTO transport_write_log (write_id, delivery_id, message_id, recipient_instance_id, attempt, bytes_written, ts) SELECT ?, delivery_id, ?, ?, attempt, ?, ? FROM deliveries WHERE message_id=?').run(this.ids.next(), m.messageId, auth.componentInstanceId, 0, now, m.messageId);
         const injection = this.receipts.issue({ messageId: m.messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId, componentId: auth.componentInstanceId });
+        // LAYER-3 INVARIANT (see checkpointPull): null issue() == already injected
+        // this epoch. Re-arm proceeds (escalation), but never re-present the body
+        // or return an empty injection id. Explicit redelivery is the only re-show.
+        if (!injection) {
+          this.audit('REINJECTION_BODY_SUPPRESSED', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId, messageId: m.messageId });
+          continue;
+        }
         const md = { ...(m.metadata ?? {}) } as Record<string, string>;
-        if (injection) md[INJECTION_METADATA_KEY] = injection.injectionId;
+        md[INJECTION_METADATA_KEY] = injection.injectionId;
         out.push({ ...m, metadata: md });
+        this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
       return out;
     });
@@ -287,14 +367,25 @@ export class DeliveryOps {
       .all(auth.epoch, auth.sessionId, now, limit) as Array<Record<string, unknown>>;
     for (const r of rows) {
       if (freshIds.has(r.message_id as string)) continue;
+      const requiresAck = (r.requires_ack as number) === 1;
+      const requiresReply = (r.requires_reply as number) === 1;
+      // A non-ack message in transport_written is NOT "unacknowledged" — it is
+      // never going to be acked. (Fire-and-forget messages have already left
+      // transport_written for `completed`, so any non-ack row here is awaiting a
+      // reply.) Don't offer ack/reject for it, and don't label it as awaiting an
+      // ack the contract never required.
+      const state: InboxEntryState = requiresAck ? 'context_injected_unacknowledged' : 'application_accepted';
+      const allowedActions = requiresAck
+        ? ['ack', 'reject', 'reply', 'request-explicit-redelivery']
+        : [...(requiresReply ? ['reply'] : []), 'request-explicit-redelivery'];
       entries.push({
         messageId: r.message_id as string, injectionId: (r.injection_id as string) ?? null,
         senderAlias: r.sender_alias as string, recipientAlias: r.recipient_alias as string, kind: r.kind as string,
         correlationId: r.correlation_id as string, causationId: (r.causation_id as string) ?? null, sequence: r.recipient_sequence as number,
-        requiresAck: (r.requires_ack as number) === 1, requiresReply: (r.requires_reply as number) === 1,
-        state: 'context_injected_unacknowledged', bodyAlreadyPresented: true, bodyIncluded: false,
+        requiresAck, requiresReply,
+        state, bodyAlreadyPresented: true, bodyIncluded: false,
         createdAt: r.created_at as string, expiresAt: (r.expires_at as string) ?? null,
-        allowedActions: ['ack', 'reject', 'reply', 'request-explicit-redelivery'],
+        allowedActions,
       });
     }
     return entries;
@@ -337,7 +428,7 @@ export class DeliveryOps {
   }
 
   /** @deprecated legacy path retained for the in-process broker contract tests
-   *  that don't model the hook as a separate component. Issues no receipts. */
+   *  that don't model the hook as a separate component. */
   checkpointPullBySessionId(sessionId: string, limit = 50): PendingMessage[] {
     const s = this.db.prepare('SELECT fencing_token, active_epoch FROM sessions WHERE session_id=?').get(sessionId) as
       | { fencing_token: number | null; active_epoch: number } | undefined;
@@ -347,8 +438,11 @@ export class DeliveryOps {
       role: ComponentRole.HOOK, epoch: s.active_epoch, generation: s.active_epoch, fencingToken: s.fencing_token, connectionId: 'checkpoint-hook',
     };
     const pending = this.pendingForSessionId(sessionId, limit);
-    this.markInjectedFor(auth, pending.map((m) => m.messageId));
-    return pending;
+    // markInjectedFor reports only NEWLY-injected ids (a re-selected, already-
+    // injected message is re-armed but not reported), so returning only those
+    // bodies upholds the Layer-3 no-repeat-body invariant on this path too.
+    const newlyInjected = new Set(this.markInjectedFor(auth, pending.map((m) => m.messageId)));
+    return pending.filter((m) => newlyInjected.has(m.messageId));
   }
 
   private pendingForSessionId(sessionId: string, limit: number): PendingMessage[] {
@@ -428,13 +522,25 @@ export class DeliveryOps {
   }
 
   /** Same as markInjected but without the connection-fence assert (used by the
-   *  ephemeral checkpoint hook, which already resolved the session's authority). */
-  markInjectedFor(auth: SessionAuthority, messageIds: string[]): string[] {
+   *  ephemeral checkpoint hook, which already resolved the session's authority).
+   *  Returns the messageIds that were NEWLY injected (a fresh body presentation).
+   *  A message re-selected after an ack-timeout requeue is RE-MARKED (so the ack
+   *  deadline re-arms and dead-letter escalation proceeds) but is NOT reported as
+   *  newly injected — so a caller that returns bodies for the reported ids never
+   *  re-presents a body (Layer-3 invariant, docs/delivery-semantics.md). */
+  markInjectedFor(auth: SessionAuthority, messageIds: string[], checkpointId?: string): string[] {
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
-      const deadline = new Date(this.clock.nowMs() + this.ackDeadlineMs).toISOString();
       const marked: string[] = [];
       for (const messageId of messageIds) {
+        // The message's response requirements decide whether an ack timer is armed
+        // and whether the delivery completes on injection. Read them once here.
+        const flags = this.db.prepare('SELECT requires_ack, requires_reply FROM messages WHERE message_id=?').get(messageId) as { requires_ack: number; requires_reply: number } | undefined;
+        if (!flags) continue; // unknown message id — nothing to inject
+        const requiresAck = flags.requires_ack === 1;
+        const requiresReply = flags.requires_reply === 1;
+        // ONLY an ack-required message gets an ack deadline (lease_expires_at).
+        const deadline = this.ackDeadlineFor(requiresAck);
         // CAS: only from queued/retry_wait -> transport_written.
         const res = this.db
           .prepare(
@@ -445,8 +551,20 @@ export class DeliveryOps {
           this.db
             .prepare('INSERT INTO transport_write_log (write_id, delivery_id, message_id, recipient_instance_id, attempt, bytes_written, ts) SELECT ?, delivery_id, ?, ?, attempt, ?, ? FROM deliveries WHERE message_id=?')
             .run(this.ids.next(), messageId, auth.instanceId, 0, now, messageId);
-          marked.push(messageId);
           this.audit('TRANSPORT_WRITTEN', { sessionId: auth.sessionId, instanceId: auth.instanceId, messageId });
+          // Record the injection. A null result means this body was already
+          // injected this epoch (e.g. an ack-timeout requeue): the delivery is
+          // re-armed above, but it must NOT be reported as a fresh presentation —
+          // the only re-show path is explicit redelivery.
+          const injection = this.receipts.issue({ messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId: checkpointId ?? `mark-${this.ids.next()}`, componentId: auth.instanceId });
+          if (injection) {
+            marked.push(messageId);
+            // A fire-and-forget message (no ack, no reply) becomes terminal
+            // immediately on its (first) injection.
+            this.completeIfNoResponseRequired(messageId, requiresAck, requiresReply, now);
+          } else {
+            this.audit('REINJECTION_BODY_SUPPRESSED', { sessionId: auth.sessionId, instanceId: auth.instanceId, messageId });
+          }
         }
       }
       return marked;

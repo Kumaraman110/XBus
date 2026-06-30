@@ -83,9 +83,16 @@ describe('§4 reliability matrix — reaper', () => {
     // after a requeue the message carries a future next_attempt_at (backoff), so
     // before re-injecting we advance past the backoff window (full backoff =
     // ceil = initialDelay*2^attempt, capped at maxDelay = 60s here).
+    // NOTE: only the FIRST injection presents the body (length 1). A re-injection
+    // after an ack-timeout requeue re-arms the ack deadline (transport_written) so
+    // escalation proceeds, but does NOT re-present the body (Layer-3 invariant,
+    // docs/delivery-semantics.md) — so "is it being re-injected?" is verified by
+    // STATE, not by a returned body.
     for (let i = 0; i < 3; i++) {
       const got = delivery.checkpointPull({ ...authB, role: 'hook' as never }, `cp-${i}`, 10);
-      expect(got).toHaveLength(1); // backoff has elapsed, so it IS injectable
+      if (i === 0) expect(got).toHaveLength(1); // first injection: body presented once
+      else expect(got.find((m) => m.messageId === messageId)).toBeUndefined(); // re-injection: no body repeat
+      expect(stateOf(messageId)).toBe('transport_written'); // (re-)armed either way
       clock.advance(ACK_DEADLINE_MS + 1000);
       reaper.sweep();
       clock.advance(60_000 + 1000); // past the (capped) backoff before next inject
@@ -116,11 +123,17 @@ describe('§4 reliability matrix — reaper', () => {
     expect(stateOf(messageId)).toBe('retry_wait');
     const nextAt = (db.prepare('SELECT next_attempt_at FROM deliveries WHERE message_id=?').get(messageId) as { next_attempt_at: string | null }).next_attempt_at;
     expect(nextAt).not.toBeNull(); // backoff armed (was the dead F-M2 column)
-    // Immediately: backoff not elapsed -> NOT injectable (no tight re-inject loop).
+    // Immediately: backoff not elapsed -> NOT re-injectable (no tight re-inject
+    // loop). It stays retry_wait and no body is returned.
     expect(delivery.checkpointPull({ ...authB, role: 'hook' as never }, 'cp2', 10)).toHaveLength(0);
-    // After the backoff window: injectable again.
+    expect(stateOf(messageId)).toBe('retry_wait');
+    // After the backoff window: re-injectable — the delivery re-arms to
+    // transport_written (so the reaper can time it out again). The body is NOT
+    // re-presented on re-injection (Layer-3), so the returned list carries no body
+    // for it; injectability is verified by STATE.
     clock.advance(60_000 + 1000);
-    expect(delivery.checkpointPull({ ...authB, role: 'hook' as never }, 'cp3', 10)).toHaveLength(1);
+    expect(delivery.checkpointPull({ ...authB, role: 'hook' as never }, 'cp3', 10).find((m) => m.messageId === messageId)).toBeUndefined();
+    expect(stateOf(messageId)).toBe('transport_written');
   });
 
   it('F-M2 backoff: no retry budget is consumed while the receiver is paused (waiting != attempt)', () => {

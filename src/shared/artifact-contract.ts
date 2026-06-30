@@ -42,6 +42,8 @@ export const ARTIFACT_ONLY_FILES = [
   'build-manifest.json',          // provenance (version/commit/buildId)
   'sbom.json',                    // CycloneDX SBOM
   'SHA256SUMS',                   // per-file checksums
+  'INSTALL.txt',                  // self-contained release-asset install guide (no source checkout needed)
+  'install.ps1',                  // PATH-free release-asset installer
 ] as const;
 
 /** Files a complete installable ARTIFACT must contain. */

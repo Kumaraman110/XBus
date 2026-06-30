@@ -45,13 +45,22 @@ The broker IPC runs over a Windows named pipe / Unix socket, treated as an **unt
 
 ## Install (developer preview)
 
-> Real installation modifies user-scope config and is gated behind explicit approval.
-> See [docs/installation.md](docs/installation.md) for the full, reversible procedure and the isolated-profile test.
+> **Requires Node.js `>=22.5` and `<25`** (Node 25+ is not yet supported).
+> Install is **PATH-free**: there is no global `xbus` command — you invoke the built
+> entrypoint with `node`. Installation copies the plugin to a user-scope root and
+> registers the MCP server + hook; it does **not** modify PATH, the registry, or a
+> shell profile. Do **not** run `npm test` as an install step. See
+> [docs/installation.md](docs/installation.md) for the full, reversible procedure.
 
 ```powershell
-# (preview) install at user scope, then launch Claude with XBus enabled:
-xbus install
-xclaude
+git clone https://github.com/Kumaraman110/XBus
+cd XBus
+npm install
+npm run build
+node .\dist\cli\main.js install --dry-run   # preview (writes nothing)
+node .\dist\cli\main.js install             # user-scope install (no PATH change)
+node .\dist\cli\main.js doctor              # verify health
+node .\dist\launcher\xclaude.js             # launch Claude Code with XBus enabled
 ```
 
 ## Quick start

@@ -44,6 +44,49 @@ function runCli(args: string[], env: Record<string, string> = {}): { code: numbe
   }
 }
 
+describe('§7 — metadata-version mismatch fails closed before activation', () => {
+  it('a plugin.json version that disagrees with the build is rejected, rolled back, leaves no plugin', async () => {
+    // Build a tampered SOURCE: copy the repo, then rewrite .claude-plugin/plugin.json
+    // to a wrong version so the installed-plugin contract validation (which checks
+    // expectedVersion: XBUS_VERSION) fails — exactly the beta.2/beta.3 divergence that
+    // broke clean install. The install must fail BEFORE leaving an activated plugin,
+    // roll back, and surface metadata-version-disagree.
+    const tamperedSource = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-tamper-src-'));
+    // copy the minimum the installer reads: .claude-plugin, .mcp.json, hooks, dist, provenance.json, package.json
+    for (const entry of ['.claude-plugin', '.mcp.json', 'hooks', 'dist', 'provenance.json', 'package.json']) {
+      const src = path.join(REPO, entry);
+      if (fs.existsSync(src)) fs.cpSync(src, path.join(tamperedSource, entry), { recursive: true });
+    }
+    // Copy ONLY the production deps the source contract requires (uuid, zod) — not the
+    // whole dev node_modules — so the source is otherwise valid and the version
+    // mismatch is what trips install, not a missing-dep.
+    for (const dep of ['uuid', 'zod']) {
+      const src = path.join(REPO, 'node_modules', dep);
+      if (fs.existsSync(src)) fs.cpSync(src, path.join(tamperedSource, 'node_modules', dep), { recursive: true });
+    }
+    // Tamper the plugin.json version.
+    const pj = path.join(tamperedSource, '.claude-plugin', 'plugin.json');
+    const meta = JSON.parse(fs.readFileSync(pj, 'utf8'));
+    meta.version = '9.9.9-tampered';
+    fs.writeFileSync(pj, JSON.stringify(meta, null, 2));
+
+    const installRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-tamper-root-'));
+    try {
+      const r = await install({ source: tamperedSource, installRoot });
+      expect(r.ok, 'tampered install must NOT succeed').toBe(false);
+      expect(r.rolledBack).toBe(true);
+      expect(String(r.health?.detail ?? r.error ?? '')).toMatch(/metadata-version-disagree|version/i);
+      // No activated plugin remains after rollback.
+      expect(fs.existsSync(path.join(installRoot, 'plugin', '.claude-plugin', 'plugin.json'))).toBe(false);
+      // No install manifest written (later integration stages would key off this).
+      expect(fs.existsSync(path.join(installRoot, 'install-manifest.json'))).toBe(false);
+    } finally {
+      fs.rmSync(tamperedSource, { recursive: true, force: true });
+      fs.rmSync(installRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('F-B — installer', () => {
   it('dry-run reports the plan and writes NOTHING', async () => {
     const r = await install({ installRoot: root, dryRun: true });

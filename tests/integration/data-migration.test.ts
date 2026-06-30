@@ -110,7 +110,7 @@ describe('data-migration — root classification + migration decision', () => {
 describe('data-migration — transactional migration preserves the authoritative root', () => {
   function run(legacy: string, dest: string, base: string) {
     return migrateDataRoot({
-      legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.2',
+      legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.3',
       migrationId: 'test-mig-1', backupDir: path.join(base, 'bk'), journalPath: path.join(base, 'journal.json'),
     });
   }
@@ -143,7 +143,7 @@ describe('data-migration — transactional migration preserves the authoritative
     const dest = path.join(base, 'data'); fs.cpSync(makeRoot({ withData: false }), dest, { recursive: true });
     run(legacy, dest, base);
     // simulate the post-commit marker the installer writes
-    writeMarker(dest, { migrationId: 'm', fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.2', legacyRoot: legacy, canonicalRoot: dest, sourceDatabaseHash: null, sourceSecretHash: null, completedAt: 't', legacyRootRetentionStatus: 'retained', destinationBackupPath: null });
+    writeMarker(dest, { migrationId: 'm', fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.3', legacyRoot: legacy, canonicalRoot: dest, sourceDatabaseHash: null, sourceSecretHash: null, completedAt: 't', legacyRootRetentionStatus: 'retained', destinationBackupPath: null });
     // a second decision must be 'already_migrated' even though the legacy root still has data
     const d2 = decideMigration(summarizeRoot(legacy), summarizeRoot(dest));
     expect(d2.kind).toBe('already_migrated');
@@ -176,7 +176,7 @@ describe('data-migration §9 — crash/journal recovery semantics', () => {
     const legacy = makeRoot({ withData: true });
     const dest = path.join(base, 'data'); fs.cpSync(makeRoot({ withData: false }), dest, { recursive: true });
     const journalPath = path.join(base, 'journal.json');
-    migrateDataRoot({ legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.2', migrationId: 'jr', backupDir: path.join(base, 'bk'), journalPath });
+    migrateDataRoot({ legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.3', migrationId: 'jr', backupDir: path.join(base, 'bk'), journalPath });
     const j = readJournal(journalPath)!;
     expect(j.state).toBe('staging_promoted');
     expect(j.sourceRoot).toBe(legacy);
@@ -188,7 +188,7 @@ describe('data-migration §9 — crash/journal recovery semantics', () => {
     const base = freshDir();
     const legacy = makeRoot({ withData: true });
     const dest = path.join(base, 'data'); fs.cpSync(makeRoot({ withData: false }), dest, { recursive: true });
-    migrateDataRoot({ legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.2', migrationId: 'sb', backupDir: path.join(base, 'bk'), journalPath: path.join(base, 'j.json') });
+    migrateDataRoot({ legacyRoot: legacy, canonicalRoot: dest, fromVersion: 'legacy-data-root', toVersion: '0.1.0-beta.3', migrationId: 'sb', backupDir: path.join(base, 'bk'), journalPath: path.join(base, 'j.json') });
     expect(fs.existsSync(path.join(base, 'bk', 'legacy-source', 'xbus.sqlite'))).toBe(true);
   });
 });

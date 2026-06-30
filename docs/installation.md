@@ -1,89 +1,161 @@
 # Installation
 
-> **Developer Preview.** A real install modifies user-scope configuration. This
-> page documents the full, reversible procedure and how to test it in an isolated
-> profile **without** touching your real environment.
+> **Developer Preview.** A real install copies the XBus plugin to a user-scope
+> install root and registers the MCP server + checkpoint hook for Claude Code. It
+> **does NOT modify PATH, the registry, or any shell profile.** This page documents
+> the actual, reversible procedure and how to test it in isolation.
 
 ## Requirements
 
-- **Node.js `>=22.5`** (XBus uses the `node:sqlite` built-in — no native addons,
-  so no C/C++ toolchain, no `npm install` of compiled modules at runtime).
+- **Node.js `>=22.5` and `<25`.** XBus uses the `node:sqlite` built-in (no native
+  addons, no C/C++ toolchain). **Node 25+ is not yet supported** — it has not passed
+  the clean-machine acceptance suite; the CLI prints an actionable error on an
+  unsupported Node. Use **Node 22 LTS** or **Node 24**.
 - Windows 10/11 (primary target). macOS/Linux are implemented but not yet
   runtime-validated.
 
-## What an install changes
+## There is no `xbus` command until you bootstrap one
 
-1. Places the XBus CLI (`xbus`) and launcher (`xclaude`) on your PATH.
-2. Registers the XBus MCP server + checkpoint hook for Claude Code (user scope).
-3. Creates the per-user data directory with restricted ACLs and a per-installation
-   root secret. An **installed** instance uses `<install-root>/data`
-   (default `~/.claude/xbus-install/data`); running from source (no install) uses
-   `~/.claude/xbus`. Either is overridable with `XBUS_DATA_DIR`. All components
-   (broker, `doctor`, the MCP server, the checkpoint hook, and `xclaude`) resolve
-   the **same** canonical root, so they never disagree.
+XBus install is **PATH-free by design.** A fresh checkout has no global `xbus`
+command, and installing does **not** create one. You invoke XBus one of two ways:
 
-All three are **reversible** (see Uninstall). Nothing is written outside your user
-scope; no machine-wide or registry changes.
+1. **From a source checkout** — call the built entrypoint with `node`:
+   `node .\dist\cli\main.js <command>`.
+2. **From an installed copy** — call the installed script by absolute path (see
+   "Invoking an installed XBus" below).
 
-## Isolated-profile test (no real changes)
+Do **not** type a bare `xbus` / `xclaude` before you have created an accessible
+command; nothing puts them on PATH.
 
-Before touching your real profile, you can exercise the entire lifecycle against a
-throwaway data directory:
+## Build + install from a source checkout (Windows)
+
+This is the supported developer-preview bootstrap. **Do not run `npm test` as an
+installation step** — the test suite is for developing XBus, not installing it.
 
 ```powershell
-# point XBus at a temp profile — your real ~/.claude/xbus is untouched
-$env:XBUS_DATA_DIR = "$env:TEMP\xbus-trial"
-xbus start
-xbus doctor
-xbus stop
-Remove-Item -Recurse -Force $env:TEMP\xbus-trial   # full uninstall of the trial
-```
-
-The clean-profile lifecycle (fresh install, upgrade, incompatible upgrade,
-rollback, offline-after-install, uninstall) is automated and proven by the
-artifact-first install suite in
-[`tests/integration/artifact-first-install.test.ts`](../tests/integration/artifact-first-install.test.ts),
-which builds the packaged artifact and exercises install / launch / hooks / MCP /
-uninstall entirely from the artifact at a spaces-containing path.
-
-## Build from source
-
-```
-git clone <repo>
+git clone https://github.com/Kumaraman110/XBus
 cd XBus
 npm install
 npm run build
-npm test            # optional: full suite
+
+# Preview the install (writes nothing):
+node .\dist\cli\main.js install --dry-run
+
+# Install at user scope (copies the plugin, registers MCP + hook, creates the
+# ACL-restricted data dir + per-install secret). Does NOT modify PATH.
+node .\dist\cli\main.js install
+
+# Verify health:
+node .\dist\cli\main.js doctor
+
+# Launch Claude Code with the XBus plugin enabled (requires Claude Code installed):
+node .\dist\launcher\xclaude.js
 ```
 
-A self-contained, checksummed, SBOM'd package can be assembled with
-`npm run package:win` (see [packaging.md](packaging.md)).
+`xclaude` spawns your own `claude` with `--plugin-dir <installed plugin>`. If
+`claude` is not on your PATH, set `CLAUDE_CODE_EXECPATH` to its full path.
+
+## Release-asset install (Windows ZIP)
+
+When using a published release asset instead of a source checkout:
+
+```powershell
+Expand-Archive .\xbus-<version>-windows.zip
+cd .\xbus-<version>-windows
+node .\dist\cli\main.js install
+node .\dist\cli\main.js doctor
+```
+
+## Invoking an installed XBus
+
+The installer records a manifest at `~/.claude/xbus-install/install-manifest.json`
+and copies the plugin under `~/.claude/xbus-install/plugin`. After install you can
+invoke the installed binaries by absolute path:
+
+```powershell
+node "$HOME\.claude\xbus-install\plugin\dist\cli\main.js" doctor
+node "$HOME\.claude\xbus-install\plugin\dist\launcher\xclaude.js"
+```
+
+> **Optional PATH integration is NOT part of this preview.** A future, separate,
+> explicitly-approved step may add a user-scope `bin` directory to PATH with full,
+> reversible tracking. Until that ships and is tested, XBus does not touch PATH and
+> these docs do not assume a bare `xbus` command.
+
+## What an install changes
+
+1. Copies the XBus plugin to `~/.claude/xbus-install/plugin` (user scope).
+2. Registers the XBus MCP server + checkpoint hook for Claude Code (user scope).
+3. Creates the per-user data directory with restricted ACLs and a per-installation
+   root secret. An **installed** instance uses `<install-root>/data`
+   (default `~/.claude/xbus-install/data`); running from source uses `~/.claude/xbus`.
+   Either is overridable with `XBUS_DATA_DIR`.
+
+It does **not** modify PATH, the registry, or any shell profile. All changes are
+**reversible** (see Uninstall); nothing is written outside your user scope.
+
+## Literal clean-shell transcript
+
+A first run on a clean Windows profile (Node 24), abbreviated:
+
+```text
+PS C:\> node --version
+v24.4.0
+PS C:\> git clone https://github.com/Kumaraman110/XBus ; cd XBus
+PS C:\XBus> npm install ; npm run build
+PS C:\XBus> node .\dist\cli\main.js install --dry-run
+{"ok":true,"dryRun":true,"plan":{"action":"install","filesToWrite":463,...}}
+PS C:\XBus> node .\dist\cli\main.js install
+{"ok":true,"health":{"ok":true},...}
+PS C:\XBus> node .\dist\cli\main.js doctor
+xbus doctor
+  this_build       ok   xbus-0.1.0-beta.3-<commit> ...
+  broker           ok   ...
+PS C:\XBus> node .\dist\launcher\xclaude.js --version
+xclaude: launching Claude Code with XBus plugin: C:\Users\<you>\.claude\xbus-install\plugin
+```
+
+The full clean-machine lifecycle (install → doctor → broker → two-session
+send/ack/reply → uninstall) is automated by
+[`scripts/clean-machine-accept.mjs`](../scripts/clean-machine-accept.mjs) and the
+artifact-first suite in
+[`tests/integration/artifact-first-install.test.ts`](../tests/integration/artifact-first-install.test.ts).
+
+## Isolated-profile trial (no real changes)
+
+To exercise the broker against a throwaway data directory without a real install:
+
+```powershell
+$env:XBUS_DATA_DIR = "$env:TEMP\xbus-trial"
+node .\dist\cli\main.js start
+node .\dist\cli\main.js doctor
+node .\dist\cli\main.js stop
+Remove-Item -Recurse -Force $env:TEMP\xbus-trial
+```
 
 ## Upgrade
 
-Install the new build; on first start the broker applies any pending schema
-migrations. An incompatible migration (checksum drift) or a database **newer**
-than the build fails closed with an actionable message rather than risking
-corruption.
-
-After upgrading, `xbus doctor` reports the **exact** build identity (ADR 0011):
-`buildId` (`xbus-<version>-<commit>`), `sourceCommit`, the installed-artifact
-`installedArtifactManifestSha256`, and `mixedBuilds` — so you can confirm the broker
-is running the build you just installed (restart the broker if `mixedBuilds` is
-`true`). Two builds that share a protocol/schema tuple but differ in source are now
-distinguishable, which they were not in earlier builds.
+Install the new build (same `install` command); on first start the broker applies
+any pending schema migrations. An incompatible migration (checksum drift) or a
+database **newer** than the build fails closed with an actionable message rather
+than risking corruption. `node .\dist\cli\main.js doctor` reports the exact build
+identity (`buildId`, `sourceCommit`, `installedArtifactManifestSha256`, `mixedBuilds`).
 
 ## Uninstall
 
-1. `xbus stop`
-2. Remove `xbus`/`xclaude` from PATH and the MCP/hook registration.
-3. Delete the data directory (`~/.claude/xbus` or your `XBUS_DATA_DIR`).
+```powershell
+node .\dist\cli\main.js stop
+node .\dist\cli\main.js uninstall          # removes only manifest-owned files + registration
+Remove-Item -Recurse -Force "$HOME\.claude\xbus-install\data"   # or your XBUS_DATA_DIR
+```
 
-After step 3 no XBus state remains; a later reinstall starts clean.
+`uninstall` removes only the files the install manifest recorded; unrelated files in
+the install root are left untouched. There is **no PATH entry to remove** (install
+never created one). After the data dir is deleted, no XBus state remains.
 
 ## Honest scope
 
-This preview's automated work does **not** perform a real user-scope install,
-PATH change, or shell-profile edit on the maintainer's machine — those steps are
-gated behind explicit approval. The procedure above is the intended, tested-in-
-isolation flow.
+This preview does **not** modify PATH or a shell profile, and the maintainer's
+automated work does not perform a machine-wide change. The bootstrap above
+(`node .\dist\cli\main.js …`) is the actual supported flow and is what the
+clean-machine acceptance script runs verbatim.

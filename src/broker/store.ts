@@ -170,7 +170,7 @@ export class BrokerStore {
             this.audit('SESSION_ALREADY_ACTIVE', { sessionId: input.sessionId, epoch: existing.active_epoch });
             throw new XBusError(
               XBusErrorCode.SESSION_ALREADY_ACTIVE,
-              'this session already has an active XBus owner; use --fork-session, close the existing owner, or run: xbus takeover <session>',
+              'this session already has an active XBus owner; use --fork-session, close the existing owner, or use the `takeover <session>` command',
               { sessionId: input.sessionId },
             );
           }

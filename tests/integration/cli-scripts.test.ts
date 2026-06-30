@@ -24,7 +24,10 @@ beforeAll(() => {
 
 function run(entry: string, args: string[], env: Record<string, string> = {}): { code: number; out: string } {
   try {
-    const out = execFileSync(process.execPath, [entry, ...args], { env: { ...process.env, ...env }, cwd: REPO, encoding: 'utf8', timeout: 90_000 });
+    // The bench (warmup + 30 handshakes + 500 round-trips + 2000-msg throughput) can
+    // run well over 90s on a slow/contended Windows runner; give it generous headroom
+    // so a slow machine is not a false non-zero exit. Bounded to catch a true hang.
+    const out = execFileSync(process.execPath, [entry, ...args], { env: { ...process.env, ...env }, cwd: REPO, encoding: 'utf8', timeout: 300_000 });
     return { code: 0, out };
   } catch (e) {
     const err = e as { status?: number; stdout?: string; stderr?: string };
@@ -78,6 +81,6 @@ describe('F-A — bench entry actually runs', () => {
     expect(report.secureTransport).toBe(true);
     expect(report.methodology.warmup).toBeGreaterThan(0);
     expect(report.handshakeMs.n).toBeGreaterThan(0);
-    expect(report.sendThroughputPerSec).toBeGreaterThan(0);
-  }, 120_000);
+    expect(report.sendThroughputPerSec).toBeGreaterThan(0); // structural (>0), NOT a perf threshold
+  }, 360_000); // exceed the 300s execFileSync bench cap so vitest doesn't kill it first (slow runners)
 });
