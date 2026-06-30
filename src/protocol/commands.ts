@@ -61,4 +61,10 @@ export interface RegisterPayload {
   capabilities: string[];
   repositoryRoot?: string;
   claudeCodeVersion?: string;
+  /** Beta.4 (ADR 0012): a human-readable name the session would like to hold.
+   *  Optional + additive — kept SEPARATE from PR #4's nested adapterRegistration so
+   *  the two feature sets compose without colliding (ADR 0012 §5). */
+  requestedSessionName?: string;
+  /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
+  agentType?: string;
 }

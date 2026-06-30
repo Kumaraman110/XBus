@@ -292,9 +292,21 @@ export class BrokerDaemon {
       supersede: p.supersede === true,
       ...(p.repositoryRoot !== undefined ? { repositoryRoot: p.repositoryRoot } : {}),
       ...(p.claudeCodeVersion !== undefined ? { claudeCodeVersion: p.claudeCodeVersion } : {}),
+      // Beta.4 (ADR 0012): optional name request + agent type. The store awards the
+      // name (active) or falls to pending_name; never fails registration over it.
+      ...(p.requestedSessionName !== undefined ? { requestedSessionName: p.requestedSessionName } : {}),
+      ...(p.agentType !== undefined ? { agentType: p.agentType } : {}),
     });
     this.connAuth.set(conn.id, auth);
-    this.reply(conn, 'register_session_ack', { sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId, role: auth.role, epoch: auth.epoch, generation: auth.generation }, frame.requestId);
+    // Beta.4: ack ADDS optional awardedSessionName + sessionNameState (the frozen
+    // fields below are unchanged; clients ignore unknown fields — ADR 0012 §5,
+    // composes with PR #4's future awardedTier).
+    this.reply(conn, 'register_session_ack', {
+      sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId,
+      role: auth.role, epoch: auth.epoch, generation: auth.generation,
+      ...(auth.sessionNameState !== undefined ? { sessionNameState: auth.sessionNameState } : {}),
+      ...(auth.awardedSessionName != null ? { awardedSessionName: auth.awardedSessionName } : {}),
+    }, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {

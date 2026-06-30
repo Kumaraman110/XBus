@@ -28,13 +28,13 @@ interface McpProc {
   kill: () => void;
 }
 
-function startMcp(sessionId: string, label: string): McpProc {
+function startMcp(sessionId: string, label: string, extraEnv: Record<string, string> = {}): McpProc {
   // Use a REAL temp working dir per session (a non-existent cwd makes spawn
   // throw ENOENT pointing at the command — a Windows quirk).
   const cwd = fs.mkdtempSync(path.join(dataDir, `cwd-${label}-`));
   const child = spawn(process.execPath, [SERVER_JS], {
     cwd,
-    env: { ...process.env, CLAUDE_CODE_SESSION_ID: sessionId, XBUS_DATA_DIR: dataDir },
+    env: { ...process.env, CLAUDE_CODE_SESSION_ID: sessionId, XBUS_DATA_DIR: dataDir, ...extraEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   procs.push(child);
@@ -152,6 +152,24 @@ describe('MCP tool surface (two real server processes)', () => {
     const after = (broker.db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
     expect(after).toBe(before);
     A.kill();
+  });
+
+  it('beta.4: an auto-derived session name is awarded at registration and is routable by name', async () => {
+    // XBUS_SESSION_NAME is the explicit/saved-preference override → deterministic.
+    const A = startMcp('aaaa7777-aaaa-7777-aaaa-777777777777', 'A', { XBUS_SESSION_NAME: 'seatmap-api' });
+    const B = startMcp('bbbb8888-bbbb-8888-bbbb-888888888888', 'B', { XBUS_SESSION_NAME: 'release-reviewer' });
+    await A.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+    await B.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+    // Touch a tool so each server connects + registers (auto-name happens then).
+    await A.callTool('xbus_status', {});
+    await B.callTool('xbus_status', {});
+    // The broker awarded the requested names → A can address B by its NAME (no
+    // explicit xbus_register alias needed). This proves the zero-friction naming path.
+    const sessA = broker.db.prepare("SELECT session_name FROM sessions WHERE session_id=?").get('aaaa7777-aaaa-7777-aaaa-777777777777') as { session_name: string | null };
+    expect(sessA.session_name).toBe('seatmap-api');
+    const send = await A.callTool('xbus_send', { to: 'release-reviewer', text: 'named-routing-ok', requiresAck: false, requiresReply: false });
+    expect(send.recipientSessionId).toBe('bbbb8888-bbbb-8888-bbbb-888888888888');
+    A.kill(); B.kill();
   });
 
   it('a session cannot ack a message addressed to another session', async () => {
