@@ -53,7 +53,7 @@ async function admin(b: RunningBroker): Promise<IpcClient> {
 
 interface MetricsPayload {
   transport: { handshakes: { ok: number; authFailed: number; protoMismatch: number; timedOut: number } };
-  reaper: { sweepsTotal: number; totals: { ackTimedOut: number; deadLettered: number; expired: number; leasesReclaimed: number } };
+  reaper: { sweepsTotal: number; totals: { ackTimedOut: number; deadLettered: number; expired: number; leasesReclaimed: number; sessionsExpired: number } };
 }
 
 /**
@@ -144,7 +144,7 @@ describe('§1 counter-correctness', () => {
     void messageId;
 
     // Drive several sweeps across time, summing the RETURNED SweepResults.
-    const sum = { ackTimedOut: 0, deadLettered: 0, expired: 0, leasesReclaimed: 0 };
+    const sum = { ackTimedOut: 0, deadLettered: 0, expired: 0, leasesReclaimed: 0, sessionsExpired: 0 };
     for (let i = 0; i < 4; i++) {
       clock.advance(5 * 60_000 + 1000); // past the ack deadline (and any backoff after)
       const r = daemon.runReaperSweep();
@@ -152,6 +152,7 @@ describe('§1 counter-correctness', () => {
       sum.deadLettered += r.deadLettered;
       sum.expired += r.expired;
       sum.leasesReclaimed += r.leasesReclaimed;
+      sum.sessionsExpired += r.sessionsExpired;
       // re-inject between sweeps so the next sweep has work (until dead-lettered).
       delivery.checkpointPull({ ...B, role: 'hook' as never }, `cp-${i + 2}`, 10);
     }
