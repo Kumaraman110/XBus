@@ -115,6 +115,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { alias: { type: 'string' } }, required: ['alias'] },
   },
   {
+    name: 'xbus_rename',
+    description: 'Set or change THIS session\'s human-readable unique name (e.g. "seatmap-api"). Use this when XBus reports your session is pending_name (the suggested name was taken or unsuitable) or to rename. Returns the active name, or an error if the name is taken/invalid — pick another.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Desired unique session name: [a-z0-9][a-z0-9._-]{1,47}, not reserved/generic.' } }, required: ['name'] },
+  },
+  {
     name: 'xbus_status',
     description: 'Report XBus connection + session status for this session.',
     inputSchema: { type: 'object', properties: {} },
@@ -258,6 +263,10 @@ export class McpServer {
       }
       case 'xbus_register': {
         const f = await this.client.request('register_alias', args);
+        return this.unwrap(f);
+      }
+      case 'xbus_rename': {
+        const f = await this.client.request('rename_session', args);
         return this.unwrap(f);
       }
       case 'xbus_status': {

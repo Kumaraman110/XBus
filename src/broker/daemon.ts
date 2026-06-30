@@ -191,6 +191,8 @@ export class BrokerDaemon {
           return this.onRegister(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
+        case 'rename_session':
+          return this.onRenameSession(conn, frame);
         case 'send_message':
           return this.onSend(conn, frame);
         case 'checkpoint_pull':
@@ -307,6 +309,17 @@ export class BrokerDaemon {
       ...(auth.sessionNameState !== undefined ? { sessionNameState: auth.sessionNameState } : {}),
       ...(auth.awardedSessionName != null ? { awardedSessionName: auth.awardedSessionName } : {}),
     }, frame.requestId);
+  }
+
+  private onRenameSession(conn: ServerConn, frame: Frame): void {
+    // Beta.4 (ADR 0012 D4): choose/change the session's human-readable name. This is
+    // the resolution path for a session stranded in pending_name (e.g. two sessions
+    // launched from the same project picked the same suggested name). mcp-role only;
+    // SESSION_NAME_TAKEN / INVALID_SESSION_NAME surface to the model so it can retry.
+    const auth = this.requireAuth(conn);
+    const p = frame.payload as { name: string };
+    const r = this.store.renameSession(auth, p.name);
+    this.reply(conn, 'rename_session_ack', { name: r.name, sessionNameState: r.state }, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {
@@ -500,7 +513,7 @@ export class BrokerDaemon {
   private onListSessions(conn: ServerConn, frame: Frame): void {
     this.requireAuth(conn);
     const rows = this.db
-      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at FROM sessions s`)
+      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at, s.session_name, s.session_name_state, s.expired_at FROM sessions s`)
       .all() as Array<Record<string, unknown>>;
     const sessions = rows.map((r) => {
       const sid = r.session_id as string;
@@ -508,6 +521,12 @@ export class BrokerDaemon {
       const unacked = (this.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=? AND state='transport_written'`).get(sid) as { n: number }).n;
       const aliases = (this.db.prepare(`SELECT alias FROM aliases WHERE session_id=? AND active=1 AND alias NOT LIKE 'session-%'`).all(sid) as Array<{ alias: string }>).map((a) => a.alias);
       return {
+        // Beta.4: the human-readable session NAME (the primary user-facing address)
+        // + its lifecycle state, so peers can discover a session by name and see
+        // whether it is active / pending (unroutable) / expired. ADR 0012 D2/D3.
+        name: (r.session_name as string) ?? null,
+        sessionNameState: (r.session_name_state as string) ?? 'unnamed',
+        expired: (r.expired_at as string | null) !== null,
         alias: aliases[0] ?? (r.automatic_alias as string),
         project: (r.project_alias as string) ?? (r.project_id as string),
         // connection (is a socket attached?), receiveMode (HOW it takes delivery),

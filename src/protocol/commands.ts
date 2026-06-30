@@ -10,6 +10,7 @@ export type FrameType =
   | 'hello' | 'hello_ack'
   | 'register_session' | 'register_session_ack'
   | 'register_alias' | 'register_alias_ack'
+  | 'rename_session' | 'rename_session_ack'   // beta.4: choose/change the human-readable session name (resolves pending_name)
   | 'heartbeat' | 'heartbeat_ack'
   | 'send_message' | 'send_message_ack'
   | 'checkpoint_pull' | 'checkpoint_pull_ack'   // hook_checkpoint: receiver pulls pending + marks injected

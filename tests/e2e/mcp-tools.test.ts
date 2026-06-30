@@ -172,6 +172,30 @@ describe('MCP tool surface (two real server processes)', () => {
     A.kill(); B.kill();
   });
 
+  it('beta.4: a collided (pending) session resolves via xbus_rename and becomes routable by name', async () => {
+    // Two sessions request the SAME name → first wins 'active', second falls to
+    // pending_name. The second resolves it via xbus_rename (the pending escape hatch).
+    const A = startMcp('aaaa9999-aaaa-9999-aaaa-999999999999', 'A', { XBUS_SESSION_NAME: 'dup-name' });
+    const B = startMcp('bbbbaaaa-bbbb-aaaa-bbbb-aaaaaaaaaaaa', 'B', { XBUS_SESSION_NAME: 'dup-name' });
+    await A.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+    await B.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
+    await A.callTool('xbus_status', {}); // A registers -> 'dup-name' active
+    await B.callTool('xbus_status', {}); // B registers -> collision -> pending_name
+    // B is pending (unroutable by name): listing shows it pending, not active-named.
+    const sessB = broker.db.prepare('SELECT session_name_state AS s FROM sessions WHERE session_id=?').get('bbbbaaaa-bbbb-aaaa-bbbb-aaaaaaaaaaaa') as { s: string };
+    expect(sessB.s).toBe('pending');
+    // B picks a different name via xbus_rename → becomes active + routable.
+    const renamed = await B.callTool('xbus_rename', { name: 'dup-name-reviewer' });
+    expect(renamed.sessionNameState).toBe('active');
+    expect(renamed.name).toBe('dup-name-reviewer');
+    // A can now address B by its chosen name.
+    const send = await A.callTool('xbus_send', { to: 'dup-name-reviewer', text: 'resolved', requiresAck: false, requiresReply: false });
+    expect(send.recipientSessionId).toBe('bbbbaaaa-bbbb-aaaa-bbbb-aaaaaaaaaaaa');
+    // Renaming to a name another active session holds is rejected (model retries).
+    await expect(B.callTool('xbus_rename', { name: 'dup-name' })).rejects.toThrow(/SESSION_NAME_TAKEN|in use/);
+    A.kill(); B.kill();
+  });
+
   it('a session cannot ack a message addressed to another session', async () => {
     const A = startMcp('dddd4444-dddd-4444-dddd-444444444444', 'A');
     const B = startMcp('eeee5555-eeee-5555-eeee-555555555555', 'B');
