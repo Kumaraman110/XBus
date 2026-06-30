@@ -1,5 +1,5 @@
 /**
- * xbus CLI: install, uninstall, doctor, status, sessions, send, start, stop,
+ * xbus CLI: install, uninstall, repair, doctor, status, sessions, send, start, stop,
  * pause/resume/dnd, block/unblock, inbox, version. install/uninstall are
  * user-scope + reversible (src/cli/install.ts); update/rollback and PATH /
  * shell-profile integration remain separate, explicitly-requested steps.
@@ -18,7 +18,8 @@ import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
 import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, invocationHint, type CliResult } from './output.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
-import { resolveDataDir } from '../launcher/install-paths.js';
+import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../launcher/install-paths.js';
+import { repairUserScope, defaultClaudeConfigPath } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
 
@@ -48,27 +49,60 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
   if (!r.ok) {
     return { human: `xbus install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: ${invocationHint('doctor')}`, json: { ...r }, exitCode: 1 };
   }
-  // PATH-free install: there is NO bare `xbus`/`xclaude` command. Print the exact
-  // copy-pasteable `node <path>` invocations (the installed plugin's own entries),
-  // never a bare command the installer did not put on PATH.
-  const launcherJs = path.join(r.plan.pluginDir, 'dist', 'launcher', 'xclaude.js');
+  // Beta.4 (ADR 0012 D8): with user-scope registration, plain `claude` from any
+  // directory loads XBus + auto-starts the broker + auto-registers a named session.
+  // No --plugin-dir, no xclaude. The CLI itself is still PATH-free (node <path>).
   const cliJs = path.join(r.plan.pluginDir, 'dist', 'cli', 'main.js');
-  return {
-    human: [
-      `XBus installed.`,
-      `  plugin dir: ${r.plan.pluginDir}`,
-      `  data dir:   ${r.plan.dataDir}`,
-      `  health:     ${r.health?.detail}`,
-      `  manifest:   ${r.manifestPath}`,
-      ``,
+  const launcherJs = path.join(r.plan.pluginDir, 'dist', 'launcher', 'xclaude.js');
+  // Did this install register user-scope config? Read it back from the manifest.
+  const wired = !!readInstallManifest(r.plan.installRoot)?.userScope;
+  const lines = [
+    `XBus installed.`,
+    `  plugin dir: ${r.plan.pluginDir}`,
+    `  data dir:   ${r.plan.dataDir}`,
+    `  health:     ${r.health?.detail}`,
+    `  manifest:   ${r.manifestPath}`,
+    ``,
+  ];
+  if (wired) {
+    lines.push(
+      `XBus is registered at user scope — just run plain 'claude' from any directory.`,
+      `The broker auto-starts and your session auto-registers with a unique name.`,
+      `Verify:  node "${cliJs}" doctor`,
+      `Repair (e.g. after node moves):  node "${cliJs}" repair`,
+    );
+  } else {
+    lines.push(
       `Verify:  node "${cliJs}" doctor`,
       `Launch Claude with XBus:  node "${launcherJs}"`,
-      `(Install is PATH-free: there is no bare 'xbus'/'xclaude' command. PATH /`,
-      ` shell-profile integration was NOT changed — request it separately if wanted.)`,
+      `(Plugin-only install: user-scope registration was skipped. PATH / shell-profile`,
+      ` integration was NOT changed — request it separately if wanted.)`,
       `See INSTALL.txt in the release asset for verify, launch, and uninstall steps.`,
-    ].join('\n'),
-    json: { ...r }, exitCode: 0,
-  };
+    );
+  }
+  return { human: lines.join('\n'), json: { ...r }, exitCode: 0 };
+}
+
+function cmdRepair(): CliResult {
+  // Re-apply the user-scope Claude config registration for the current install
+  // (fixes drift, e.g. the node executable moved). Reads the install manifest for
+  // the owning installId so it re-takes ONLY this install's entry.
+  const installRoot = defaultInstallRoot();
+  const manifest = readInstallManifest(installRoot);
+  if (!manifest) {
+    return { human: `XBus is not installed (nothing to repair). Run: node "<pluginDir>/dist/cli/main.js" install`, json: { ok: false, notInstalled: true }, exitCode: 1 };
+  }
+  const configPath = manifest.userScope?.configPath ?? defaultClaudeConfigPath();
+  const r = repairUserScope({
+    configPath,
+    nodePath: process.execPath,
+    serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
+    hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+    dataDir: manifest.dataDir,
+    installId: manifest.installId ?? `xbus-repair-${process.pid}`,
+  });
+  if (!r.ok) return { human: `xbus repair FAILED: ${r.error ?? 'unknown'}`, json: { ...r }, exitCode: 1 };
+  return { human: `XBus user-scope config ${r.repaired ? 'repaired' : 'already current'} (${configPath}).`, json: { ...r }, exitCode: 0 };
 }
 
 function cmdUninstall(dryRun: boolean, removeData: boolean): CliResult {
@@ -177,7 +211,6 @@ async function cmdDoctor(): Promise<CliResult> {
   // normative contract the packager + installer use (consume one contract, not
   // ad-hoc lists). Absent install → informational, not a failure.
   try {
-    const { defaultInstallRoot, readInstallManifest } = await import('../launcher/install-paths.js');
     const { validateArtifact } = await import('../shared/artifact-contract.js');
     const manifest = readInstallManifest(defaultInstallRoot());
     if (manifest) {
@@ -358,6 +391,8 @@ export async function run(argv: string[]): Promise<void> {
         return emit(await cmdInstall(args.includes('--dry-run')), asJson);
       case 'uninstall':
         return emit(cmdUninstall(args.includes('--dry-run'), args.includes('--remove-data')), asJson);
+      case 'repair':
+        return emit(cmdRepair(), asJson);
       case 'doctor':
         return emit(await cmdDoctor(), asJson);
       case 'status':
