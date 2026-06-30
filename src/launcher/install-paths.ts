@@ -38,6 +38,17 @@ export interface InstallManifest {
   /** sha256 of the installed artifact's SHA256SUMS — the exact distributable
    *  identity (see ADR 0011). Absent for a dev install from a built repo (no SHA256SUMS). */
   artifactManifestSha256?: string;
+  /** Beta.4 (ADR 0012 D8): a unique id for THIS install, used as the ownership tag
+   *  on user-scope Claude config entries so uninstall removes only what we created. */
+  installId?: string;
+  /** Beta.4: record of the user-scope Claude MCP+hooks registration (so uninstall
+   *  can reverse it, and doctor/repair can detect drift). Absent if not registered. */
+  userScope?: {
+    configPath: string;
+    registeredAt: string;
+    /** Pre-install backup of the user's config (restorable). */
+    backupPath?: string;
+  };
 }
 
 export function readInstallManifest(installRoot: string): InstallManifest | null {
