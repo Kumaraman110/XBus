@@ -179,6 +179,38 @@ describe('unregisterUserScope — ownership-scoped removal', () => {
   });
 });
 
+describe('Windows backslash paths in the hook command (regression)', () => {
+  // A Windows node/hook path uses backslashes. The hook `command` is a SHELL string,
+  // so the path must survive LITERALLY — JSON.stringify would double the backslashes
+  // (C:\\Users\\…), producing a broken path AND breaking ownership-matching on
+  // uninstall (includes() of the raw path would no longer match). Use real backslash
+  // paths here (the forward-slash fixtures above did not exercise this).
+  const winNode = 'C:\\Program Files\\nodejs\\node.exe';
+  const winHook = 'C:\\Users\\v\\.claude\\xbus-install\\plugin\\dist\\channel\\hook-entry.js';
+
+  it('stores the hook command with LITERAL backslashes (not doubled)', () => {
+    registerUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
+    const raw = fs.readFileSync(configPath, 'utf8');
+    const cfg = readClaudeConfig(configPath)!;
+    const cmd = cfg.hooks!.UserPromptSubmit![0]!.hooks[0]!.command;
+    // The in-memory command value must contain the path with SINGLE backslashes.
+    expect(cmd).toContain(winHook);
+    expect(cmd).not.toContain('C:\\\\Users'); // not doubled in memory
+    // (On disk the JSON file escapes each backslash once — that's normal JSON.)
+    expect(raw).toContain('hook-entry.js');
+  });
+
+  it('uninstall removes the Windows-path hook it created (ownership match survives)', () => {
+    registerUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
+    expect(JSON.stringify(readClaudeConfig(configPath)!.hooks)).toContain('hook-entry.js');
+    const u = unregisterUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
+    expect(u.ok).toBe(true);
+    expect(u.removed).toBe(true);
+    // our hook is gone — the includes() ownership match worked despite backslashes.
+    expect(JSON.stringify(readClaudeConfig(configPath)!.hooks ?? {})).not.toContain('hook-entry.js');
+  });
+});
+
 describe('repairUserScope', () => {
   it('re-applies the canonical entry when ours has drifted (e.g. node path moved)', () => {
     registerUserScope(opts({ nodePath: 'C:/old/node.exe' }));

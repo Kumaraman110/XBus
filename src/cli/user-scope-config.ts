@@ -104,10 +104,18 @@ function xbusMcpEntry(o: UserScopeOptions): McpServerEntry {
   };
 }
 
-/** Our canonical hook command (node "<hookEntry>"). */
+/** Our canonical hook command: `"<node>" "<hookEntry>"`.
+ *
+ *  The command is a SHELL string, so the path must appear LITERALLY (a Windows path
+ *  keeps its single backslashes). We therefore wrap each path in real double quotes
+ *  (spaces-safe on both cmd.exe and POSIX sh) — NOT JSON.stringify, which would
+ *  DOUBLE backslashes into the value (C:\\Users\\…), breaking both the runtime path
+ *  and the includes()-based ownership match on uninstall. Filenames cannot contain a
+ *  double quote on Windows, and our install paths never do on POSIX, so naive
+ *  double-quote wrapping is safe here. */
+function shQuote(p: string): string { return `"${p}"`; }
 function xbusHookCommand(o: UserScopeOptions): string {
-  // Quote the path for the shell the hook runner uses (spaces-safe).
-  return `${JSON.stringify(o.nodePath)} ${JSON.stringify(o.hookEntry)}`;
+  return `${shQuote(o.nodePath)} ${shQuote(o.hookEntry)}`;
 }
 
 /** Is this hook-command string ours (references our hook entry)? */
