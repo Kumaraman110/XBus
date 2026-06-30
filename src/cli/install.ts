@@ -162,6 +162,13 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
   fs.mkdirSync(installRoot, { recursive: true });
   try { assertNotReparse(installRoot); } catch (e) { return { ok: false, dryRun: false, plan, error: (e as Error).message }; }
 
+  // Hoisted so the OUTER catch can REVERSE a completed user-scope registration: if
+  // the user-scope MCP/hooks write succeeded but a LATER step (manifest rewrite,
+  // migration marker) throws, rollback must also unregister the two config files —
+  // otherwise they're orphaned pointing at a plugin dir the rollback just deleted,
+  // with no manifest left for `uninstall` to key off (adversarial-review minor).
+  let userScopeToReverse: Parameters<typeof unregisterUserScope>[0] | undefined;
+
   // Stage into a temp dir alongside the final plugin dir, then swap atomically.
   const staging = path.join(installRoot, `.plugin.staging-${process.pid}`);
   fs.rmSync(staging, { recursive: true, force: true });
@@ -273,7 +280,7 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       const installId = `xbus-${now.replace(/[:.]/g, '-')}-${process.pid}`;
       const configPath = opts.claudeConfigPath ?? defaultClaudeConfigPath();
       const settingsPath = opts.claudeSettingsPath ?? defaultClaudeSettingsPath();
-      const usr = registerUserScope({
+      const usrOpts = {
         configPath,
         settingsPath,
         nodePath: opts.nodePath ?? process.execPath,
@@ -281,7 +288,9 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
         dataDir,
         installId,
-      });
+      };
+      const usr = registerUserScope(usrOpts);
+      if (usr.ok) userScopeToReverse = usrOpts; // arm the rollback for any LATER throw
       if (!usr.ok) {
         const partial: InstallManifest = { schema: 1, name: 'xbus', version: XBUS_VERSION, commit: readCommit(source), buildId: BUILD_ID, installedAt: now, installRoot, pluginDir, dataDir, files, backups };
         const rb = rollback(installRoot, partial);
@@ -315,6 +324,10 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     // creation): remove a swapped plugin dir, restore the most recent backup,
     // and clean staging + any partial manifest. Leaves the install root as it was.
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ }
+    // Reverse a COMPLETED user-scope registration first (best-effort), so a throw
+    // after it succeeded does not orphan ~/.claude.json + ~/.claude/settings.json
+    // entries pointing at the plugin dir we are about to delete.
+    if (userScopeToReverse) { try { unregisterUserScope(userScopeToReverse); } catch { /* best effort */ } }
     let rolledBack = false;
     try {
       if (swapped && fs.existsSync(pluginDir)) fs.rmSync(pluginDir, { recursive: true, force: true });

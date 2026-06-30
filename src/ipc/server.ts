@@ -101,10 +101,22 @@ export class IpcServer {
       this.server = net.createServer((socket) => this.accept(socket));
       const onError = (err: NodeJS.ErrnoException): void => {
         if (err.code === 'EADDRINUSE' && allowStaleSocketRecovery && this.isUnixSocketEndpoint()) {
-          // Probe the existing socket; if unreachable it is stale → unlink + retry.
+          // Capture the inode of the offending socket NOW, then probe it. If it is
+          // unreachable (stale), unlink it and retry — but ONLY if the inode is
+          // unchanged at unlink time, so a broker that bound a NEW socket at this path
+          // in the probe→unlink gap is never clobbered (TOCTOU close: we remove the
+          // EXACT stale inode we probed, or nothing). The upstream checkSingleton /
+          // probeExisting layer is still the primary arbiter for the common case.
+          let inoBefore: number | undefined;
+          try { inoBefore = fs.statSync(this.endpoint).ino; } catch { inoBefore = undefined; }
           this.probeStaleSocket().then((reachable) => {
             if (reachable) { reject(err); return; } // a real broker owns it
-            try { fs.unlinkSync(this.endpoint); } catch { /* ignore */ }
+            try {
+              const inoNow = fs.statSync(this.endpoint).ino;
+              if (inoBefore !== undefined && inoNow === inoBefore) fs.unlinkSync(this.endpoint);
+              // else: the inode changed (a racing broker re-created the path) — do NOT
+              // unlink; the retry below will hit EADDRINUSE and propagate (contended).
+            } catch { /* path vanished — fine, the retry will just bind */ }
             this.listenOnce(false).then(resolve, reject); // retry ONCE, no further recovery
           }, () => reject(err));
           return;

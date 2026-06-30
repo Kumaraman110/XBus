@@ -251,7 +251,18 @@ export class BrokerStore {
         // For an expired resume there are none (the sweep dead-lettered the queue),
         // so this is a no-op there — old dead_letter rows are NOT touched.
         this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, target_instance_id=NULL, updated_at=? WHERE recipient_session_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}'`).run(now, input.sessionId);
-        if (isExpiredResume) this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
+        if (isExpiredResume) {
+          // The expiry sweep retired ALL of this session's alias rows (active=0),
+          // including the broker-minted automatic_alias (session-<8hex>) — the
+          // always-present fallback address. A resumed session must be routable by
+          // that alias again (ADR 0012 / reaper.ts: 'still routable by its
+          // automatic_alias'); reactivate it (re-upsert if the row was pruned). The
+          // session's prior USER name stays released (re-claimed below if requested).
+          const auto = automaticAlias(input.sessionId);
+          const reactivated = this.db.prepare(`UPDATE aliases SET active=1, retired_at=NULL WHERE session_id=? AND alias_ci=? AND scope='global'`).run(input.sessionId, auto.ci);
+          if (reactivated.changes === 0) this.upsertAliasRow(auto, 'global', null, input.sessionId, now);
+          this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
+        }
       } else {
         // Split-brain guard (ADR 0008): at most ONE live writable (mcp) component
         // per session epoch. A SECOND concurrent mcp registration on a DIFFERENT

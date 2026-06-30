@@ -165,6 +165,26 @@ describe('15-day expiry sweep', () => {
     expect(got.find((m) => m.text === 'new')).toBeDefined(); // new body delivered
   });
 
+  it('an expired session resuming WITHOUT a name is routable again by its automatic_alias', () => {
+    // Cross-fix regression: the expiry sweep retires ALL alias rows (active=0),
+    // including the broker-minted automatic_alias. A resume must reactivate it, else
+    // a session that resumes with no requestedSessionName is unaddressable by alias.
+    const sender = ready('aa-snd');
+    const rcvId = sid();
+    const rcv = store.register({ sessionId: rcvId, instanceId: 'i', connectionId: `c-${rcvId}`, processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' }); // unnamed
+    store.signalReadiness(rcv, { ackAvailable: true, versionOk: true });
+    const autoAlias = (db.prepare('SELECT automatic_alias AS a FROM sessions WHERE session_id=?').get(rcvId) as { a: string }).a;
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep(); // expires rcv, retires its automatic_alias (active=0)
+    // Resume WITHOUT a requested name (the bite case).
+    const resumed = store.register({ sessionId: rcvId, instanceId: 'i2', connectionId: `c2-${rcvId}`, processId: 7, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' });
+    store.signalReadiness(resumed, { ackAvailable: true, versionOk: true });
+    expect(sessRow(rcvId).expired_at).toBeNull(); // recovered
+    // Routable by the automatic_alias again (the sweep had deactivated it).
+    const send = store.send(sender, { to: autoAlias, text: 'via-auto-alias', kind: 'request', requiresAck: false, requiresReply: false });
+    expect(send.recipientSessionId).toBe(rcvId);
+  });
+
   it('is idempotent — a second sweep does not double-expire', () => {
     ready('idem');
     clock.advance(15 * DAY + 1000);
