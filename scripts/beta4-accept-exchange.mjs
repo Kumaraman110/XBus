@@ -107,12 +107,22 @@ try {
   pass('named request → ack → correlated reply');
 
   // ── 4: duplicate-name → pending → xbus_rename → active ──
-  const C = startMcp('cccc3333-cccc-3333-cccc-333333333333', 'C', 'accept-architect'); // same name as A
+  // C requests the SAME name as A. The broker awards A 'active' and falls C to
+  // 'pending' (unroutable by name). Verify the pending state directly from the
+  // broker DB (the source of truth — robust against admin-list connection timing),
+  // then resolve via xbus_rename and confirm 'active'.
+  const C = startMcp('cccc3333-cccc-3333-cccc-333333333333', 'C', 'accept-architect');
   await C.rpc('initialize', { protocolVersion: '2024-11-05', capabilities: {} });
   await C.callTool('xbus_status', {}); // registers → collision → pending
-  sess = await listSessions();
-  const pendingC = sess.find((s) => s.sessionId === 'cccc3333-cccc-3333-cccc-333333333333');
-  if (pendingC?.sessionNameState !== 'pending') throw new Error('C did not go pending on name collision: ' + JSON.stringify(pendingC));
+  const { openDatabase: openDb } = await imp('database/connection.js');
+  const stateOfC = () => {
+    const db = openDb(path.join(dataDir, 'xbus.sqlite'), { applyPragmas: true });
+    try { return (db.prepare("SELECT session_name_state AS s FROM sessions WHERE session_id=?").get('cccc3333-cccc-3333-cccc-333333333333') || {}).s; }
+    finally { db.close(); }
+  };
+  let cState;
+  for (let i = 0; i < 15 && cState === undefined; i++) { cState = stateOfC(); if (cState === undefined) await new Promise((r) => setTimeout(r, 200)); }
+  if (cState !== 'pending') throw new Error('C did not go pending on name collision: state=' + cState);
   const renamed = await C.callTool('xbus_rename', { name: 'accept-architect-2' });
   if (renamed.sessionNameState !== 'active' || renamed.name !== 'accept-architect-2') throw new Error('rename did not activate: ' + JSON.stringify(renamed));
   pass('duplicate name → pending → xbus_rename → active');

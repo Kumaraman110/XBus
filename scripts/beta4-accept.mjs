@@ -62,6 +62,18 @@ function runCli(cli, args, extra = {}) {
   return { code: r.status ?? 1, out: (r.stdout ?? '') + (r.stderr ?? ''), stdout: r.stdout ?? '' };
 }
 function readJson(p) { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+/** Parse the LAST balanced JSON object from a stdout string (ignores banner lines). */
+function parseJsonOut(stdout) {
+  const start = stdout.indexOf('{');
+  if (start < 0) throw new Error('no JSON in output: ' + stdout.slice(0, 200));
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < stdout.length; i++) {
+    const c = stdout[i];
+    if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true; else if (c === '{') depth++; else if (c === '}') { depth--; if (depth === 0) return JSON.parse(stdout.slice(start, i + 1)); }
+  }
+  throw new Error('unbalanced JSON in output');
+}
 const checks = [];
 function check(name, ok, detail) { checks.push({ name, ok, detail }); log(`  [${ok ? 'PASS' : 'FAIL'}] ${name}${detail ? ' — ' + detail : ''}`); if (!ok) fail(`${name}: ${detail}`); }
 
@@ -71,7 +83,7 @@ try {
 
   log('[1] install with user-scope registration');
   let r = runCli(cliFromSource, ['install', '--json']);
-  check('install ok', r.code === 0 && readJson(r.stdout.slice(r.stdout.indexOf('{'))).ok, r.code === 0 ? '' : r.out.slice(0, 400));
+  check('install ok', r.code === 0 && parseJsonOut(r.stdout).ok, r.code === 0 ? '' : r.out.slice(0, 400));
 
   log('[2] XBus registered in the user Claude config (two files, ownership-tagged)');
   const cfg = readJson(claudeConfig);
