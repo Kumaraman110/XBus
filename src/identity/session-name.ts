@@ -19,6 +19,19 @@
  */
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 
+/** The session name lifecycle (ADR 0012 Decision 2). ORTHOGONAL to connection
+ *  `state` and `readiness`:
+ *    'unnamed'  legacy / not-yet-named — routable by automatic_alias.
+ *    'pending'  a name was requested but is unusable/taken — UNROUTABLE until chosen.
+ *    'active'   a valid unique name is held — discoverable + routable by name.
+ *    'retired'  name released (rename / expiry) — returns to the pool. */
+export const SESSION_NAME_STATES = ['unnamed', 'pending', 'active', 'retired'] as const;
+export type SessionNameState = (typeof SESSION_NAME_STATES)[number];
+
+/** Broker-minted auto-aliases use this prefix (`aliases.ts`); a user session name
+ *  must not shadow that namespace. */
+const SESSION_AUTO_PREFIX = 'session-';
+
 /** Min/max human-readable length (the `{1,47}` tail + 1 leading char ⇒ 2..48). */
 export const SESSION_NAME_MIN = 2;
 export const SESSION_NAME_MAX = 48;
@@ -84,6 +97,9 @@ export function validateSessionName(raw: unknown): NormalizedSessionName {
       XBusErrorCode.INVALID_SESSION_NAME,
       'session name must match [a-z0-9][a-z0-9._-]{1,47} (start with a letter or digit)',
     );
+  }
+  if (normalized.startsWith(SESSION_AUTO_PREFIX)) {
+    throw new XBusError(XBusErrorCode.INVALID_SESSION_NAME, `the "${SESSION_AUTO_PREFIX}" prefix is reserved for broker-minted aliases`);
   }
   if (RESERVED_SESSION_NAMES.has(normalized)) {
     throw new XBusError(XBusErrorCode.INVALID_SESSION_NAME, `reserved session name: ${normalized}`);

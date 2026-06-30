@@ -18,10 +18,15 @@ import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { PROTOCOL_VERSION, XBUS_VERSION } from '../protocol/version.js';
 import { DeliveryState } from '../protocol/states.js';
 import { validateUserAlias, automaticAlias, parseRecipient, type NormalizedAlias } from '../identity/aliases.js';
+import { validateSessionName, type NormalizedSessionName } from '../identity/session-name.js';
 import type { SendInput } from '../protocol/schemas.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
+
+/** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
+ *  routing expires this long after its last MEANINGFUL activity. */
+export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
 
 export interface RegisterInput {
   sessionId: string;
@@ -37,6 +42,18 @@ export interface RegisterInput {
   buildId?: string;
   repositoryRoot?: string;
   claudeCodeVersion?: string;
+  /** Beta.4: a human-readable name the session would like to hold. Valid +
+   *  unclaimed ⇒ 'active'; taken/invalid ⇒ 'pending' (registration still succeeds,
+   *  the session is just unroutable-by-name until the user picks one). */
+  requestedSessionName?: string;
+  /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
+  agentType?: string;
+}
+
+/** Beta.4: outcome of a name claim (register or rename). */
+export interface SessionNameStatus {
+  state: 'unnamed' | 'pending' | 'active' | 'retired';
+  name: string | null;
 }
 
 /**
@@ -53,6 +70,12 @@ export interface SessionAuthority {
   generation: number;
   fencingToken: number;
   connectionId: string;
+  /** Beta.4 (ADR 0012): the session's name lifecycle state at registration.
+   *  Additive + optional — the frozen ack fields above are unchanged; clients that
+   *  predate beta.4 ignore these. */
+  sessionNameState?: 'unnamed' | 'pending' | 'active' | 'retired';
+  /** Beta.4: the held display name when sessionNameState==='active', else null. */
+  awardedSessionName?: string | null;
 }
 
 export interface SendResult {
@@ -97,6 +120,63 @@ export class BrokerStore {
       );
   }
 
+  /**
+   * Refresh `last_meaningful_activity_at` (+ recompute the 15-day `expires_at`)
+   * for a session. Call ONLY from genuinely meaningful, model-visible ops
+   * (register, name op, send, ack/reject/reply, redeliver, body-injecting
+   * checkpoint pull, intentional control change) — NEVER from passive liveness
+   * (signalReadiness, reconnect, sweeps, health checks). Idempotent. Must run
+   * inside the caller's transaction. ADR 0012 Decision 5.
+   */
+  refreshMeaningfulActivity(sessionId: string, nowIso?: string): void {
+    const now = nowIso ?? this.clock.nowIso();
+    const expiresAt = new Date(this.clock.nowMs() + MEANINGFUL_ACTIVITY_RETENTION_MS).toISOString();
+    this.db.prepare('UPDATE sessions SET last_meaningful_activity_at=?, expires_at=?, updated_at=? WHERE session_id=?').run(now, expiresAt, now, sessionId);
+  }
+
+  /**
+   * Attempt to claim a session name during the register/rename transaction.
+   * Returns the resulting status. A valid + unclaimed name is acquired ('active');
+   * a TAKEN or INVALID name leaves the session 'pending' (caller must NOT fail
+   * registration over it — the session is just unroutable-by-name until chosen).
+   * The DB unique index `ux_session_name_active` is the authoritative race guard;
+   * this pre-check produces the friendly state, and the index backstops a race.
+   */
+  private claimNameForRegister(sessionId: string, requested: string | undefined, now: string): SessionNameStatus {
+    if (requested === undefined) return { state: 'unnamed', name: null };
+    let norm: NormalizedSessionName;
+    try {
+      norm = validateSessionName(requested);
+    } catch {
+      // Invalid name → register as pending (unroutable) with a short reservation TTL.
+      this.markPending(sessionId, now);
+      return { state: 'pending', name: null };
+    }
+    const taken = this.db
+      .prepare(`SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`)
+      .get(norm.normalized, sessionId) as { session_id: string } | undefined;
+    if (taken) {
+      this.markPending(sessionId, now);
+      return { state: 'pending', name: null };
+    }
+    try {
+      this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, updated_at=? WHERE session_id=?`)
+        .run(norm.display, norm.normalized, now, sessionId);
+    } catch {
+      // Lost a race to the unique index — fall back to pending, never throw.
+      this.markPending(sessionId, now);
+      return { state: 'pending', name: null };
+    }
+    return { state: 'active', name: norm.display };
+  }
+
+  /** Put a session into the unroutable 'pending' name state with a reservation TTL. */
+  private markPending(sessionId: string, now: string): void {
+    const pendingTtl = new Date(this.clock.nowMs() + 5 * 60_000).toISOString();
+    this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='pending', pending_name_expires_at=?, updated_at=? WHERE session_id=?`)
+      .run(pendingTtl, now, sessionId);
+  }
+
   private nextFencingToken(): number {
     this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
     return (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
@@ -134,12 +214,12 @@ export class BrokerStore {
         const auto = automaticAlias(input.sessionId);
         this.db
           .prepare(
-            `INSERT INTO sessions (session_id, active_instance_id, generation, high_water_generation, active_epoch, fencing_token, bound_connection_id, automatic_alias, project_id, cwd, repository_root, claude_code_version, xbus_version, capabilities_json, receive_mode, state, connected_at, last_seen_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'connected', ?,?,?,?)`,
+            `INSERT INTO sessions (session_id, active_instance_id, generation, high_water_generation, active_epoch, fencing_token, bound_connection_id, automatic_alias, project_id, cwd, repository_root, claude_code_version, xbus_version, capabilities_json, receive_mode, state, agent_type, connected_at, last_seen_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'connected', ?,?,?,?,?)`,
           )
           .run(
             input.sessionId, componentInstanceId, epoch, epoch, epoch, epoch, input.connectionId,
             auto.display, input.projectId, input.cwd, input.repositoryRoot ?? null, input.claudeCodeVersion ?? null,
-            XBUS_VERSION, JSON.stringify(input.capabilities), input.receiveMode, now, now, now, now,
+            XBUS_VERSION, JSON.stringify(input.capabilities), input.receiveMode, input.agentType ?? null, now, now, now, now,
           );
         this.db.prepare('INSERT OR IGNORE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, 1)').run(input.sessionId);
         this.upsertAliasRow(auto, 'global', null, input.sessionId, now);
@@ -194,10 +274,25 @@ export class BrokerStore {
         )
         .run(componentInstanceId, input.sessionId, epoch, role, input.processId, input.connectionId, input.buildId ?? null, JSON.stringify(input.capabilities), now, now);
 
-      this.audit('COMPONENT_REGISTERED', { sessionId: input.sessionId, instanceId: componentInstanceId, role, epoch });
+      // Beta.4 (ADR 0012): name claim + meaningful-activity stamp happen only on a
+      // GENUINELY NEW session lifecycle (first registration or a true supersede),
+      // never on a passive component join/reconnect — joining is not "activity",
+      // and a reconnecting hook must not re-roll the name or extend the idle timer.
+      const isNewLifecycle = !existing || input.supersede === true;
+      let nameStatus: SessionNameStatus;
+      if (isNewLifecycle) {
+        nameStatus = this.claimNameForRegister(input.sessionId, input.requestedSessionName, now);
+        this.refreshMeaningfulActivity(input.sessionId, now);
+      } else {
+        const cur = this.db.prepare(`SELECT session_name_state AS s, session_name AS n FROM sessions WHERE session_id=?`).get(input.sessionId) as { s: SessionNameStatus['state']; n: string | null };
+        nameStatus = { state: cur.s, name: cur.n };
+      }
+
+      this.audit('COMPONENT_REGISTERED', { sessionId: input.sessionId, instanceId: componentInstanceId, role, epoch, sessionNameState: nameStatus.state });
       return {
         sessionId: input.sessionId, instanceId: componentInstanceId, componentInstanceId, role, epoch,
         generation: epoch, fencingToken: epochToken, connectionId: input.connectionId,
+        sessionNameState: nameStatus.state, awardedSessionName: nameStatus.name,
       };
     });
   }
@@ -264,6 +359,50 @@ export class BrokerStore {
   }
 
   /**
+   * Beta.4 (ADR 0012 Decision 4): atomically (re)name the authenticated session.
+   * Validates the new name, acquires it via the unique index (case-insensitive,
+   * reserve-on-claim), releases the old name, refreshes meaningful activity, and
+   * audits. Promotes a 'pending' session to 'active'. Throws SESSION_NAME_TAKEN if
+   * another active/pending session holds it, INVALID_SESSION_NAME if malformed.
+   * mcp-role only (a hook must not rename). All in one transaction so a failure
+   * leaves the prior name binding intact.
+   */
+  renameSession(auth: SessionAuthority, rawName: string): SessionNameStatus {
+    if (auth.role !== ComponentRole.MCP) {
+      throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'only the mcp component may name/rename a session');
+    }
+    const norm = validateSessionName(rawName); // throws INVALID_SESSION_NAME
+    return this.db.transaction(() => {
+      const s = this.db.prepare('SELECT active_epoch, session_name_state AS state FROM sessions WHERE session_id=?').get(auth.sessionId) as { active_epoch: number; state: string } | undefined;
+      if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
+      if (s.active_epoch !== auth.epoch) throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
+      const taken = this.db
+        .prepare(`SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`)
+        .get(norm.normalized, auth.sessionId) as { session_id: string } | undefined;
+      if (taken) throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      const now = this.clock.nowIso();
+      try {
+        this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, updated_at=? WHERE session_id=?`)
+          .run(norm.display, norm.normalized, now, auth.sessionId);
+      } catch {
+        // Unique-index race: someone else acquired it between the check and the write.
+        throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      }
+      this.refreshMeaningfulActivity(auth.sessionId, now);
+      this.audit('SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
+      return { state: 'active', name: norm.display };
+    });
+  }
+
+  /** Beta.4: discoverable active-named sessions (excludes pending/unnamed/retired
+   *  and any session that has expired). Used by the discovery / list-sessions path. */
+  listActiveNamedSessions(): Array<{ sessionId: string; name: string; projectId: string; agentType: string | null }> {
+    return this.db
+      .prepare(`SELECT session_id AS sessionId, session_name AS name, project_id AS projectId, agent_type AS agentType FROM sessions WHERE session_name_state='active' AND expired_at IS NULL ORDER BY normalized_session_name`)
+      .all() as Array<{ sessionId: string; name: string; projectId: string; agentType: string | null }>;
+  }
+
+  /**
    * §2 — record an explicit readiness signal for the authenticated session.
    * The client supplies concrete capability hints (canAck, hookAvailable, …);
    * the broker DERIVES the readiness state (never trusts a bare "ready").
@@ -309,7 +448,15 @@ export class BrokerStore {
       return { sessionId: s.session_id, alias: s.automatic_alias };
     }
     if (ref.kind === 'alias') {
-      const rows = this.db.prepare(`SELECT session_id, alias FROM aliases WHERE alias_ci=? AND active=1`).all(ref.alias.toLowerCase()) as Array<{ session_id: string; alias: string }>;
+      const want = ref.alias.toLowerCase();
+      // Beta.4: a bare recipient may name a SESSION NAME (active only) or a routing
+      // alias — distinct pools, both valid `to:` targets. Match both, dedup by
+      // session, and reject ambiguity. Pending/unnamed/retired names are NOT routable.
+      const byName = this.db.prepare(`SELECT session_id, session_name AS alias FROM sessions WHERE normalized_session_name=? AND session_name_state='active' AND expired_at IS NULL`).all(want) as Array<{ session_id: string; alias: string }>;
+      const byAlias = this.db.prepare(`SELECT session_id, alias FROM aliases WHERE alias_ci=? AND active=1`).all(want) as Array<{ session_id: string; alias: string }>;
+      const merged = new Map<string, { session_id: string; alias: string }>();
+      for (const r of [...byName, ...byAlias]) merged.set(r.session_id, r);
+      const rows = [...merged.values()];
       if (rows.length === 0) throw new XBusError(XBusErrorCode.UNKNOWN_RECIPIENT, 'unknown recipient');
       if (rows.length > 1) throw new XBusError(XBusErrorCode.AMBIGUOUS_RECIPIENT, 'ambiguous recipient; supply a fully-qualified projectId/alias or exact session id');
       return { sessionId: rows[0]!.session_id, alias: rows[0]!.alias };
@@ -383,6 +530,8 @@ export class BrokerStore {
         .prepare(`INSERT INTO deliveries (delivery_id, message_id, recipient_session_id, state, created_at, updated_at) VALUES (?,?,?, '${DeliveryState.QUEUED}', ?, ?)`)
         .run(this.ids.next(), messageId, recipient.sessionId, now, now);
 
+      // Beta.4: sending is meaningful activity for the SENDER (ADR 0012 Decision 5).
+      this.refreshMeaningfulActivity(auth.sessionId, now);
       this.audit('MESSAGE_SENT', { sessionId: auth.sessionId, messageId, traceId, recipient: recipient.alias, sequence });
 
       return { messageId, correlationId, recipientSessionId: recipient.sessionId, recipientAlias: recipient.alias, sequence, state: DeliveryState.QUEUED, deduplicated: false };

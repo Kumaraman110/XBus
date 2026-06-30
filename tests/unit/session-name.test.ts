@@ -133,6 +133,11 @@ describe('validateSessionName — reserved / generic / id-like rejection', () =>
     rejects('/usr/local/bin');
     rejects('./relative');
   });
+
+  it('rejects the broker-minted "session-" auto-alias prefix', () => {
+    rejects('session-abc123');
+    rejects('Session-Deadbeef'); // case-insensitive
+  });
 });
 
 describe('isValidSessionName — boolean mirror of validateSessionName', () => {
