@@ -4,11 +4,12 @@ All notable changes to XBus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project is in
 pre-1.0 Developer Preview, so the public surface may still change.
 
-## [0.1.0-beta.3] — first-run correctness hotfix
+## [0.1.0-beta.3] — Windows and delivery-correctness hotfix
 
-A release-correctness hotfix for the Windows first-user experience. **No protocol,
-XBUS-STP, schema, crypto, or broker behavior change** (`compatibilityId xbus-p1-stp1-s5`
-unchanged). Scope:
+A release-correctness update for the Windows first-user experience and checkpoint
+delivery lifecycle. There is **no protocol, XBUS-STP, schema, crypto, or compatibility
+ID change** (`compatibilityId xbus-p1-stp1-s5` remains unchanged). Broker lifecycle
+behavior is corrected for non-ACK delivery and automatic checkpoint reinjection. Scope:
 
 - **Install bootstrap corrected.** Install is **PATH-free by design** — there is no
   global `xbus` command. README / installation / quickstart now document the actual
@@ -34,6 +35,20 @@ unchanged). Scope:
 - **Clean-machine acceptance.** New `npm run accept:clean-machine` runs the documented
   flow end-to-end (install → doctor → fake-host MCP init → broker → two-session
   send/ack/correlated-reply → stop → uninstall) using only installed files.
+- **Windows Claude launcher resolution.** The launcher now resolves npm-installed
+  Claude Code shims deterministically on Windows using
+  `claude.cmd → claude.exe → claude.bat → claude`, never selects `claude.ps1`,
+  and retains `CLAUDE_CODE_EXECPATH` as an explicit advanced override.
+- **Non-ACK delivery lifecycle corrected.** Messages with `requires_ack=false`
+  no longer receive ACK deadlines or enter ACK-timeout requeue/dead-letter handling.
+  Fire-and-forget messages become terminal after successful checkpoint injection;
+  non-ACK messages requiring a reply remain pending only for that correlated reply.
+- **Checkpoint injection-ID invariant enforced.** An automatic checkpoint never
+  returns a message body without a valid injection ID and never automatically
+  re-presents an already-injected body in the same epoch. ACK-timeout escalation
+  remains active for ACK-required messages, while explicit redelivery remains the
+  only path that intentionally presents the body again under a new logical
+  injection number.
 
 ## [0.1.0-beta.2] — first public developer preview
 
