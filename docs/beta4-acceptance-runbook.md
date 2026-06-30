@@ -17,11 +17,10 @@ Windows profile.
 ## A. Automated acceptance — run this first
 
 ```powershell
-# Supported Node (22 LTS / 24). The script is fully isolated: it never touches your
-# real ~/.claude, ~/.claude.json, or ~/.claude/settings.json (it points
+# Supported Node (22 LTS / 24) on PATH. The script is fully isolated: it never
+# touches your real ~/.claude, ~/.claude.json, or ~/.claude/settings.json (it points
 # CLAUDE_CONFIG_PATH / CLAUDE_SETTINGS_PATH / HOME at a temp tree and uses a fake
 # claude host). No `xbus`/`xclaude` on PATH is needed.
-$env:Path = "C:\Users\v173617\xbus-validation\node22;$env:Path"
 npm run build
 node scripts/beta4-accept.mjs            # uses ./dist
 # expected last line: RESULT: BETA4_AUTOMATED_ACCEPTANCE_PASS
