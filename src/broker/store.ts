@@ -131,7 +131,12 @@ export class BrokerStore {
   refreshMeaningfulActivity(sessionId: string, nowIso?: string): void {
     const now = nowIso ?? this.clock.nowIso();
     const expiresAt = new Date(this.clock.nowMs() + MEANINGFUL_ACTIVITY_RETENTION_MS).toISOString();
-    this.db.prepare('UPDATE sessions SET last_meaningful_activity_at=?, expires_at=?, updated_at=? WHERE session_id=?').run(now, expiresAt, now, sessionId);
+    // Guard `expired_at IS NULL` (matching delivery.ts refreshActivity): activity must
+    // NEVER silently revive a tombstoned session into an expired-yet-active row. Paths
+    // that legitimately bring an expired session back (register-resume, rename-resume)
+    // clear expired_at FIRST, so this update then applies; a stray refresh on a still-
+    // expired row is a no-op. ADR 0012 D6 (tombstone not revived by activity).
+    this.db.prepare('UPDATE sessions SET last_meaningful_activity_at=?, expires_at=?, updated_at=? WHERE session_id=? AND expired_at IS NULL').run(now, expiresAt, now, sessionId);
   }
 
   /**
@@ -402,7 +407,7 @@ export class BrokerStore {
     }
     const norm = validateSessionName(rawName); // throws INVALID_SESSION_NAME
     return this.db.transaction(() => {
-      const s = this.db.prepare('SELECT active_epoch, session_name_state AS state FROM sessions WHERE session_id=?').get(auth.sessionId) as { active_epoch: number; state: string } | undefined;
+      const s = this.db.prepare('SELECT active_epoch, session_name_state AS state, expired_at AS expiredAt FROM sessions WHERE session_id=?').get(auth.sessionId) as { active_epoch: number; state: string; expiredAt: string | null } | undefined;
       if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
       if (s.active_epoch !== auth.epoch) throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
       const taken = this.db
@@ -410,15 +415,25 @@ export class BrokerStore {
         .get(norm.normalized, auth.sessionId) as { session_id: string } | undefined;
       if (taken) throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
       const now = this.clock.nowIso();
+      // Beta.4 (ADR 0012 D6): if this session was EXPIRED (the reaper set expired_at +
+      // 'retired' while its connection stayed alive on non-meaningful heartbeats), a
+      // rename must RESURRECT it — clear the tombstone — not half-revive it. Leaving
+      // expired_at set while flipping session_name_state='active' would create an
+      // unroutable-yet-name-holding row that permanently locks the name (the reaper
+      // never re-expires it). Clearing expired_at here also makes the subsequent
+      // refreshMeaningfulActivity (guarded on expired_at IS NULL) apply. The live
+      // connection keeps the current epoch — naming is the meaningful activity that
+      // brings the session back.
+      const wasExpired = s.expiredAt !== null;
       try {
-        this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, updated_at=? WHERE session_id=?`)
+        this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, expired_at=NULL, expiration_reason=NULL, updated_at=? WHERE session_id=?`)
           .run(norm.display, norm.normalized, now, auth.sessionId);
       } catch {
         // Unique-index race: someone else acquired it between the check and the write.
         throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
       }
-      this.refreshMeaningfulActivity(auth.sessionId, now);
-      this.audit('SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
+      this.refreshMeaningfulActivity(auth.sessionId, now); // now applies (expired_at cleared above)
+      this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
       return { state: 'active', name: norm.display };
     });
   }

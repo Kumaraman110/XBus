@@ -185,6 +185,45 @@ describe('15-day expiry sweep', () => {
     expect(send.recipientSessionId).toBe(rcvId);
   });
 
+  it('renameSession on an EXPIRED session resurrects it cleanly (no tombstone-locked name)', () => {
+    // Cross-cycle regression: a session whose connection stays alive (heartbeats are
+    // NOT meaningful activity) is expired by the reaper while its epoch is unchanged.
+    // The model then calls xbus_rename. Before the fix this left expired_at set AND
+    // session_name_state='active' — an unroutable row that permanently locked the name
+    // in ux_session_name_active. The rename must RESURRECT (clear the tombstone).
+    const sender = ready('rr-snd');
+    const victim = ready('rr-victim');
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    expect(sessRow(victim.sessionId).expired_at).not.toBeNull();
+    expect(sessRow(victim.sessionId).state).toBe('retired');
+    // The live connection's epoch is unchanged (expiry doesn't bump it), so rename's
+    // epoch check passes — exactly the bite case.
+    const out = store.renameSession(victim, 'rr-victim-renamed');
+    expect(out.state).toBe('active');
+    const row = sessRow(victim.sessionId);
+    expect(row.expired_at).toBeNull();      // tombstone cleared (resurrected)
+    expect(row.reason).toBeNull();
+    expect(row.norm).toBe('rr-victim-renamed');
+    // Routable again by the new name (would be UNROUTABLE if expired_at were still set).
+    const send = store.send(sender, { to: 'rr-victim-renamed', text: 'back', kind: 'request', requiresAck: false, requiresReply: false });
+    expect(send.recipientSessionId).toBe(victim.sessionId);
+    // And another session can NOT be blocked from a DIFFERENT name (no lock leak):
+    const other = ready('rr-other');
+    expect(sessRow(other.sessionId).state).toBe('active');
+  });
+
+  it('refreshMeaningfulActivity does NOT revive an expired (tombstoned) session', () => {
+    const a = ready('rma-one');
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    const expiredAt = sessRow(a.sessionId).expired_at;
+    expect(expiredAt).not.toBeNull();
+    // A stray refresh on a still-expired row must be a no-op (guarded expired_at IS NULL).
+    store.refreshMeaningfulActivity(a.sessionId);
+    expect(sessRow(a.sessionId).expired_at).toBe(expiredAt); // unchanged — not revived
+  });
+
   it('is idempotent — a second sweep does not double-expire', () => {
     ready('idem');
     clock.advance(15 * DAY + 1000);
