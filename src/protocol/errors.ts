@@ -12,6 +12,14 @@ export const XBusErrorCode = {
   AMBIGUOUS_RECIPIENT: 'XBUS_AMBIGUOUS_RECIPIENT',
   INVALID_ALIAS: 'XBUS_INVALID_ALIAS',
   // Sessions / identity / fencing
+  /** A human-readable session name was rejected (charset, reserved, generic,
+   *  UUID-like, path-like, length). Beta.4 named-session validation. */
+  INVALID_SESSION_NAME: 'XBUS_INVALID_SESSION_NAME',
+  /** The requested name is already owned by another ACTIVE session. Beta.4. */
+  SESSION_NAME_TAKEN: 'XBUS_SESSION_NAME_TAKEN',
+  /** A send targeted a session that has expired (>15 days without meaningful
+   *  activity); its name was released. FINAL / non-retryable. Beta.4 retention. */
+  RECIPIENT_SESSION_EXPIRED: 'XBUS_RECIPIENT_SESSION_EXPIRED',
   SESSION_NOT_REGISTERED: 'XBUS_SESSION_NOT_REGISTERED',
   SESSION_ALREADY_BOUND: 'XBUS_SESSION_ALREADY_BOUND',
   SESSION_FENCED: 'XBUS_SESSION_FENCED',
