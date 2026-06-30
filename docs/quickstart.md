@@ -2,29 +2,37 @@
 
 Launch two Claude Code sessions from unrelated directories and have them talk.
 
-> Preview note: real installation modifies user-scope config and is gated behind
-> explicit approval — see [installation.md](installation.md). The steps below show
-> the intended flow once installed.
+> **First install XBus** (see [installation.md](installation.md)) — it is **PATH-free**,
+> so there is no global `xbus` command. Invoke the CLI as `node .\dist\cli\main.js …`
+> from your checkout (or the installed plugin's `dist\cli\main.js` by absolute path).
+> For brevity below, define a convenience alias in **your** shell first — XBus does
+> not create one:
+>
+> ```powershell
+> # optional: a session-local alias so the examples below read cleanly
+> function xbus   { node "$PWD\dist\cli\main.js" @args }
+> function xclaude { node "$PWD\dist\launcher\xclaude.js" @args }
+> ```
 
 ## 1. Start the broker (once per machine/user)
 
 The broker auto-starts on first use, or explicitly:
 
 ```powershell
-xbus start
-xbus doctor      # verify: data dir, broker reachable, secure transport on
+node .\dist\cli\main.js start
+node .\dist\cli\main.js doctor   # verify: data dir, broker reachable, secure transport on
 ```
 
 ## 2. Launch two sessions
 
-In two terminals, in two different projects:
+In two terminals, in two different projects (requires Claude Code installed):
 
 ```powershell
 # terminal A
-xclaude            # launches Claude Code with XBus enabled
+node .\dist\launcher\xclaude.js   # launches Claude Code with XBus enabled
 
 # terminal B
-xclaude
+node .\dist\launcher\xclaude.js
 ```
 
 ## 3. Register aliases

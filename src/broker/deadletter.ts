@@ -83,7 +83,7 @@ export class DeadLetterStore {
 
   private recommend(category: string): string {
     switch (category) {
-      case 'max_attempts': return 'Transient failures exhausted retries. Use: xbus dead-letter retry <id> (revalidated).';
+      case 'max_attempts': return 'Transient failures exhausted retries. Use the `dead-letter retry <id>` command (revalidated).';
       case 'recipient_gone': return 'Recipient session no longer exists. Confirm the recipient is running, then retry.';
       case 'expired': return 'Message passed its acceptance TTL. Resend a fresh message if still relevant.';
       default: return 'Inspect the failure, then retry or discard explicitly.';

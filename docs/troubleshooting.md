@@ -1,9 +1,23 @@
 # Troubleshooting
 
-Start with:
+> **`xbus` is not recognized / there is no `xbus` command.** Install is **PATH-free** —
+> XBus does not put a command on PATH. Invoke it as `node .\dist\cli\main.js <command>`
+> from your checkout, or the installed plugin's `dist\cli\main.js` by absolute path. See
+> [installation.md](installation.md).
+>
+> **`XBus does not yet support Node.js 25.x`.** XBus supports Node `>=22.5` and `<25`.
+> Use **Node 22 LTS** or **Node 24**. (Maintainers validating a newer major can set
+> `XBUS_ALLOW_UNSUPPORTED_NODE=1`, which runs with a visible warning and does not change
+> the supported boundary.)
+>
+> **MCP reconnection failure in Claude.** Most often the plugin failed to install
+> cleanly (e.g. a half-rolled-back install). Re-run `node .\dist\cli\main.js install`
+> then `node .\dist\cli\main.js doctor`; both must report ok before launching `xclaude`.
+
+Start with (from your checkout or the installed plugin path):
 
 ```
-xbus doctor
+node .\dist\cli\main.js doctor
 ```
 
 It checks the data directory + ACLs, broker reachability, the secure transport,

@@ -156,6 +156,24 @@ export function buildPackage(stagingDir: string): PackageResult {
   copyDir(path.join(REPO, '.claude-plugin'), path.join(stagingDir, '.claude-plugin'));
   fs.copyFileSync(path.join(REPO, '.mcp.json'), path.join(stagingDir, '.mcp.json'));
   copyDir(path.join(REPO, 'hooks'), path.join(stagingDir, 'hooks'));
+  // The PATH-free release-asset installer (Windows). Lets an archive user run
+  // `.\install.ps1` instead of typing the `node .\dist\cli\main.js install` bootstrap.
+  if (fs.existsSync(path.join(REPO, 'install.ps1'))) {
+    fs.copyFileSync(path.join(REPO, 'install.ps1'), path.join(stagingDir, 'install.ps1'));
+  }
+  // Self-contained install guide for the RELEASE ASSET — a clean-profile user must
+  // be able to install/verify/launch/uninstall from instructions INSIDE the asset,
+  // with no source checkout and no maintainer knowledge. (install.ps1 + xclaude
+  // reference THIS file, not the repo-only docs/installation.md which is not shipped.)
+  if (fs.existsSync(path.join(REPO, 'INSTALL.txt'))) {
+    fs.copyFileSync(path.join(REPO, 'INSTALL.txt'), path.join(stagingDir, 'INSTALL.txt'));
+  } else {
+    throw new Error('INSTALL.txt not found at repo root — the release asset must ship a self-contained install guide');
+  }
+  // LICENSE notice for the archive.
+  if (fs.existsSync(path.join(REPO, 'LICENSE'))) {
+    fs.copyFileSync(path.join(REPO, 'LICENSE'), path.join(stagingDir, 'LICENSE'));
+  }
 
   // 2) Pinned PRODUCTION deps only.
   for (const dep of PROD_DEPS) {
@@ -191,12 +209,18 @@ export function buildPackage(stagingDir: string): PackageResult {
 
   // 4b) Build manifest — provenance of THIS artifact. NOTE: `buildId`
   //     here is the legacy COMPATIBILITY tuple (wire value); the EXACT build id is
-  //     in provenance.json (4c). builtOnPlatform/node are NON-deterministic build
-  //     facts — kept for human provenance but NOT part of the deterministic
-  //     identity (provenance.json is the deterministic, checksum-covered one).
+  //     in provenance.json (4c). This file is checksum-covered (step 6), so it MUST
+  //     be byte-reproducible across any supported builder Node/OS: it carries ONLY
+  //     deterministic source facts (name/version/commit/compat tuple). The builder's
+  //     Node version + platform are NON-deterministic build environment — they
+  //     belong in out-of-band release provenance emitted ALONGSIDE the release ZIP
+  //     (package-release-zip.ts writes release-provenance.json next to the archive),
+  //     NEVER inside the checksum-covered, reproducible artifact. (Earlier builds
+  //     embedded process.version/platform here, which silently made the artifact
+  //     manifest checksum vary by builder Node — the exact reproducibility defect
+  //     this gate exists to catch.)
   fs.writeFileSync(path.join(stagingDir, 'build-manifest.json'), JSON.stringify({
     name: repoPkg.name, version: repoPkg.version, commit, buildId: BUILD_ID,
-    builtOnPlatform: `${process.platform}/${process.arch}`, node: process.version,
   }, null, 2) + '\n');
 
   // 4c) The NORMATIVE provenance manifest (ADR 0011). DETERMINISTIC: only
@@ -245,7 +269,7 @@ export function buildPackage(stagingDir: string): PackageResult {
   // 9) Verify EXPECTED outputs are present — never report success on an empty/
   //    partial dir. (Superseded by the contract validator below, kept
   //    as a fast fail-fast.)
-  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod'];
+  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'INSTALL.txt', 'install.ps1', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod'];
   const missingOutputs = expected.filter((e) => !fs.existsSync(path.join(stagingDir, e)));
 
   // 8b) NORMATIVE artifact-contract validation: the SAME validator the

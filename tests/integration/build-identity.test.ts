@@ -106,7 +106,7 @@ describe('build-identity model', () => {
   it('source run (no provenance) degrades to a LABELLED source identity, never a false exact id', () => {
     const id = resolveIdentity(5, null);
     expect(id.sourceCommit).toBe('source');
-    expect(id.buildId).toBe('xbus-0.1.0-beta.2-source');
+    expect(id.buildId).toBe('xbus-0.1.0-beta.3-source');
     expect(id.compatibilityId).toBe('xbus-p1-stp1-s5');
   });
 

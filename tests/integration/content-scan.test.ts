@@ -15,7 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scanTree, denylistRules, loadPrivateDenylist } from '../../src/tools/content-scan.js';
+import { scanTree, denylistRules, loadPrivateDenylist, isThirdPartyNpmVersionField, STRUCTURAL_RULES } from '../../src/tools/content-scan.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -79,12 +79,54 @@ describe('content scan — whole-repo (no private terms / paths / secrets / prov
       const lines = text.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const ln = lines[i]!;
-        if (rcTag.test(ln) && !/synthetic|placeholder|fixture|example|e\.g\./i.test(ln)) hits.push(`rc-tag  ${f}:${i + 1}  ${ln.trim().slice(0, 70)}`);
+        // Same narrow allowance as the scanner's prerelease-rc-tag rule: a legitimate
+        // THIRD-PARTY npm version field (e.g. "std-env": "^4.0.0-rc.1") is not internal
+        // provenance. A private RC tag in prose / a resolved git URL is still flagged.
+        if (rcTag.test(ln) && !/synthetic|placeholder|fixture|example|e\.g\./i.test(ln) && !isThirdPartyNpmVersionField(ln)) hits.push(`rc-tag  ${f}:${i + 1}  ${ln.trim().slice(0, 70)}`);
         for (const r of shaRules) if (r.pattern.test(ln)) hits.push(`rc-sha  ${f}:${i + 1}  ${ln.trim().slice(0, 70)}`);
       }
     }
     if (hits.length) throw new Error(`internal RC provenance leaked back into tracked source:\n  ${hits.join('\n  ')}`);
     expect(hits).toHaveLength(0);
+  });
+
+  it('lockfile scanning: third-party prerelease versions are accepted; private leaks are still rejected', () => {
+    // §2 regression suite. The lockfile is STILL fully scanned; only a narrow npm
+    // version-field carrying a legitimate third-party rc.N is allowed. Everything
+    // private (RC tag in prose, a private SHA in a resolved URL, a workstation path,
+    // a credential) is still caught by the relevant rule.
+    const rcTag = new RegExp('\\b(?:v?\\d+\\.\\d+\\.\\d+-)?rc\\.[0-9]+\\b', 'i');
+    const flaggedByRc = (l: string) => rcTag.test(l) && !/synthetic|placeholder|fixture|example|e\.g\./i.test(l) && !isThirdPartyNpmVersionField(l);
+
+    // (1) legitimate third-party prerelease dep versions are ACCEPTED (not RC-flagged)
+    for (const ok of ['    "std-env": "^4.0.0-rc.1",', '      "version": "1.2.3-rc.2",', '    "some-dep": ">=2.0.0-rc.5 <3",']) {
+      expect(flaggedByRc(ok), `should accept: ${ok}`).toBe(false);
+    }
+
+    // (2) a private RC tag elsewhere (prose / non-version context) is REJECTED
+    for (const bad of ['  // cut from internal v0.1.0-rc.4 build', '    "comment": "rebased onto rc.6 candidate"']) {
+      expect(flaggedByRc(bad), `should flag: ${bad}`).toBe(true);
+    }
+
+    // (3) a private SHA inside a resolved git URL is REJECTED by the unrecognized-git-sha rule
+    //     (and is NOT cleared by the npm-version-field allowance, which excludes url/resolved lines).
+    // A realistic (non-repeating) private commit SHA in a resolved git ref. Must NOT
+    // use a repeated-char run, which the rule treats as an obviously-synthetic dummy.
+    const resolvedLine = '    "resolved": "git+https://host/repo.git#d131eb47c93f8a205e6b1f0c84d92a7be3105f29",';
+    expect(isThirdPartyNpmVersionField(resolvedLine)).toBe(false);
+    const gitShaRule = STRUCTURAL_RULES.find((r) => r.id === 'unrecognized-git-sha')!;
+    expect(gitShaRule.pattern.test(resolvedLine) && !(gitShaRule.allow?.(resolvedLine) ?? false)).toBe(true);
+
+    // (4) a workstation path in the lockfile is REJECTED by the windows-user-path rule
+    const pathLine = '    "x": "C:\\\\Users\\\\realperson\\\\secret",';
+    const winPathRule = STRUCTURAL_RULES.find((r) => r.id === 'windows-user-path')!;
+    expect(winPathRule.pattern.test(pathLine) && !(winPathRule.allow?.(pathLine) ?? false)).toBe(true);
+    expect(isThirdPartyNpmVersionField(pathLine)).toBe(false); // path value is not a semver range
+
+    // (5) a credential-like value is REJECTED by the inline-secret rule
+    const credLine = '    "token": "abcdefghijklmnopqrstuvwxyz0123456789",';
+    const secretRule = STRUCTURAL_RULES.find((r) => r.id === 'inline-secret')!;
+    expect(secretRule.pattern.test(credLine) && !(secretRule.allow?.(credLine) ?? false)).toBe(true);
   });
 
   it('the private publication audit FAILS CLOSED when the external denylist is absent', () => {

@@ -11,17 +11,29 @@ export interface CliResult {
   exitCode: number;
 }
 
-const NEXT_ACTION: Record<string, string> = {
-  XBUS_UNKNOWN_RECIPIENT: 'Recipient not found. Run: xbus sessions',
-  XBUS_AMBIGUOUS_RECIPIENT: 'Recipient is ambiguous. Use a qualified alias (project/alias) or the exact session ID.',
-  XBUS_BROKER_UNAVAILABLE: 'Broker unavailable. Run: xbus doctor',
-  XBUS_SESSION_FENCED: 'This session was superseded by a newer instance. Restart the session.',
-  XBUS_INVALID_ALIAS: 'Alias is invalid. Use ASCII letters, digits, "_" or "-" (max 128).',
-};
+/** The exact `node "<this cli>" <sub>` invocation for THIS process. Install is
+ *  PATH-free — there is NO bare `xbus`/`xclaude` command on PATH — so every
+ *  user-facing "run this" hint must show the real `node <path>` form, never a
+ *  bare `xbus ...` the reader cannot execute. */
+export function invocationHint(sub: string): string {
+  const entry = process.argv[1];
+  const base = entry ? `node "${entry}"` : 'node ./dist/cli/main.js';
+  return `${base} ${sub}`;
+}
+
+function nextActions(): Record<string, string> {
+  return {
+    XBUS_UNKNOWN_RECIPIENT: `Recipient not found. Run: ${invocationHint('sessions')}`,
+    XBUS_AMBIGUOUS_RECIPIENT: 'Recipient is ambiguous. Use a qualified alias (project/alias) or the exact session ID.',
+    XBUS_BROKER_UNAVAILABLE: `Broker unavailable. Run: ${invocationHint('doctor')}`,
+    XBUS_SESSION_FENCED: 'This session was superseded by a newer instance. Restart the session.',
+    XBUS_INVALID_ALIAS: 'Alias is invalid. Use ASCII letters, digits, "_" or "-" (max 128).',
+  };
+}
 
 export function errorResult(e: unknown): CliResult {
   if (isXBusError(e)) {
-    const next = NEXT_ACTION[e.code] ?? 'Run: xbus doctor';
+    const next = nextActions()[e.code] ?? `Run: ${invocationHint('doctor')}`;
     return {
       human: `Error: ${e.message}\n${next}`,
       json: { ok: false, ...e.toWire(), nextAction: next },
@@ -29,7 +41,7 @@ export function errorResult(e: unknown): CliResult {
     };
   }
   const msg = e instanceof Error ? e.message : String(e);
-  return { human: `Error: ${msg}\nRun: xbus doctor`, json: { ok: false, message: msg }, exitCode: 1 };
+  return { human: `Error: ${msg}\nRun: ${invocationHint('doctor')}`, json: { ok: false, message: msg }, exitCode: 1 };
 }
 
 export function emit(result: CliResult, asJson: boolean): never {

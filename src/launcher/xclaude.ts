@@ -20,6 +20,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { readInstallManifest, defaultInstallRoot, resolveDataDir } from './install-paths.js';
+import { assertSupportedNode } from '../shared/node-support.js';
+import { resolveClaudeExecutable, isResolved } from './resolve-claude.js';
 
 function fail(msg: string): never {
   process.stderr.write(`xclaude: ${msg}\n`);
@@ -39,11 +41,14 @@ function resolvePluginDir(): string {
   const root = defaultInstallRoot();
   const manifest = readInstallManifest(root);
   if (!manifest) {
-    fail(`XBus is not installed (no manifest under ${root}).\n  Run: xbus install\n  Or set XBUS_PLUGIN_DIR to a plugin directory.`);
+    fail(`XBus is not installed (no manifest under ${root}).\n  Run: node <checkout>/dist/cli/main.js install  (install is PATH-free; there is no global 'xbus' command)\n  Or set XBUS_PLUGIN_DIR to a plugin directory.`);
   }
   const pluginDir = manifest.pluginDir;
   if (!fs.existsSync(path.join(pluginDir, '.claude-plugin', 'plugin.json'))) {
-    fail(`installed plugin dir is missing or corrupt: ${pluginDir}\n  Re-run: xbus install`);
+    // PATH-free: point at the real CLI entry (sibling of this launcher), not a
+    // bare `xbus` command that does not exist on PATH.
+    const cliJs = path.join(path.dirname(process.argv[1] ?? ''), '..', 'cli', 'main.js');
+    fail(`installed plugin dir is missing or corrupt: ${pluginDir}\n  Re-run: node "${cliJs}" install`);
   }
   return pluginDir;
 }
@@ -67,8 +72,28 @@ export function cmdQuoteArg(arg: string): string {
 function main(): void {
   const userArgs = process.argv.slice(2);
   const pluginDir = resolvePluginDir();
-  const claudeBin = process.env.CLAUDE_CODE_EXECPATH || 'claude';
+  // §6 test-mode guard: when XBUS_TEST_REQUIRE_FAKE_CLAUDE=1, the launcher REFUSES
+  // to fall back to a real `claude` on PATH — it requires CLAUDE_CODE_EXECPATH to
+  // point at an explicit (fake) executable. This makes it impossible for an
+  // automated test to ever resolve or launch the user's real Claude Code.
+  const requireFake = process.env.XBUS_TEST_REQUIRE_FAKE_CLAUDE === '1';
+  const explicitBin = process.env.CLAUDE_CODE_EXECPATH;
+  if (requireFake && !explicitBin) {
+    fail('test mode requires CLAUDE_CODE_EXECPATH to point at a fake claude executable; refusing to resolve the real `claude`.');
+  }
   const args = buildClaudeArgs(pluginDir, userArgs);
+
+  // Resolve a LAUNCHABLE claude. An explicit CLAUDE_CODE_EXECPATH wins; otherwise
+  // we find it on PATH the way Windows actually would (where.exe per concrete file
+  // name, preferring claude.cmd), NOT by spawning the bare token `claude` (which
+  // Node's non-shell spawn cannot launch on Windows → ENOENT). No shell injection.
+  const resolved = resolveClaudeExecutable({ explicitPath: explicitBin, env: process.env, platform: process.platform });
+  if (!isResolved(resolved)) {
+    // Actionable: names the lookup strategy + attempts; never claims Claude is
+    // missing when Windows command lookup can actually find it.
+    fail(resolved.message);
+  }
+  const claudeBin = resolved.execPath;
 
   // Activation is explicit + visible.
   process.stderr.write(`xclaude: launching Claude Code with XBus plugin: ${pluginDir}\n`);
@@ -83,13 +108,12 @@ function main(): void {
   // installed data dir — not a divergent default. A user-set XBUS_DATA_DIR wins.
   env.XBUS_DATA_DIR = resolveDataDir();
 
-  // Windows: a .cmd/.bat shim (e.g. claude.cmd) cannot be spawned directly
-  // (EINVAL); route it through cmd.exe with each token explicitly quoted so
-  // spaces/special chars survive intact. Everything else spawns directly (Node
-  // quotes argv itself). We never build a shell string for the non-batch path.
-  const isWinBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(claudeBin);
+  // A .cmd/.bat shim cannot be spawned directly on Windows (EINVAL/ENOENT); route
+  // it through cmd.exe with each token explicitly quoted so spaces/special chars
+  // survive intact. A native executable is spawned directly (Node quotes argv
+  // itself). We never build a shell string for the direct path.
   let child;
-  if (isWinBatch) {
+  if (resolved.launchVia === 'cmd') {
     // `cmd /s /c "<line>"`: with /s, cmd strips exactly one leading and one
     // trailing quote from the whole line and runs the remainder verbatim. So we
     // quote every token (preserving embedded spaces — e.g. a plugin dir under
@@ -101,7 +125,7 @@ function main(): void {
   }
   child.on('error', (e: NodeJS.ErrnoException) => {
     if (e.code === 'ENOENT') {
-      fail(`could not find the 'claude' executable. Install Claude Code, or set CLAUDE_CODE_EXECPATH.`);
+      fail(`could not launch the resolved 'claude' at ${claudeBin} (ENOENT). It may have been moved or be the wrong kind of file. Set CLAUDE_CODE_EXECPATH to a launchable Claude Code executable (advanced).`);
     }
     fail(`failed to launch claude: ${e.message}`);
   });
@@ -113,6 +137,7 @@ function main(): void {
 
 // Run only as the CLI entry (argv[1] is the compiled launcher).
 if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('launcher/xclaude.js')) {
+  assertSupportedNode(); // §8: actionable unsupported-Node error before spawning anything
   main();
 }
 
