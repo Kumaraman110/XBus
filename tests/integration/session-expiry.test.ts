@@ -203,6 +203,48 @@ describe('expiry preserves the non-ACK invariant (I3)', () => {
     expect(d.fc).toBe('recipient_inactive_15_days');
   });
 
+  it('reply() to an EXPIRED original-sender is rejected (no orphan), symmetric with send()', () => {
+    // A sends a request to B; A then goes idle >15d and is expired; B replies. The
+    // reply's recipient is A (expired) — it must be rejected, not queued into a dead
+    // session where the sweep (CAS expired_at IS NULL) would never reclaim it.
+    const a = ready('rx-a');
+    const b = ready('rx-b');
+    const { messageId } = store.send(a, { to: 'rx-b', text: 'q', kind: 'request', requiresAck: true, requiresReply: true });
+    const v = delivery.inboxView(b, 'cp1', 10);
+    delivery.ack(b, { messageId, status: 'accepted', injectionId: v[0]!.injectionId! });
+    // Expire A (the original sender). Advance long enough that A (last active at the
+    // send) crosses 15d; B was just active (ack) so it survives.
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    expect(sessRow(a.sessionId).expired_at).not.toBeNull();
+    const allocSeq = (rid: string): number => { const row = db.prepare('SELECT next_sequence FROM recipient_sequences WHERE recipient_session_id=?').get(rid) as { next_sequence: number } | undefined; const seq = row ? row.next_sequence : 1; db.prepare('INSERT OR REPLACE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?,?)').run(rid, seq + 1); return seq; };
+    try {
+      delivery.reply(b, { messageId, text: 'answer', outcome: 'completed' }, allocSeq);
+      throw new Error('expected reply to throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(XBusError);
+      expect((e as XBusError).code).toBe(XBusErrorCode.RECIPIENT_SESSION_EXPIRED);
+    }
+    // No reply message/delivery was queued to the expired sender.
+    const replies = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE recipient_session_id=? AND kind='reply'`).get(a.sessionId) as { n: number };
+    expect(replies.n).toBe(0);
+  });
+
+  it('a stale pending_name reservation lapses back to unnamed after its TTL', () => {
+    // Two sessions race for the same name → second goes pending with a ~5-min TTL.
+    ready('p-owner');
+    const pendingAuth = ready('p-owner'); // collision → pending
+    expect(sessRow(pendingAuth.sessionId).state).toBe('pending');
+    // Before the TTL: still pending.
+    clock.advance(4 * 60_000);
+    reaper.sweep();
+    expect(sessRow(pendingAuth.sessionId).state).toBe('pending');
+    // After the ~5-min TTL: the reservation lapses → unnamed (routable by alias).
+    clock.advance(2 * 60_000);
+    reaper.sweep();
+    expect(sessRow(pendingAuth.sessionId).state).toBe('unnamed');
+  });
+
   it('does not expire or dead-letter inside the 15-day window', () => {
     const sender = ready('win-snd');
     const rcv = ready('win-rcv');

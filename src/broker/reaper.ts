@@ -69,12 +69,31 @@ export class Reaper {
 
   /** Run one full reaper pass. Idempotent given a fixed clock. */
   sweep(): SweepResult {
-    return this.db.transaction(() => ({
-      ...this.reapAckTimeouts(),
-      expired: this.reapAcceptanceTtl(),
-      leasesReclaimed: this.reclaimLeases(),
-      sessionsExpired: this.reapExpiredSessions(),
-    }));
+    return this.db.transaction(() => {
+      const r = {
+        ...this.reapAckTimeouts(),
+        expired: this.reapAcceptanceTtl(),
+        leasesReclaimed: this.reclaimLeases(),
+        sessionsExpired: this.reapExpiredSessions(),
+      };
+      this.reapStalePendingNames();
+      return r;
+    });
+  }
+
+  /**
+   * Beta.4 (ADR 0012 Decision 4): release a pending_name reservation whose TTL
+   * (pending_name_expires_at, ~5 min) has lapsed — the session reverts to 'unnamed'
+   * (still routable by its automatic_alias) so a long-abandoned name request does not
+   * sit reserved forever. Idempotent (acts only on still-pending rows past the TTL).
+   * Not counted in SweepResult (a maintenance detail, not a delivery outcome).
+   */
+  private reapStalePendingNames(): void {
+    const now = this.clock.nowIso();
+    const res = this.db.prepare(
+      `UPDATE sessions SET session_name_state='unnamed', session_name=NULL, normalized_session_name=NULL, pending_name_expires_at=NULL, updated_at=? WHERE session_name_state='pending' AND pending_name_expires_at IS NOT NULL AND pending_name_expires_at <= ?`,
+    ).run(now, now);
+    if (res.changes > 0) this.audit('PENDING_NAME_RESERVATION_LAPSED', null, { count: res.changes });
   }
 
   /**

@@ -125,23 +125,22 @@ describe('beta.3 -> beta.4 upgrade', () => {
     db.close();
   });
 
-  it('post-upgrade: a legacy session expires by 15-day inactivity like any other', () => {
+  it('post-upgrade: a migrated session expires by 15-day inactivity WITHOUT re-registering (backfill)', () => {
     const t0 = clock.nowIso();
     let db = openDatabase(dbPath, { applyPragmas: true });
     applyV5(db, t0);
-    seedSession(db, LEGACY, 'architect', t0);
+    seedSession(db, LEGACY, 'architect', t0); // last_seen_at = t0
     db.close();
     db = openDatabase(dbPath, { applyPragmas: true });
-    runMigrations(db, t0);
+    runMigrations(db, t0); // v6 backfills expires_at = t0 + 15 days
     const ids = new SeqIdGen('m');
-    const store = new BrokerStore(db, clock, ids, 'b');
     const reaper = new Reaper(db, clock, ids);
-    // The upgraded legacy row has NO last_meaningful_activity_at/expires_at yet — it
-    // was never refreshed. Re-register it (beta.4 lifecycle) to stamp the timer, then
-    // let 15 days pass.
-    const auth = store.register({ sessionId: LEGACY, instanceId: 'i', connectionId: 'c-leg2', processId: 5, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', supersede: true });
-    store.signalReadiness(auth, { ackAvailable: true, versionOk: true });
-    clock.advance(15 * DAY + 1000);
+    // The migrated row's retention clock was backfilled from last_seen_at — so it
+    // expires on its OWN (no beta.4 re-registration needed). This is the exact
+    // stale-install population the retention policy must cover.
+    const backfilled = db.prepare('SELECT expires_at AS x FROM sessions WHERE session_id=?').get(LEGACY) as { x: string | null };
+    expect(backfilled.x).not.toBeNull();
+    clock.advance(15 * DAY + 1000); // past the backfilled deadline
     expect(reaper.sweep().sessionsExpired).toBe(1);
     const e = db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(LEGACY) as { expired_at: string | null };
     expect(e.expired_at).not.toBeNull();

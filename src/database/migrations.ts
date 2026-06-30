@@ -363,6 +363,22 @@ export const MIGRATIONS: readonly Migration[] = [
 
       -- Expiry-sweep scan support: find due sessions cheaply.
       CREATE INDEX idx_sessions_expiry ON sessions(session_name_state, expires_at);
+
+      -- Backfill the retention clock for EXISTING (beta.3-upgraded) sessions so the
+      -- 15-day inactivity policy applies to them from upgrade time too — otherwise a
+      -- migrated session that never re-registers would keep last_meaningful_activity_at
+      -- NULL forever and never expire (the exact stale-install population retention is
+      -- meant to cover). Anchor on the most recent known activity (last_seen_at, else
+      -- created_at); expires_at = that + 15 days.
+      --
+      -- CRITICAL: the reaper compares expires_at to the clock STRING-WISE, so the
+      -- backfilled value MUST be in the exact JS toISOString() format
+      -- (YYYY-MM-DDTHH:MM:SS.sssZ). SQLite's datetime() drops the 'T'/'Z'/millis and
+      -- would mis-sort; strftime('%Y-%m-%dT%H:%M:%fZ', ...) reproduces it exactly.
+      UPDATE sessions
+        SET last_meaningful_activity_at = COALESCE(last_seen_at, created_at),
+            expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(last_seen_at, created_at), '+15 days')
+        WHERE last_meaningful_activity_at IS NULL;
     `,
   },
 ];

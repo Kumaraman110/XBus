@@ -87,7 +87,12 @@ describe('migration v6 — 5→6 on a populated DB', () => {
     expect(row.normalized_session_name).toBeNull();
     expect(row.session_name_state).toBe('unnamed'); // safe default — legacy session stays routable by alias
     expect(row.expired_at).toBeNull();
-    expect(row.last_meaningful_activity_at).toBeNull();
+    // Beta.4: the retention clock is BACKFILLED for upgraded sessions (anchored on
+    // last_seen_at) so they participate in 15-day expiry from upgrade time — NOT NULL.
+    expect(row.last_meaningful_activity_at).not.toBeNull();
+    const e = db.prepare('SELECT expires_at AS x FROM sessions WHERE session_id=?').get('aaaaaaaa-0000-4000-8000-000000000001') as { x: string | null };
+    expect(e.x).not.toBeNull();
+    expect(e.x).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/); // exact JS ISO format
     db.close();
   });
 

@@ -679,6 +679,17 @@ export class DeliveryOps {
         }
       }
 
+      // Beta.4 (ADR 0012 D6): the reply's recipient is the ORIGINAL SENDER. If that
+      // session has expired (>15d idle), it is unroutable — queuing a reply to it
+      // would create a permanent orphan the sweep won't reclaim (its CAS requires
+      // expired_at IS NULL). Reject FINAL, symmetric with store.send()'s guard. This
+      // is AFTER the idempotency short-circuit, so a genuine duplicate still no-ops.
+      const origExpired = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(orig.sender_session_id) as { expired_at: string | null } | undefined;
+      if (origExpired?.expired_at) {
+        this.audit('REPLY_REJECTED_RECIPIENT_EXPIRED', { sessionId: auth.sessionId, messageId: input.messageId });
+        throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'the original sender session has expired (no activity for 15 days); cannot deliver the reply');
+      }
+
       const replyId = this.ids.next();
       const sequence = allocSequence(orig.sender_session_id);
       this.db
