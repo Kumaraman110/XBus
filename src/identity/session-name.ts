@@ -128,3 +128,61 @@ export function isValidSessionName(raw: unknown): boolean {
     return false;
   }
 }
+
+/**
+ * Best-effort sanitize an arbitrary label (a repo name, directory, etc.) into the
+ * session-name grammar: NFC, lowercase, collapse any run of unsafe characters to a
+ * single '-', drop leading non-alphanumerics, trim trailing separators, truncate to
+ * the max length. Returns null when nothing usable remains. The result is NOT
+ * guaranteed to pass reserved/generic checks — {@link suggestSessionName} validates.
+ */
+export function sanitizeToSessionName(raw: string): string | null {
+  if (typeof raw !== 'string') return null;
+  let s = raw.normalize('NFC').toLowerCase();
+  s = s.replace(/[^a-z0-9._-]+/g, '-'); // unsafe runs -> single dash
+  s = s.replace(/^[^a-z0-9]+/, '');     // must start alphanumeric
+  s = s.replace(/[-._]+$/, '');         // trim trailing separators
+  if (s.length > SESSION_NAME_MAX) {
+    s = s.slice(0, SESSION_NAME_MAX).replace(/[-._]+$/, '');
+  }
+  if (s.length < SESSION_NAME_MIN) return null;
+  // The sanitized form matches the charset/shape; reserved/generic are decided by
+  // the caller via validateSessionName. Return it for that final check.
+  return SESSION_NAME_RE.test(s) ? s : null;
+}
+
+/** Inputs for deriving a suggested session name (all optional; precedence order). */
+export interface NameSuggestionInputs {
+  /** A previously-saved workspace preference (highest precedence). */
+  savedName?: string;
+  /** The Git repository name for the workspace. */
+  gitRepo?: string;
+  /** The current working directory's base name. */
+  dirName?: string;
+  /** The agent/runtime type (claude, codex, hermes, …) for the last-resort fallback. */
+  agentType?: string;
+  /** A project/workspace id for the last-resort fallback. */
+  projectId?: string;
+}
+
+/**
+ * Derive a suggested session name (ADR 0012 Decision 3). Tries, in order: saved
+ * preference → git repo → directory → `<agentType>-<projectId>`. Each candidate is
+ * sanitized AND fully validated (so a reserved/generic/UUID-like candidate is
+ * skipped, not suggested). Returns the first valid suggestion, or null when none
+ * is usable (the caller must then enter pending_name and prompt the user).
+ */
+export function suggestSessionName(inp: NameSuggestionInputs): string | null {
+  const candidates: Array<string | undefined> = [
+    inp.savedName,
+    inp.gitRepo,
+    inp.dirName,
+    inp.agentType && inp.projectId ? `${inp.agentType}-${inp.projectId}` : undefined,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    const s = sanitizeToSessionName(c);
+    if (s !== null && isValidSessionName(s)) return s;
+  }
+  return null;
+}
