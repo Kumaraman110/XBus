@@ -53,4 +53,15 @@ describe('checkCompatibility (mixed-version matrix)', () => {
     expect(broker.buildId).toBe(BUILD_ID);
     expect(broker.protocolVersion).toBeGreaterThanOrEqual(1);
   });
+
+  it('ADR 0012 §3: a beta.3-schema client (s5) is rejected upgrade_component by a v6 broker', () => {
+    // Beta.4 bumped SCHEMA_VERSION to 6. A still-installed beta.3 plugin advertises
+    // schema 5; it MUST be told to upgrade rather than be allowed to write against
+    // the v6 schema it does not understand. This is the fail-closed guard the bump buys.
+    expect(SCHEMA_VERSION).toBe(6);
+    const beta3 = client({ schemaVersion: 5 });
+    const v = checkCompatibility(beta3, broker);
+    expect(v.result).toBe('upgrade_component');
+    expect(v.ok).toBe(false);
+  });
 });

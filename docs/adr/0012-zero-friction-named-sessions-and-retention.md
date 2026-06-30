@@ -114,9 +114,13 @@ state and is not touched.
   ```sql
   CREATE UNIQUE INDEX ux_session_name_active
     ON sessions(normalized_session_name)
-    WHERE session_name_state='active' AND normalized_session_name IS NOT NULL;
+    WHERE normalized_session_name IS NOT NULL AND session_name_state IN ('active','pending');
   ```
 
+  The predicate covers **both** `active` and `pending` (reserve-on-claim): a name is
+  locked the moment it is claimed, so two simultaneous sessions launching from the
+  same project cannot both reserve it — exactly the duplicate-name acceptance case.
+  `unnamed`/`retired` rows (NULL normalized name) are excluded so they never collide.
   SQLite serializes this inside the existing `store.register()` transaction
   (`store.ts:121–203`), giving race-safety for free — the same mechanism that already
   protects `registerAlias`. **No separate registry table** (it would duplicate the
@@ -259,10 +263,24 @@ makes `compatibilityId = xbus-p1-stp1-s6`. This is **required and separately jus
   `tests/fixtures/stp-vectors.json` are byte-for-byte identical (ADR 0011 §"Security
   note"). Only the schema integer in the tuple moves — exactly what a schema migration is
   *supposed* to do.
-- **Required code/test updates (tracked):** regenerate any `-s5`-pinned assertions and
-  the packaged `provenance.json` to `-s6`; add a handshake test that a beta.3-schema
-  client (schema 5) is rejected `upgrade_component` by a v6 broker; verify migration 5→6
-  on a populated DB (NULL defaults, query coalescing).
+- **Required code/test updates (DONE):** `provenance.json` auto-derives from
+  `SCHEMA_VERSION` (`write-provenance.ts:39`) so it regenerated to `-s6` on build; the
+  only hardcoded live assertion (`build-identity.test.ts` `WIRE_COMPATIBILITY_ID`)
+  flipped to `-s6`; added the handshake regression that a schema-5 client is rejected
+  `upgrade_component` by a v6 broker; the populated 5→6 migration is tested
+  (`migration-v6.test.ts`).
+- **Adapter-SDK tuple reconciliation (scoped decision):** the adapter SDK carries a
+  SEPARATE, hardcoded `FROZEN_PROTOCOL_COMPAT = { …schema: 5 }` (`manifest.ts:25`) that
+  `validateManifest` enforces. It is **left at schema 5** on this branch: it is imported
+  nowhere outside `src/adapter/**` (dormant library code; broker-side enforcement is in
+  held PR #4), no test cross-links it to `SCHEMA_VERSION`, and the directive forbids
+  changing the adapter tuple unless required. It moves to s6 only when adapters are
+  actually wired to the s6 broker (PR #4's scope). The live `SCHEMA_VERSION` and the
+  SDK's frozen target are now intentionally decoupled (asserted in
+  `adapter-sdk.test.ts`). Historical records (the beta.2/beta.3 CHANGELOG sections, the
+  beta.2 release notes, `compatibility/platforms.json`'s beta.2 baseline, the roadmap's
+  beta.2-line statements) keep their `-s5` text — rewriting published history is
+  forbidden; beta.4 gets its own new CHANGELOG section.
 
 ---
 

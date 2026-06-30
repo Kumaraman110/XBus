@@ -94,7 +94,7 @@ made of four non-overlapping concepts (`src/shared/build-identity.ts`):
   identifies the exact source build. **Diagnostics only — never bound into the
   handshake.**
 - **sourceCommit** — the full git commit SHA the artifact was built from.
-- **compatibilityId** — `xbus-p<proto>-stp<stp>-s<schema>` (e.g. `xbus-p1-stp1-s5`);
+- **compatibilityId** — `xbus-p<proto>-stp<stp>-s<schema>` (currently `xbus-p1-stp1-s6`);
   the STABLE, version-independent interop tuple **bound into the STP transcript** (it
   is the value the wire field named `buildId` carries). Builds interoperate iff it
   matches.
