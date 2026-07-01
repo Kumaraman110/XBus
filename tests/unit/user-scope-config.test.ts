@@ -171,6 +171,33 @@ describe('unregisterUserScope — ownership-scoped removal across both files', (
     expect(JSON.stringify(s.hooks)).toContain('user-hook');   // their hook kept
   });
 
+  it('byte-exact restore: uninstall removes the `hooks` key entirely if it was empty before install', () => {
+    // Live-acceptance regression: a user whose settings.json had NO `hooks` key must get
+    // it back verbatim after uninstall. Leaving a residual `hooks: {}` changes the file
+    // bytes/SHA and reads as "XBus left a trace". install adds hooks; uninstall must
+    // fully undo, dropping the now-empty key.
+    writeConfig({ mcpServers: {}, theme: 'dark' });
+    writeSettings({ theme: 'dark' }); // NO hooks key pre-install
+    registerUserScope(opts());
+    expect(readClaudeSettings(settingsPath)!.hooks).toBeDefined(); // install added it
+    const u = unregisterUserScope(opts());
+    expect(u.removed).toBe(true);
+    const s = readClaudeSettings(settingsPath)! as Record<string, unknown>;
+    expect('hooks' in s).toBe(false);          // key GONE (not an empty {})
+    expect(s.theme).toBe('dark');              // unrelated settings intact
+  });
+
+  it('preserves a non-empty hooks map (only drops the key when fully emptied)', () => {
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'user-hook' }] }] } });
+    registerUserScope(opts());
+    const u = unregisterUserScope(opts());
+    expect(u.removed).toBe(true);
+    const s = readClaudeSettings(settingsPath)!;
+    expect(s.hooks).toBeDefined();                             // key kept (user still has a hook)
+    expect(JSON.stringify(s.hooks)).toContain('user-hook');    // their hook preserved
+    expect(JSON.stringify(s.hooks)).not.toContain('hook-entry.js'); // ours gone
+  });
+
   it('does NOT remove an xbus mcp entry owned by a DIFFERENT install', () => {
     writeConfig({ mcpServers: { xbus: { command: 'x', [XBUS_OWNER_TAG]: 'OTHER' } } });
     const u = unregisterUserScope(opts({ installId: 'mine' }));

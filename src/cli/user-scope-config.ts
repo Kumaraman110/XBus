@@ -208,6 +208,15 @@ function stripHooks(s: ClaudeSettings, o: UserScopeOptions, ownerToMatch: string
     })).filter((g) => g.hooks.length > 0);
     if (cleaned.length > 0) hooks[ev] = cleaned;
   }
+  // Byte-exact-restore: if removing our handlers emptied the hooks map, drop the `hooks`
+  // key entirely rather than leaving a residual `hooks: {}`. A user whose settings.json
+  // had NO hooks key before install must get it back verbatim (an empty {} changes the
+  // file's bytes/SHA and reads as XBus-left-a-trace). Preserve a non-empty map as-is.
+  if (Object.keys(hooks).length === 0) {
+    const rest = { ...s };
+    delete (rest as { hooks?: unknown }).hooks;
+    return { settings: rest, changed };
+  }
   return { settings: { ...s, hooks }, changed };
 }
 
