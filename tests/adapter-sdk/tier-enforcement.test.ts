@@ -169,15 +169,23 @@ describe('PR2 §10 — compatibility invariants + legacy no-op', () => {
     expect(modeRequires('live')).toBe('livePush');
     expect(modeRequires('poll_only')).toBe('none');
   });
-  it('the three frozen wire axes are unchanged', () => {
+  it('the protocol + STP wire axes remain frozen at 1 (proto/STP unchanged by beta.4)', () => {
+    // PR #4 changed NEITHER proto NOR STP; beta.4 also leaves both frozen. Only the
+    // additive DB schema moved (see below). These two are the true wire-compat axes.
     expect(PROTOCOL_VERSION).toBe(1);
     expect(MIN_SUPPORTED_PROTOCOL_VERSION).toBe(1);
     expect(STP_VERSION).toBe(1);
-    expect(SCHEMA_VERSION).toBe(5);
   });
-  it('the DB schema is still at migration 5; BUILD_ID unchanged', () => {
-    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(5);
-    expect(BUILD_ID).toBe('xbus-p1-stp1-s5');
+  it('the live DB schema is at migration 6 / xbus-p1-stp1-s6 post-composition (beta.4 ADR 0012 §3)', () => {
+    // PR #4 itself made NO schema change (it was s5 on its own branch). Composing it
+    // with beta.4 — whose owner-approved migration v6 adds the additive session-name +
+    // 15-day-retention columns — advances the LIVE schema to 6 and the compatibility
+    // id to xbus-p1-stp1-s6 (proto+STP still 1). Fail-closed by design: a beta.3/PR#4
+    // s5 client is told to upgrade. The FROZEN adapter-SDK compat contract that must
+    // stay byte-pinned at schema 5 lives separately in tests/adapter-sdk/adapter-sdk.test.ts.
+    expect(SCHEMA_VERSION).toBe(6);
+    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(6);
+    expect(BUILD_ID).toBe('xbus-p1-stp1-s6');
   });
 });
 
