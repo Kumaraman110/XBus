@@ -30,6 +30,8 @@ export interface SweepResult {
   expired: number;
   /** delivery_leases rows past expiry that were reclaimed (state held->expired). */
   leasesReclaimed: number;
+  /** sessions with no meaningful activity for >15 days -> expired (beta.4). */
+  sessionsExpired: number;
 }
 
 export interface ReaperOptions {
@@ -67,11 +69,72 @@ export class Reaper {
 
   /** Run one full reaper pass. Idempotent given a fixed clock. */
   sweep(): SweepResult {
-    return this.db.transaction(() => ({
-      ...this.reapAckTimeouts(),
-      expired: this.reapAcceptanceTtl(),
-      leasesReclaimed: this.reclaimLeases(),
-    }));
+    return this.db.transaction(() => {
+      const r = {
+        ...this.reapAckTimeouts(),
+        expired: this.reapAcceptanceTtl(),
+        leasesReclaimed: this.reclaimLeases(),
+        sessionsExpired: this.reapExpiredSessions(),
+      };
+      this.reapStalePendingNames();
+      return r;
+    });
+  }
+
+  /**
+   * Beta.4 (ADR 0012 Decision 4): release a pending_name reservation whose TTL
+   * (pending_name_expires_at, ~5 min) has lapsed — the session reverts to 'unnamed'
+   * (still routable by its automatic_alias) so a long-abandoned name request does not
+   * sit reserved forever. Idempotent (acts only on still-pending rows past the TTL).
+   * Not counted in SweepResult (a maintenance detail, not a delivery outcome).
+   */
+  private reapStalePendingNames(): void {
+    const now = this.clock.nowIso();
+    const res = this.db.prepare(
+      `UPDATE sessions SET session_name_state='unnamed', session_name=NULL, normalized_session_name=NULL, pending_name_expires_at=NULL, updated_at=? WHERE session_name_state='pending' AND pending_name_expires_at IS NOT NULL AND pending_name_expires_at <= ?`,
+    ).run(now, now);
+    if (res.changes > 0) this.audit('PENDING_NAME_RESERVATION_LAPSED', null, { count: res.changes });
+  }
+
+  /**
+   * Beta.4 (ADR 0012 Decision 6): expire sessions with no MEANINGFUL activity for
+   * >15 days. expires_at = last_meaningful_activity_at + 15d is maintained by the
+   * meaningful-activity refresh; this pass acts when now >= expires_at. Per due
+   * session, atomically (this whole sweep is one transaction):
+   *   1. CAS expired_at (guards idempotence) + reason + readiness='disconnected'
+   *      + release the name (session_name_state -> 'retired').
+   *   2. Retire any live alias rows the session held (name returns to the pool).
+   *   3. Dead-letter the recipient's pending deliveries (queued/retry_wait ONLY)
+   *      with failure_category='recipient_inactive_15_days'. This NEVER touches the
+   *      ack-timeout path or transport_written rows — the non-ACK invariant (I3) is
+   *      preserved by construction (non-ack messages are already terminal-completed
+   *      at injection; we only sweep not-yet-injected deliveries).
+   * The expired sessions row itself is the body-free tombstone (no separate table,
+   * no tombstone message) — it durably carries name, id, last activity, expiry
+   * time, and reason. session_id is NOT deleted (audit trail).
+   */
+  private reapExpiredSessions(): number {
+    const now = this.clock.nowIso();
+    const due = this.db.prepare(
+      `SELECT session_id FROM sessions WHERE expired_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC`,
+    ).all(now) as Array<{ session_id: string }>;
+    let sessionsExpired = 0;
+    for (const s of due) {
+      // CAS on expired_at IS NULL → idempotent (a second sweep sees expired_at set).
+      const res = this.db.prepare(
+        `UPDATE sessions SET expired_at=?, expiration_reason='recipient_inactive_15_days', readiness='disconnected', session_name_state='retired', normalized_session_name=NULL, pending_name_expires_at=NULL, updated_at=? WHERE session_id=? AND expired_at IS NULL`,
+      ).run(now, now, s.session_id);
+      if (res.changes === 0) continue; // already expired by a concurrent/earlier pass
+      // Release any live alias rows (name returns to the pool for reuse).
+      this.db.prepare(`UPDATE aliases SET active=0, retired_at=? WHERE session_id=? AND active=1`).run(now, s.session_id);
+      // Dead-letter ONLY not-yet-injected deliveries; never the ack-timeout path.
+      this.db.prepare(
+        `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_inactive_15_days', next_attempt_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`,
+      ).run(now, s.session_id);
+      this.audit('SESSION_EXPIRED', null, { sessionId: s.session_id, reason: 'recipient_inactive_15_days' });
+      sessionsExpired++;
+    }
+    return sessionsExpired;
   }
 
   /**

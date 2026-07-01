@@ -36,7 +36,8 @@ See [providers.md](providers.md) for the delivery-mode detail.
   allowed to register against an incompatible broker.
 - **Build identity (ADR 0011)** — separates two concepts that were previously
   conflated under one `buildId`:
-  - **compatibilityId** — `xbus-p<protocol>-stp<stp>-s<schema>` (e.g. `xbus-p1-stp1-s5`).
+  - **compatibilityId** — `xbus-p<protocol>-stp<stp>-s<schema>` (currently `xbus-p1-stp1-s6`,
+    moved from `-s5` by the beta.4 schema migration v6, ADR 0012 §3).
     The STABLE, **version-independent** interop tuple; builds interoperate iff this
     matches. This is the value the XBUS-STP wire field named `buildId` carries.
   - **buildId (exact)** — `xbus-<version>-<shortCommit>`. Deterministically identifies

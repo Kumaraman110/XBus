@@ -4,6 +4,7 @@
  * buffered-byte budget, max connections.
  */
 import net from 'node:net';
+import fs from 'node:fs';
 import { FrameDecoder, encodeFrame } from './framing.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import type { Frame } from '../protocol/commands.js';
@@ -81,10 +82,70 @@ export class IpcServer {
   }
 
   listen(): Promise<void> {
+    return this.listenOnce(true);
+  }
+
+  /**
+   * Bind the endpoint. On POSIX the endpoint is a filesystem Unix socket: a broker
+   * that was HARD-KILLED (SIGKILL/OOM/crash) never ran its graceful unlink, so a
+   * stale `broker.sock` file is left on disk and Node's listen() then fails
+   * EADDRINUSE forever — silently wedging auto-start (ADR 0012 D7 / beta.4 review).
+   * Node does NOT auto-remove a stale UDS path. So: if the FIRST bind fails
+   * EADDRINUSE on a Unix-socket path, PROBE it — if nothing answers it is stale →
+   * unlink and retry ONCE. If something answers, a real broker owns it → propagate
+   * (the singleton arbiter maps it to BROKER_CONTENDED). Windows named pipes are not
+   * filesystem paths and need no unlink, so this only applies to UDS endpoints.
+   */
+  private listenOnce(allowStaleSocketRecovery: boolean): Promise<void> {
     return new Promise((resolve, reject) => {
       this.server = net.createServer((socket) => this.accept(socket));
-      this.server.on('error', reject);
-      this.server.listen(this.endpoint, () => resolve());
+      const onError = (err: NodeJS.ErrnoException): void => {
+        if (err.code === 'EADDRINUSE' && allowStaleSocketRecovery && this.isUnixSocketEndpoint()) {
+          // Capture the inode of the offending socket NOW, then probe it. If it is
+          // unreachable (stale), unlink it and retry — but ONLY if the inode is
+          // unchanged at unlink time, so a broker that bound a NEW socket at this path
+          // in the probe→unlink gap is never clobbered (TOCTOU close: we remove the
+          // EXACT stale inode we probed, or nothing). The upstream checkSingleton /
+          // probeExisting layer is still the primary arbiter for the common case.
+          let inoBefore: number | undefined;
+          try { inoBefore = fs.statSync(this.endpoint).ino; } catch { inoBefore = undefined; }
+          this.probeStaleSocket().then((reachable) => {
+            if (reachable) { reject(err); return; } // a real broker owns it
+            try {
+              const inoNow = fs.statSync(this.endpoint).ino;
+              if (inoBefore !== undefined && inoNow === inoBefore) fs.unlinkSync(this.endpoint);
+              // else: the inode changed (a racing broker re-created the path) — do NOT
+              // unlink; the retry below will hit EADDRINUSE and propagate (contended).
+            } catch { /* path vanished — fine, the retry will just bind */ }
+            this.listenOnce(false).then(resolve, reject); // retry ONCE, no further recovery
+          }, () => reject(err));
+          return;
+        }
+        reject(err);
+      };
+      this.server.once('error', onError);
+      this.server.listen(this.endpoint, () => {
+        this.server!.removeListener('error', onError);
+        this.server!.on('error', () => {}); // swallow post-bind transient socket errors
+        resolve();
+      });
+    });
+  }
+
+  /** Is the endpoint a filesystem Unix socket (vs a Windows named pipe)? */
+  private isUnixSocketEndpoint(): boolean {
+    return process.platform !== 'win32' && !this.endpoint.startsWith('\\\\');
+  }
+
+  /** Bounded probe of the endpoint: true if a server answers, false otherwise. */
+  private probeStaleSocket(timeoutMs = 500): Promise<boolean> {
+    return new Promise((resolve) => {
+      const sock = net.createConnection(this.endpoint);
+      let done = false;
+      const finish = (v: boolean): void => { if (!done) { done = true; try { sock.destroy(); } catch { /* ignore */ } resolve(v); } };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      sock.once('connect', () => { clearTimeout(timer); finish(true); });
+      sock.once('error', () => { clearTimeout(timer); finish(false); });
     });
   }
 

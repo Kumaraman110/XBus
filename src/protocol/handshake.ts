@@ -15,8 +15,11 @@ export const SCHEMA_VERSION = MIGRATIONS.reduce((m, x) => Math.max(m, x.version)
 
 /**
  * The STABLE compatibility tuple bound into the XBUS-STP transcript (ADR 0011).
- * This is `xbus-p<proto>-stp<stp>-s<schema>` = "xbus-p1-stp1-s5",
- * deliberately VERSION-INDEPENDENT so different builds interoperate iff it matches.
+ * This is `xbus-p<proto>-stp<stp>-s<schema>` = "xbus-p1-stp1-s6" as of beta.4
+ * (migration v6 moved the schema 5 -> 6; proto + stp remain 1). It is computed from
+ * SCHEMA_VERSION, so it tracks the live schema automatically — the value here is only
+ * an example. It is deliberately VERSION-INDEPENDENT so different builds interoperate
+ * iff it matches.
  *
  * The XBUS-STP v1 wire field is still named `buildId` for byte-compatibility —
  * but it carries this COMPATIBILITY value, never the exact artifact identity.

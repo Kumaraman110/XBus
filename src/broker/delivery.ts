@@ -14,6 +14,7 @@ import type { Clock, IdGen } from '../shared/clock.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { DeliveryState } from '../protocol/states.js';
 import type { SessionAuthority, SendResult } from './store.js';
+import { MEANINGFUL_ACTIVITY_RETENTION_MS } from './store.js';
 import { ReceiptStore } from './receipts.js';
 import { ControlsStore } from './controls.js';
 import { assertAllowed, Operation, ComponentRole } from '../identity/components.js';
@@ -120,6 +121,19 @@ export class DeliveryOps {
     this.db
       .prepare('INSERT INTO audit_events (audit_id, event_type, actor_session_id, actor_instance_id, message_id, trace_id, safe_metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?)')
       .run(this.ids.next(), eventType, fields.sessionId ?? null, fields.instanceId ?? null, fields.messageId ?? null, null, JSON.stringify(fields), this.clock.nowIso());
+  }
+
+  /**
+   * Beta.4 (ADR 0012 Decision 5): refresh the RECIPIENT's meaningful-activity
+   * timestamp (+ recompute the 15-day expiry). Called from genuinely meaningful
+   * recipient ops — ack, reject, reply, explicit redelivery, and a body-injecting
+   * checkpoint pull — but NEVER from a body-suppressed re-injection, a deferred
+   * (not-ready) pull, or any passive path. Idempotent; runs in the caller's txn.
+   * Skips an already-expired session (a tombstone must not be revived by activity).
+   */
+  private refreshActivity(sessionId: string, now: string): void {
+    const expiresAt = new Date(this.clock.nowMs() + MEANINGFUL_ACTIVITY_RETENTION_MS).toISOString();
+    this.db.prepare('UPDATE sessions SET last_meaningful_activity_at=?, expires_at=?, updated_at=? WHERE session_id=? AND expired_at IS NULL').run(now, expiresAt, now, sessionId);
   }
 
   /**
@@ -270,6 +284,10 @@ export class DeliveryOps {
         // message (no ack, no reply) becomes terminal immediately.
         this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
+      // Beta.4: receiving a body at a checkpoint is meaningful RECIPIENT activity —
+      // but ONLY when a body was actually presented (a body-suppressed re-injection
+      // or an empty pull is not activity). ADR 0012 Decision 5.
+      if (out.length > 0) this.refreshActivity(auth.sessionId, now);
       return out;
     });
   }
@@ -316,6 +334,7 @@ export class DeliveryOps {
         out.push({ ...m, metadata: md });
         this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
+      if (out.length > 0) this.refreshActivity(auth.sessionId, now); // ADR 0012 D5
       return out;
     });
   }
@@ -414,6 +433,7 @@ export class DeliveryOps {
         return null;
       }
       const injection = this.receipts.issue({ messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId: `redeliver-${this.ids.next()}`, componentId: auth.componentInstanceId, logicalInjectionNumber: maxLogical + 1 });
+      this.refreshActivity(auth.sessionId, this.clock.nowIso()); // ADR 0012 D5: explicit redelivery is meaningful
       this.audit('EXPLICIT_REDELIVERY', { sessionId: auth.sessionId, messageId, reason: reason.slice(0, 120), logical: maxLogical + 1 });
       const pm = this.rowToPending(m);
       return {
@@ -622,6 +642,7 @@ export class DeliveryOps {
         .prepare('INSERT INTO receipts (receipt_id, message_id, receiver_session_id, receiver_instance_id, receiver_generation, receipt_type, status, note, body_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
         .run(this.ids.next(), input.messageId, auth.sessionId, auth.instanceId, auth.epoch, 'ack', input.status, input.note ?? null, msg.body_hash, now);
       if (injectionId) this.receipts.consume(injectionId, 'ack');
+      this.refreshActivity(auth.sessionId, now); // ADR 0012 D5: ack/reject is meaningful
       this.audit('ACK', { sessionId: auth.sessionId, messageId: input.messageId, status: input.status });
       return { state: target, duplicate: false };
     });
@@ -658,6 +679,17 @@ export class DeliveryOps {
         }
       }
 
+      // Beta.4 (ADR 0012 D6): the reply's recipient is the ORIGINAL SENDER. If that
+      // session has expired (>15d idle), it is unroutable — queuing a reply to it
+      // would create a permanent orphan the sweep won't reclaim (its CAS requires
+      // expired_at IS NULL). Reject FINAL, symmetric with store.send()'s guard. This
+      // is AFTER the idempotency short-circuit, so a genuine duplicate still no-ops.
+      const origExpired = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(orig.sender_session_id) as { expired_at: string | null } | undefined;
+      if (origExpired?.expired_at) {
+        this.audit('REPLY_REJECTED_RECIPIENT_EXPIRED', { sessionId: auth.sessionId, messageId: input.messageId });
+        throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'the original sender session has expired (no activity for 15 days); cannot deliver the reply');
+      }
+
       const replyId = this.ids.next();
       const sequence = allocSequence(orig.sender_session_id);
       this.db
@@ -675,6 +707,7 @@ export class DeliveryOps {
         .prepare('INSERT OR IGNORE INTO receipts (receipt_id, message_id, receiver_session_id, receiver_instance_id, receiver_generation, receipt_type, status, body_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
         .run(this.ids.next(), input.messageId, auth.sessionId, auth.instanceId, auth.epoch, 'reply', input.outcome, orig.body_hash, now);
       if (injectionId) this.receipts.consume(injectionId, 'reply');
+      this.refreshActivity(auth.sessionId, now); // ADR 0012 D5: replying is meaningful
       this.audit('REPLY', { sessionId: auth.sessionId, messageId: input.messageId, replyMessageId: replyId });
       return { messageId: input.messageId, replyMessageId: replyId, correlationId: orig.correlation_id, recipientSessionId: orig.sender_session_id, recipientAlias: orig.sender_alias, sequence, state: DeliveryState.QUEUED, deduplicated: false };
     });

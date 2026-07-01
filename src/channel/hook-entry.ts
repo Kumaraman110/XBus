@@ -8,6 +8,7 @@ import { runCheckpoint, type HookInput } from './checkpoint-hook.js';
 import { defaultEndpoint } from '../ipc/transport.js';
 import { resolveDataDir } from './server.js';
 import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
+import { ensureBrokerDefault } from '../broker/ensure.js';
 
 export async function main(): Promise<void> {
   let input = '';
@@ -24,6 +25,10 @@ export async function main(): Promise<void> {
   const endpoint = defaultEndpoint(dataDir);
   const rootSecret = loadOrCreateRootSecret(dataDir);
   const autoContinue = process.env.XBUS_AUTO_CONTINUE_ON_STOP === '1';
+  // Beta.4 (ADR 0012 D7): zero-friction broker auto-start. Best-effort + bounded;
+  // if it degrades, runCheckpoint's own connect simply fails closed and the hook
+  // returns {exitCode:0} — Claude is NEVER blocked on XBus.
+  try { await ensureBrokerDefault(dataDir); } catch { /* runCheckpoint degrades */ }
   try {
     const result = await runCheckpoint(hook, { endpoint, rootSecret, autoContinueOnStop: autoContinue });
     if (result.stdout) process.stdout.write(result.stdout);

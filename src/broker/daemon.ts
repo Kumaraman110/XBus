@@ -20,7 +20,7 @@ import type { ReadinessHints } from './readiness.js';
 import { XBusError, XBusErrorCode, isXBusError } from '../protocol/errors.js';
 import { validateSendInput } from '../protocol/schemas.js';
 import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../identity/components.js';
-import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, type HelloInfo } from '../protocol/handshake.js';
+import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, BUILD_ID, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
@@ -204,6 +204,8 @@ export class BrokerDaemon {
           return this.onRegister(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
+        case 'rename_session':
+          return this.onRenameSession(conn, frame);
         case 'send_message':
           return this.onSend(conn, frame);
         case 'checkpoint_pull':
@@ -326,16 +328,44 @@ export class BrokerDaemon {
       supersede: p.supersede === true,
       ...(p.repositoryRoot !== undefined ? { repositoryRoot: p.repositoryRoot } : {}),
       ...(p.claudeCodeVersion !== undefined ? { claudeCodeVersion: p.claudeCodeVersion } : {}),
+      // Beta.4 (ADR 0012): optional name request + agent type. The store awards the
+      // name (active) or falls to pending_name; never fails registration over it.
+      ...(p.requestedSessionName !== undefined ? { requestedSessionName: p.requestedSessionName } : {}),
+      ...(p.agentType !== undefined ? { agentType: p.agentType } : {}),
     });
     this.connAuth.set(conn.id, auth);
-    // Awarded support is in-memory only (no schema change); surfaced in the ack ONLY
-    // for adapter-aware registrations, so a legacy ack is byte-identical to before.
-    const ackPayload: Record<string, unknown> = { sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId, role: auth.role, epoch: auth.epoch, generation: auth.generation };
+    // Composition (ADR 0012 §5 + PR #4): the register ack carries THREE additive,
+    // orthogonal field-sets on top of the frozen base (sessionId/instanceId/
+    // componentInstanceId/role/epoch/generation):
+    //   • beta.4 naming — sessionNameState + awardedSessionName (present once a name is
+    //     awarded or pending);
+    //   • PR #4 enforcement — awardedSupport, present ONLY for adapter-aware
+    //     registrations (in-memory award; no schema change; a legacy ack is byte-identical).
+    // All are unknown-field-tolerant, so the two feature lines compose without touching
+    // the frozen wire bytes. The connAwarded map is set here (success) and was already
+    // cleared at the start of this attempt, so a stale award can never survive.
+    const ackPayload: Record<string, unknown> = {
+      sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId,
+      role: auth.role, epoch: auth.epoch, generation: auth.generation,
+      ...(auth.sessionNameState !== undefined ? { sessionNameState: auth.sessionNameState } : {}),
+      ...(auth.awardedSessionName != null ? { awardedSessionName: auth.awardedSessionName } : {}),
+    };
     if (enforcement) {
       this.connAwarded.set(conn.id, enforcement.awarded);
       ackPayload.awardedSupport = enforcement.awarded;
     }
     this.reply(conn, 'register_session_ack', ackPayload, frame.requestId);
+  }
+
+  private onRenameSession(conn: ServerConn, frame: Frame): void {
+    // Beta.4 (ADR 0012 D4): choose/change the session's human-readable name. This is
+    // the resolution path for a session stranded in pending_name (e.g. two sessions
+    // launched from the same project picked the same suggested name). mcp-role only;
+    // SESSION_NAME_TAKEN / INVALID_SESSION_NAME surface to the model so it can retry.
+    const auth = this.requireAuth(conn);
+    const p = frame.payload as { name: string };
+    const r = this.store.renameSession(auth, p.name);
+    this.reply(conn, 'rename_session_ack', { name: r.name, sessionNameState: r.state }, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {
@@ -529,7 +559,7 @@ export class BrokerDaemon {
   private onListSessions(conn: ServerConn, frame: Frame): void {
     this.requireAuth(conn);
     const rows = this.db
-      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at FROM sessions s`)
+      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at, s.session_name, s.session_name_state, s.expired_at FROM sessions s`)
       .all() as Array<Record<string, unknown>>;
     const sessions = rows.map((r) => {
       const sid = r.session_id as string;
@@ -537,6 +567,12 @@ export class BrokerDaemon {
       const unacked = (this.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=? AND state='transport_written'`).get(sid) as { n: number }).n;
       const aliases = (this.db.prepare(`SELECT alias FROM aliases WHERE session_id=? AND active=1 AND alias NOT LIKE 'session-%'`).all(sid) as Array<{ alias: string }>).map((a) => a.alias);
       return {
+        // Beta.4: the human-readable session NAME (the primary user-facing address)
+        // + its lifecycle state, so peers can discover a session by name and see
+        // whether it is active / pending (unroutable) / expired. ADR 0012 D2/D3.
+        name: (r.session_name as string) ?? null,
+        sessionNameState: (r.session_name_state as string) ?? 'unnamed',
+        expired: (r.expired_at as string | null) !== null,
         alias: aliases[0] ?? (r.automatic_alias as string),
         project: (r.project_alias as string) ?? (r.project_id as string),
         // connection (is a socket attached?), receiveMode (HOW it takes delivery),
@@ -607,11 +643,44 @@ export class BrokerDaemon {
   }
 
   private onStatus(conn: ServerConn, frame: Frame): void {
+    // Report the CALLER's own broker-owned identity. The session is keyed by the
+    // AUTHENTICATED connection (this.connAuth), never a caller-supplied id — a caller
+    // cannot spoke another session's id to read its state. This is a pure read: a plain
+    // SELECT that never refreshes meaningful activity and never revives an expired row.
     const auth = this.connAuth.get(conn.id);
+    let session: Record<string, unknown> | null = null;
+    if (auth) {
+      const row = this.db.prepare(
+        `SELECT session_name AS name, normalized_session_name AS norm, session_name_state AS state,
+                agent_type AS agentType, cwd, readiness, last_meaningful_activity_at AS lastActivity,
+                expires_at AS expiresAt, expired_at AS expiredAt
+         FROM sessions WHERE session_id=?`,
+      ).get(auth.sessionId) as
+        | { name: string | null; norm: string | null; state: string | null; agentType: string | null; cwd: string | null; readiness: string | null; lastActivity: string | null; expiresAt: string | null; expiredAt: string | null }
+        | undefined;
+      // sessionName reports the ACTIVE display name only; pending/unnamed/retired ⇒ null
+      // (a pending session holds no routable name). session_name_state carries the nuance.
+      const active = row?.state === 'active';
+      session = {
+        sessionId: auth.sessionId,
+        instanceId: auth.instanceId,
+        generation: auth.generation,
+        epoch: auth.epoch,
+        sessionName: active ? (row?.name ?? null) : null,
+        sessionNameState: row?.state ?? 'unnamed',
+        agentType: row?.agentType ?? null,
+        cwd: row?.cwd ?? null,
+        readiness: row?.readiness ?? null,
+        lastMeaningfulActivityAt: row?.lastActivity ?? null,
+        expiresAt: row?.expiresAt ?? null,
+        expired: row?.expiredAt != null,
+      };
+    }
     const payload = {
       broker: 'connected',
       brokerInstanceId: this.brokerInstanceId,
-      session: auth ? { sessionId: auth.sessionId, instanceId: auth.instanceId, generation: auth.generation } : null,
+      compatibilityId: BUILD_ID,
+      session,
     };
     this.reply(conn, 'get_status_ack', payload, frame.requestId);
   }

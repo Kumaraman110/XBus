@@ -10,6 +10,7 @@ export type FrameType =
   | 'hello' | 'hello_ack'
   | 'register_session' | 'register_session_ack'
   | 'register_alias' | 'register_alias_ack'
+  | 'rename_session' | 'rename_session_ack'   // beta.4: choose/change the human-readable session name (resolves pending_name)
   | 'heartbeat' | 'heartbeat_ack'
   | 'send_message' | 'send_message_ack'
   | 'checkpoint_pull' | 'checkpoint_pull_ack'   // hook_checkpoint: receiver pulls pending + marks injected
@@ -61,4 +62,10 @@ export interface RegisterPayload {
   capabilities: string[];
   repositoryRoot?: string;
   claudeCodeVersion?: string;
+  /** Beta.4 (ADR 0012): a human-readable name the session would like to hold.
+   *  Optional + additive — kept SEPARATE from PR #4's nested adapterRegistration so
+   *  the two feature sets compose without colliding (ADR 0012 §5). */
+  requestedSessionName?: string;
+  /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
+  agentType?: string;
 }

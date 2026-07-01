@@ -316,6 +316,71 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE sessions ADD COLUMN readiness_updated_at TEXT;
     `,
   },
+  {
+    version: 6,
+    name: 'named_sessions_and_activity_retention',
+    sql: `
+      -- ADR 0012 (beta.4): required human-readable session names + 15-day
+      -- meaningful-activity retention. All ADDITIVE; legacy rows default to a
+      -- routable 'unnamed' name state with NULL name columns. The existing
+      -- (unused) sessions.expires_at column is REUSED as the 15-day expiry
+      -- deadline — deliberately NOT renamed, to avoid the SQLite RENAME COLUMN
+      -- portability risk (it is null in every existing row).
+      --
+      -- This migration moves SCHEMA_VERSION 5 -> 6, so the wire compatibility
+      -- tuple becomes xbus-p1-stp1-s6. That bump is intentional and fail-closed:
+      -- a beta.3 client (schema 5) meeting a v6-migrated broker is rejected
+      -- 'upgrade_component' rather than silently writing v6 state (ADR 0012 §3).
+
+      -- Name lifecycle: ORTHOGONAL to connection 'state' and 'readiness'.
+      --   'unnamed'  legacy / not-yet-named (routable by automatic_alias)
+      --   'pending'  name requested but unusable/ambiguous; UNROUTABLE until chosen
+      --   'active'   a valid unique name is held; discoverable + routable by name
+      --   'retired'  name released (rename / expiry); name returns to the pool
+      ALTER TABLE sessions ADD COLUMN session_name TEXT;
+      ALTER TABLE sessions ADD COLUMN normalized_session_name TEXT;
+      ALTER TABLE sessions ADD COLUMN session_name_state TEXT NOT NULL DEFAULT 'unnamed';
+      ALTER TABLE sessions ADD COLUMN pending_name_expires_at TEXT;
+
+      -- 15-day meaningful-activity retention (expires_at already exists, reused).
+      ALTER TABLE sessions ADD COLUMN last_meaningful_activity_at TEXT;
+      ALTER TABLE sessions ADD COLUMN expired_at TEXT;
+      ALTER TABLE sessions ADD COLUMN expiration_reason TEXT;
+
+      -- Captured-at-registration diagnostic metadata (NOT trust evidence — the
+      -- broker-owned-evidence model in PR #4 stays schema-distinct from these).
+      ALTER TABLE sessions ADD COLUMN agent_type TEXT;
+
+      -- Active-name uniqueness: case-insensitive, global within this broker
+      -- (one broker == one OS user == one dataDir). Reserve-on-claim — a name is
+      -- locked while 'active' OR 'pending', so two simultaneous sessions cannot
+      -- both claim it; 'unnamed'/'retired' rows (NULL normalized name) are
+      -- excluded so they never collide. SQLite serializes this inside the
+      -- register transaction, mirroring the proven aliases index.
+      CREATE UNIQUE INDEX ux_session_name_active
+        ON sessions(normalized_session_name)
+        WHERE normalized_session_name IS NOT NULL AND session_name_state IN ('active','pending');
+
+      -- Expiry-sweep scan support: find due sessions cheaply.
+      CREATE INDEX idx_sessions_expiry ON sessions(session_name_state, expires_at);
+
+      -- Backfill the retention clock for EXISTING (beta.3-upgraded) sessions so the
+      -- 15-day inactivity policy applies to them from upgrade time too — otherwise a
+      -- migrated session that never re-registers would keep last_meaningful_activity_at
+      -- NULL forever and never expire (the exact stale-install population retention is
+      -- meant to cover). Anchor on the most recent known activity (last_seen_at, else
+      -- created_at); expires_at = that + 15 days.
+      --
+      -- CRITICAL: the reaper compares expires_at to the clock STRING-WISE, so the
+      -- backfilled value MUST be in the exact JS toISOString() format
+      -- (YYYY-MM-DDTHH:MM:SS.sssZ). SQLite's datetime() drops the 'T'/'Z'/millis and
+      -- would mis-sort; strftime('%Y-%m-%dT%H:%M:%fZ', ...) reproduces it exactly.
+      UPDATE sessions
+        SET last_meaningful_activity_at = COALESCE(last_seen_at, created_at),
+            expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', COALESCE(last_seen_at, created_at), '+15 days')
+        WHERE last_meaningful_activity_at IS NULL;
+    `,
+  },
 ];
 
 function checksum(sql: string): string {
