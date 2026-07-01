@@ -319,7 +319,24 @@ export class BrokerStore {
         this.refreshMeaningfulActivity(input.sessionId, now);
       } else {
         const cur = this.db.prepare(`SELECT session_name_state AS s, session_name AS n FROM sessions WHERE session_id=?`).get(input.sessionId) as { s: SessionNameStatus['state']; n: string | null };
-        nameStatus = { state: cur.s, name: cur.n };
+        // First-name-on-reconnect (registration-order race fix): the lifecycle hook can
+        // register a session as `unnamed` (projectId 'proj-hook', no requestedSessionName)
+        // BEFORE the MCP server's named registration arrives. That MCP register is a
+        // reconnect (not a new lifecycle), so historically it left the session unnamed
+        // forever. Claiming a name for a still-`unnamed` session is NOT a disruptive
+        // "re-roll" (the guard above protects `active`/`pending` names) — it is the FIRST
+        // name the session ever gets, so do it here when a name was requested. This makes
+        // auto-naming deterministic regardless of hook-vs-MCP registration order.
+        if (cur.s === 'unnamed' && input.requestedSessionName !== undefined) {
+          nameStatus = this.claimNameForRegister(input.sessionId, input.requestedSessionName, now);
+          // Backfill agent_type when the first (hook) registration left it null, so the
+          // named session reports its real agent, not the hook placeholder.
+          if (input.agentType !== undefined) {
+            this.db.prepare(`UPDATE sessions SET agent_type=COALESCE(agent_type, ?) WHERE session_id=?`).run(input.agentType, input.sessionId);
+          }
+        } else {
+          nameStatus = { state: cur.s, name: cur.n };
+        }
       }
 
       this.audit('COMPONENT_REGISTERED', { sessionId: input.sessionId, instanceId: componentInstanceId, role, epoch, sessionNameState: nameStatus.state });

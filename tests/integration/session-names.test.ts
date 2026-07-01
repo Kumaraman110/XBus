@@ -166,3 +166,53 @@ describe('discovery — listActiveNamedSessions()', () => {
     expect(res.recipientSessionId).not.toBe(pending.sessionId);
   });
 });
+
+describe('registration-order race: hook registers unnamed BEFORE the MCP names the session', () => {
+  // Live-acceptance regression: in the real CLI the UserPromptSubmit hook can register a
+  // session FIRST (as a HOOK, projectId 'proj-hook', NO requestedSessionName) before the
+  // MCP server's named registration arrives. The MCP register is then a reconnect (not a
+  // new lifecycle). Historically that left the session 'unnamed' forever (observed live:
+  // project-a got named, project-b stayed unnamed purely on ordering). Naming a still-
+  // 'unnamed' session on reconnect is NOT a re-roll, so it must now succeed.
+  const sid2 = (): string => { const h = (100 + (n += 1)).toString(16).padStart(8, '0'); return `${h}-0000-4000-8000-000000000000`; };
+
+  it('hook-first (unnamed) then MCP-with-name -> session becomes active-named', () => {
+    const s = sid2();
+    // 1) HOOK registers first: role 'hook', no requested name, placeholder project.
+    const hookAuth = store.register({ sessionId: s, instanceId: 'hook-i', connectionId: `c-hook-${s}`, processId: 1, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    expect(nameState(s).state).toBe('unnamed');
+    // 2) MCP registers with the derived name — a reconnect, but the session is unnamed.
+    const mcpAuth = store.register({ sessionId: s, instanceId: 'mcp-i', connectionId: `c-mcp-${s}`, processId: 2, projectId: 'p', cwd: '/proj', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'project-b', agentType: 'claude' });
+    const ns = nameState(s);
+    expect(ns.state).toBe('active');            // named on reconnect (was the bug: stayed unnamed)
+    expect(ns.name).toBe('project-b');
+    expect(mcpAuth.awardedSessionName).toBe('project-b');
+    expect(mcpAuth.sessionNameState).toBe('active');
+    // agent_type backfilled from the hook placeholder (null) to the real agent.
+    const at = (db.prepare('SELECT agent_type AS a FROM sessions WHERE session_id=?').get(s) as { a: string | null }).a;
+    expect(at).toBe('claude');
+    // now discoverable + routable by name.
+    expect(store.listActiveNamedSessions().map((x) => x.name)).toContain('project-b');
+    expect(hookAuth.epoch).toBeGreaterThan(0);
+  });
+
+  it('a hook reconnect does NOT re-roll / wipe an ALREADY-active name (guard preserved)', () => {
+    const s = sid2();
+    // MCP owns the session with an active name.
+    store.register({ sessionId: s, instanceId: 'mcp-i', connectionId: `c-mcp-${s}`, processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', requestedSessionName: 'keep-me' });
+    expect(nameState(s).name).toBe('keep-me');
+    // A later HOOK registration (reconnect, no requestedSessionName — exactly what the
+    // lifecycle hook sends every checkpoint) must leave the active name untouched: my
+    // fix only claims when the session is CURRENTLY 'unnamed', so 'active' is preserved.
+    store.register({ sessionId: s, instanceId: 'hook-i', connectionId: `c-hook-${s}`, processId: 2, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    expect(nameState(s).name).toBe('keep-me');   // unchanged
+    expect(nameState(s).state).toBe('active');
+  });
+
+  it('hook-first then MCP with NO name -> stays unnamed (no spurious naming)', () => {
+    const s = sid2();
+    store.register({ sessionId: s, instanceId: 'hook-i', connectionId: `c-hook-${s}`, processId: 1, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    store.register({ sessionId: s, instanceId: 'mcp-i', connectionId: `c-mcp-${s}`, processId: 2, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' }); // no name
+    expect(nameState(s).state).toBe('unnamed');
+  });
+});
