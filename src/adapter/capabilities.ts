@@ -91,6 +91,53 @@ export function toVerified(role: ComponentRole, caps: AgentCapabilities): Verifi
   };
 }
 
+/**
+ * Broker-side capability CONFIRMATION (the self-promotion guard). An adapter's
+ * declared `AgentCapabilities` are UNTRUSTED: a self-flattering adapter can set any
+ * leaf to `'verified'`. This function REWRITES every declared leaf down to at most
+ * `'declared'`, then raises ONLY the leaves the broker has real evidence for back to
+ * `'verified'`. The result is what may be fed to `toVerified()` — never the raw
+ * adapter return. This makes the "verified comes from broker confirmation, never the
+ * manifest" invariant CODE, not a comment.
+ *
+ * `evidence` is the structurally-provenanced ValidationEvidence (a fake runtime can
+ * never set the live/full flags — see tier.ts / evidence.ts), so a fake run cannot
+ * confirm livePush.
+ */
+export function confirmCapabilities(declared: AgentCapabilities, evidence: ConfirmEvidence): AgentCapabilities {
+  // Start from a clamp: nothing the adapter SAID is verified survives as verified.
+  const clamp = (s: CapabilityState): CapabilityState => (s === 'verified' ? 'declared' : s);
+  const raise = (s: CapabilityState, proven: boolean): CapabilityState => (proven ? 'verified' : clamp(s));
+  return {
+    receive: {
+      manualPull: raise(declared.receive.manualPull, evidence.manualReceiveVerified),
+      lifecycleCheckpoint: raise(declared.receive.lifecycleCheckpoint, evidence.checkpointReceiveVerified),
+      livePush: raise(declared.receive.livePush, evidence.liveReceiveVerified),
+      backgroundWake: clamp(declared.receive.backgroundWake),
+      idleWake: clamp(declared.receive.idleWake),
+    },
+    messaging: {
+      acknowledgements: raise(declared.messaging.acknowledgements, evidence.ackReplyVerified),
+      correlatedReplies: raise(declared.messaging.correlatedReplies, evidence.ackReplyVerified),
+      progressEvents: clamp(declared.messaging.progressEvents),
+      cancellation: clamp(declared.messaging.cancellation),
+      streaming: clamp(declared.messaging.streaming),
+      structuredPayloads: clamp(declared.messaging.structuredPayloads),
+      attachments: clamp(declared.messaging.attachments),
+    },
+    lifecycle: { ...declared.lifecycle },     // lifecycle/execution leaves are not tier inputs;
+    execution: { ...declared.execution },     // clamp not required (toVerified ignores them)
+  };
+}
+
+/** The evidence subset `confirmCapabilities` reads (a structural subset of ValidationEvidence). */
+export interface ConfirmEvidence {
+  manualReceiveVerified: boolean;
+  checkpointReceiveVerified: boolean;
+  liveReceiveVerified: boolean;
+  ackReplyVerified: boolean;
+}
+
 /** A blank capability set (everything unsupported) — a safe default for a fresh adapter. */
 export function emptyCapabilities(): AgentCapabilities {
   const u: CapabilityState = 'unsupported';
