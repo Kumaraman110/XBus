@@ -20,7 +20,7 @@ import type { ReadinessHints } from './readiness.js';
 import { XBusError, XBusErrorCode, isXBusError } from '../protocol/errors.js';
 import { validateSendInput } from '../protocol/schemas.js';
 import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../identity/components.js';
-import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, type HelloInfo } from '../protocol/handshake.js';
+import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, BUILD_ID, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
@@ -643,11 +643,44 @@ export class BrokerDaemon {
   }
 
   private onStatus(conn: ServerConn, frame: Frame): void {
+    // Report the CALLER's own broker-owned identity. The session is keyed by the
+    // AUTHENTICATED connection (this.connAuth), never a caller-supplied id — a caller
+    // cannot spoke another session's id to read its state. This is a pure read: a plain
+    // SELECT that never refreshes meaningful activity and never revives an expired row.
     const auth = this.connAuth.get(conn.id);
+    let session: Record<string, unknown> | null = null;
+    if (auth) {
+      const row = this.db.prepare(
+        `SELECT session_name AS name, normalized_session_name AS norm, session_name_state AS state,
+                agent_type AS agentType, cwd, readiness, last_meaningful_activity_at AS lastActivity,
+                expires_at AS expiresAt, expired_at AS expiredAt
+         FROM sessions WHERE session_id=?`,
+      ).get(auth.sessionId) as
+        | { name: string | null; norm: string | null; state: string | null; agentType: string | null; cwd: string | null; readiness: string | null; lastActivity: string | null; expiresAt: string | null; expiredAt: string | null }
+        | undefined;
+      // sessionName reports the ACTIVE display name only; pending/unnamed/retired ⇒ null
+      // (a pending session holds no routable name). session_name_state carries the nuance.
+      const active = row?.state === 'active';
+      session = {
+        sessionId: auth.sessionId,
+        instanceId: auth.instanceId,
+        generation: auth.generation,
+        epoch: auth.epoch,
+        sessionName: active ? (row?.name ?? null) : null,
+        sessionNameState: row?.state ?? 'unnamed',
+        agentType: row?.agentType ?? null,
+        cwd: row?.cwd ?? null,
+        readiness: row?.readiness ?? null,
+        lastMeaningfulActivityAt: row?.lastActivity ?? null,
+        expiresAt: row?.expiresAt ?? null,
+        expired: row?.expiredAt != null,
+      };
+    }
     const payload = {
       broker: 'connected',
       brokerInstanceId: this.brokerInstanceId,
-      session: auth ? { sessionId: auth.sessionId, instanceId: auth.instanceId, generation: auth.generation } : null,
+      compatibilityId: BUILD_ID,
+      session,
     };
     this.reply(conn, 'get_status_ack', payload, frame.requestId);
   }
