@@ -100,7 +100,12 @@ export class TrustedEvidenceRegistry {
     if (ev.adapterId !== q.adapterId) return { ok: false, reason: 'adapter_id_mismatch' };
     if (ev.adapterVersion !== q.adapterVersion) return { ok: false, reason: 'adapter_version_mismatch' };
     if (ev.role !== q.role) return { ok: false, reason: 'role_mismatch' };
-    if (q.buildId !== undefined && ev.buildId !== undefined && ev.buildId !== q.buildId) return { ok: false, reason: 'build_mismatch' };
+    // buildId is part of the EXACT identity tuple: presence/absence is symmetric. A
+    // query without a buildId must NOT match evidence pinned to a specific build, and a
+    // query with a buildId must NOT match build-agnostic evidence — otherwise an adapter
+    // could omit (or invent) buildId to escape/borrow build-scoped evidence. Compare with
+    // a null-normalized equality so undefined and a value never cross-match.
+    if ((q.buildId ?? null) !== (ev.buildId ?? null)) return { ok: false, reason: 'build_mismatch' };
     if (!(TRUSTED_EVIDENCE_SOURCES as readonly string[]).includes(ev.source)) return { ok: false, reason: 'unknown_source' };
     if (ev.conformanceVersion !== undefined && ev.conformanceVersion !== SUPPORTED_CONFORMANCE_VERSION) return { ok: false, reason: 'unsupported_conformance_version' };
     return { ok: true, evidence: ev };

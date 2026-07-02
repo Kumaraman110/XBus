@@ -135,6 +135,24 @@ describe('PR2 §4 — evidence is bound to exact adapter identity (registry reje
     r3.record(brokerEvidence({ adapterId: 'D', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }));
     expect(r3.resolve({ adapterId: 'D', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-2' }).reason).toBe('build_mismatch');
   });
+
+  it('final-review #7: buildId binding is SYMMETRIC (presence/absence is part of the exact tuple)', () => {
+    // Evidence PINNED to a build must NOT resolve for a query that omits buildId
+    // (adapter can\'t drop buildId to borrow build-scoped evidence).
+    const rPinned = new TrustedEvidenceRegistry();
+    rPinned.record(brokerEvidence({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }));
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK }).ok).toBe(false);
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK }).reason).toBe('build_mismatch');
+    // Build-AGNOSTIC evidence (no buildId) must NOT resolve for a query that supplies one
+    // (adapter can\'t invent a buildId to match broad evidence under a narrow claim).
+    const rAgnostic = new TrustedEvidenceRegistry();
+    rAgnostic.record(brokerEvidence({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK })); // no buildId
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'anything' }).ok).toBe(false);
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'anything' }).reason).toBe('build_mismatch');
+    // Exact match (both absent) still resolves; (both present + equal) still resolves.
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK }).ok).toBe(true);
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }).ok).toBe(true);
+  });
 });
 
 describe('PR2 §5 — declared role must match authenticated authority', () => {
