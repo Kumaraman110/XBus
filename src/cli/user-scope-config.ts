@@ -185,6 +185,14 @@ function stripMcp(cfg: ClaudeConfig, o: UserScopeOptions, ownerToMatch: string |
   const owner = cfg.mcpServers[XBUS_MCP_KEY][XBUS_OWNER_TAG] as string | undefined;
   if (ownerToMatch !== null && owner !== ownerToMatch) return { cfg, changed: false };
   const m = { ...cfg.mcpServers }; delete m[XBUS_MCP_KEY];
+  // Byte-exact-restore (symmetric with stripHooks): if removing the xbus entry emptied
+  // mcpServers, drop the key entirely rather than leaving a residual `mcpServers: {}`. A
+  // user whose config had NO mcpServers key before install must get it back verbatim.
+  if (Object.keys(m).length === 0) {
+    const rest = { ...cfg };
+    delete (rest as { mcpServers?: unknown }).mcpServers;
+    return { cfg: rest, changed: true };
+  }
   return { cfg: { ...cfg, mcpServers: m }, changed: true };
 }
 function stripHooks(s: ClaudeSettings, o: UserScopeOptions, ownerToMatch: string | null): { settings: ClaudeSettings; changed: boolean } {

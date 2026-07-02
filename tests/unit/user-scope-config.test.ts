@@ -198,6 +198,31 @@ describe('unregisterUserScope — ownership-scoped removal across both files', (
     expect(JSON.stringify(s.hooks)).not.toContain('hook-entry.js'); // ours gone
   });
 
+  it('final-review #7b: uninstall removes the `mcpServers` key entirely if it was empty before install', () => {
+    // Symmetric with the hooks case: a user whose .claude.json had NO `mcpServers` key
+    // must get it back verbatim after uninstall — not a residual `mcpServers: {}`.
+    writeConfig({ theme: 'dark' });   // NO mcpServers key pre-install
+    writeSettings({ theme: 'dark' });
+    registerUserScope(opts());
+    expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined(); // install added it
+    const u = unregisterUserScope(opts());
+    expect(u.removed).toBe(true);
+    const cfg = readClaudeConfig(configPath)! as Record<string, unknown>;
+    expect('mcpServers' in cfg).toBe(false);   // key GONE (not an empty {})
+    expect(cfg.theme).toBe('dark');            // unrelated config intact
+  });
+
+  it('preserves a non-empty mcpServers map (only drops the key when fully emptied)', () => {
+    writeConfig({ mcpServers: { otherTool: { command: 'othercmd' } }, theme: 'x' });
+    registerUserScope(opts());
+    const u = unregisterUserScope(opts());
+    expect(u.removed).toBe(true);
+    const cfg = readClaudeConfig(configPath)!;
+    expect(cfg.mcpServers).toBeDefined();                    // key kept (user still has a server)
+    expect(cfg.mcpServers!.otherTool).toBeDefined();         // theirs preserved
+    expect(cfg.mcpServers!.xbus).toBeUndefined();            // ours gone
+  });
+
   it('does NOT remove an xbus mcp entry owned by a DIFFERENT install', () => {
     writeConfig({ mcpServers: { xbus: { command: 'x', [XBUS_OWNER_TAG]: 'OTHER' } } });
     const u = unregisterUserScope(opts({ installId: 'mine' }));
