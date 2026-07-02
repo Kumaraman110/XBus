@@ -17,9 +17,11 @@ function writeSecret(p: string, authDir: string, secret: Buffer): Buffer {
   const tmp = `${p}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, secret, { mode: 0o600 });
   fs.renameSync(tmp, p);
-  // Real restriction (Windows ACL / Unix mode). The auth dir is hardened too. This runs
-  // ONLY on create/re-init (rare — first use), so the icacls spawns are off the hot path.
-  try { hardenFile(authDir); } catch { /* best effort */ }
+  // Real restriction (Windows ACL / Unix mode). This runs ONLY on create/re-init (rare —
+  // first use), so the icacls spawns are off the hot path. The auth DIRECTORY is hardened
+  // with hardenDir (0700 on Unix / inheritance-strip + recursive re-grant on Windows) —
+  // NOT hardenFile, which would chmod a directory to 0600 and drop the traversal bit.
+  try { hardenDir(authDir); } catch { /* best effort */ }
   try { hardenFile(p); } catch { /* best effort */ }
   return secret;
 }

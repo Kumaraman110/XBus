@@ -99,6 +99,26 @@ describe(`runtime artifact permissions (${process.platform})`, () => {
     }
   });
 
+  it('final-review #1: creating the secret hardens the auth DIRECTORY correctly (dir, not file perms)', () => {
+    // writeSecret must harden authDir with hardenDir (0700 on Unix / inheritance-strip
+    // on Windows), NOT hardenFile (which would chmod a dir to 0600, dropping traversal).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-secretdir-'));
+    try {
+      const p = secretPath(dir);
+      const authDir = path.dirname(p);
+      const secret = loadOrCreateRootSecret(dir); // first-use create → hardens authDir
+      expect(secret.length).toBe(32);
+      // The auth dir must be traversable + own-restricted (no broad principals), and the
+      // secret must be READABLE (proves the dir wasn't 0600'd into non-traversable).
+      expect(describeAcl(authDir).broadAccess).toBe(false);
+      const reread = loadOrCreateRootSecret(dir); // must still read through the dir
+      expect(reread.equals(secret)).toBe(true);
+      if (!isWin) expect(describeAcl(authDir).mode).toBe('700'); // dir mode, not 600
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
   it('a symlinked data path is rejected (reparse/junction guard)', function () {
     const real = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-real-'));
     const link = path.join(os.tmpdir(), `xbus-link-${Math.random().toString(36).slice(2)}`);

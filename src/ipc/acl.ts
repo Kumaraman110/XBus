@@ -52,6 +52,11 @@ export function hardenFile(file: string): HardenResult {
   return icaclsRestrict(file);
 }
 
+/** Bound every icacls spawn so a hung subprocess (e.g. a slow network share, or a
+ *  degraded-ACL retry path reached from the hook) can never block indefinitely — a
+ *  timeout throws, is caught, and degrades best-effort. */
+const ICACLS_TIMEOUT_MS = 5000;
+
 function icaclsRestrict(target: string): HardenResult {
   const user = os.userInfo().username;
   try {
@@ -60,6 +65,7 @@ function icaclsRestrict(target: string): HardenResult {
     execFileSync('icacls', [target, '/inheritance:r', '/grant:r', `${user}:F`, 'SYSTEM:F'], {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
+      timeout: ICACLS_TIMEOUT_MS,
     });
     return { applied: true, method: 'icacls', detail: `inheritance removed; granted ${user}+SYSTEM only` };
   } catch (e) {
@@ -90,6 +96,7 @@ export function reestablishAccess(target: string): HardenResult {
     execFileSync('icacls', [target, '/grant', `${user}:F`, 'SYSTEM:F', '/T', '/C', '/Q'], {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
+      timeout: ICACLS_TIMEOUT_MS,
     });
     return { applied: true, method: 'icacls', detail: `re-granted ${user}+SYSTEM across subtree` };
   } catch (e) {
@@ -109,7 +116,7 @@ export function describeAcl(target: string): { platform: string; principals?: st
     return { platform: 'posix', mode, broadAccess: (m & 0o077) !== 0 };
   }
   try {
-    const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true });
+    const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true, timeout: ICACLS_TIMEOUT_MS });
     // icacls output: first line is "<path> PRINCIPAL:(perms)"; continuation lines
     // are "<indent>PRINCIPAL:(perms)". Parse the ACE principals only.
     const lines = out.split(/\r?\n/);
