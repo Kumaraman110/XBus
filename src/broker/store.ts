@@ -175,7 +175,18 @@ export class BrokerStore {
     return { state: 'active', name: norm.display };
   }
 
-  /** Put a session into the unroutable 'pending' name state with a reservation TTL. */
+  /**
+   * Put a session into the unroutable 'pending' name state with a reservation TTL.
+   *
+   * By design (ADR 0012 D4) a pending session holds NO name — normalized_session_name is
+   * NULL, so it is unroutable AND it does NOT reserve the contested name for later. A
+   * duplicate-name registrant is told, in effect, "that name is taken; you are pending —
+   * choose another via rename." It has no claim on the contested name, so if the active
+   * holder later renames/expires and a fresh session takes that name, that is correct, not
+   * a lost reservation: pending is an escape-hatch state, not a FIFO queue for the name.
+   * The pending session's ONLY route to a name is an explicit xbus_rename to a free one.
+   * (Truly-invalid names also land here; same semantics.)
+   */
   private markPending(sessionId: string, now: string): void {
     const pendingTtl = new Date(this.clock.nowMs() + 5 * 60_000).toISOString();
     this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='pending', pending_name_expires_at=?, updated_at=? WHERE session_id=?`)

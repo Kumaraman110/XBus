@@ -178,7 +178,14 @@ export function spawnDetachedBroker(dataDir: string): Promise<void> {
         windowsHide: true,
       });
       child.once('error', reject);
-      // Resolve as soon as the spawn is issued; readiness is observed via probe.
+      // Resolve as soon as the spawn is ISSUED; readiness is authoritatively observed via
+      // probe (ensureBroker's waitUntilReachable), NOT this promise. A late async spawn
+      // error that arrives after resolve() is intentionally a no-op here: ensureBroker does
+      // not treat a resolved spawn as "started" — if the broker never becomes reachable it
+      // degrades with `start_timeout`. So a dropped async error cannot cause a wrong result
+      // (a false "started"); it only means the failure is detected by the bounded probe
+      // rather than the listener. This is the deliberate detection model (ADR 0012 D7),
+      // not a swallowed error.
       child.unref();
       resolve();
     } catch (e) { reject(e instanceof Error ? e : new Error(String(e))); }
