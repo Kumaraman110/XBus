@@ -442,11 +442,19 @@ export class DeliveryOps {
         return null;
       }
       const injection = this.receipts.issue({ messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId: `redeliver-${this.ids.next()}`, componentId: auth.componentInstanceId, logicalInjectionNumber: maxLogical + 1 });
+      // Invariant (delivery §1): a returned/injected body ALWAYS carries a valid injection
+      // id. If issue() could not mint one (e.g. a concurrent redelivery already took this
+      // logical number → UNIQUE collision), do NOT return a body with a null id — throw so
+      // the whole txn rolls back (no orphaned injection, no bodiless-id presentation). The
+      // caller can retry; the model never sees an un-referenced body.
+      if (!injection?.injectionId) {
+        throw new XBusError(XBusErrorCode.INVALID_RECEIPT, 'redelivery could not allocate an injection id (concurrent redelivery); retry');
+      }
       this.refreshActivity(auth.sessionId, this.clock.nowIso()); // ADR 0012 D5: explicit redelivery is meaningful
       this.audit('EXPLICIT_REDELIVERY', { sessionId: auth.sessionId, messageId, reason: reason.slice(0, 120), logical: maxLogical + 1 });
       const pm = this.rowToPending(m);
       return {
-        messageId, injectionId: injection?.injectionId ?? null, senderAlias: pm.senderAlias, recipientAlias: pm.recipientAlias,
+        messageId, injectionId: injection.injectionId, senderAlias: pm.senderAlias, recipientAlias: pm.recipientAlias,
         kind: pm.kind, correlationId: pm.correlationId, causationId: pm.causationId, sequence: pm.sequence,
         requiresAck: pm.requiresAck, requiresReply: pm.requiresReply, state: 'context_injected_unacknowledged',
         bodyAlreadyPresented: true, bodyIncluded: true, text: pm.text, metadata: pm.metadata,

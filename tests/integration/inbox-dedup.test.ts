@@ -115,6 +115,23 @@ describe('§1 model-visible duplicate prevention', () => {
     expect(forMsg[0]!.injectionId).not.toBeNull();
   });
 
+  it('re-review #4: redeliver ALWAYS returns a non-null injection id with the body (never a bodiless id)', () => {
+    const { authA, authB } = pair();
+    const s = send(authA);
+    delivery.inboxView(authB, 'cp1', 10); // first injection (logical 1)
+    // Several successive redeliveries each mint a fresh, non-null injection id.
+    for (let i = 0; i < 3; i++) {
+      const re = delivery.redeliver(authB, s.messageId, `redeliver-${i}`);
+      expect(re).not.toBeNull();
+      expect(re!.bodyIncluded).toBe(true);
+      expect(re!.injectionId).toBeTruthy();       // NEVER null when a body is returned
+      expect(typeof re!.injectionId).toBe('string');
+    }
+    // Logical numbers advanced monotonically (1 = first inject, 2..4 = redeliveries).
+    const logicals = (db.prepare('SELECT logical_injection_number AS n FROM context_injections WHERE message_id=? ORDER BY n').all(s.messageId) as Array<{ n: number }>).map((r) => r.n);
+    expect(logicals).toEqual([1, 2, 3, 4]);
+  });
+
   it('final-review #6b: an inbox entry never carries a null injection id for a transport_written body', () => {
     const { authA, authB } = pair();
     const s = send(authA);
