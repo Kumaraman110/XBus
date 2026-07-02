@@ -374,11 +374,20 @@ export class DeliveryOps {
       allowedActions: m.requiresAck ? ['ack', 'reject', 'reply'] : ['reply'],
     }));
     // 2) already-injected-but-unacked for THIS epoch — body NOT repeated.
+    // The injection id is resolved via a CORRELATED SUBQUERY that pins the CURRENT
+    // (highest logical_injection_number) injection for THIS (message, epoch) — not a
+    // multi-row LEFT JOIN. A plain LEFT JOIN on context_injections returns one row PER
+    // injection, so a message with >1 injection for the epoch (e.g. after an explicit
+    // redelivery bumps logical_injection_number) would (a) be listed multiple times and
+    // (b) surface an arbitrary/stale injection id. Mirrors injectionIdFor(); one row per
+    // transport_written delivery, always carrying the current epoch-bound injection id.
     const rows = this.db
       .prepare(
-        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at, ci.injection_id
+        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at,
+                (SELECT ci.injection_id FROM context_injections ci
+                   WHERE ci.message_id=m.message_id AND ci.recipient_epoch=?
+                   ORDER BY ci.logical_injection_number DESC LIMIT 1) AS injection_id
          FROM deliveries d JOIN messages m ON m.message_id=d.message_id
-         LEFT JOIN context_injections ci ON ci.message_id=m.message_id AND ci.recipient_epoch=?
          WHERE d.recipient_session_id=? AND d.state='${DeliveryState.TRANSPORT_WRITTEN}'
            AND (m.expires_at IS NULL OR m.expires_at > ?)
          ORDER BY m.recipient_sequence ASC LIMIT ?`,
