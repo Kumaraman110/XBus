@@ -86,4 +86,22 @@ describe('MCP checkpoint_pull refreshes meaningful activity (final-review #5)', 
     // No body injected ⇒ not meaningful ⇒ activity unchanged (passive read must not extend).
     expect(activityAt(B)).toBe(before);
   });
+
+  it('re-review #3: an intentional set_control (pause/DND) refreshes meaningful activity (ADR 0012 D5)', async () => {
+    const B = 'dddd0000-0000-4000-8000-0000000000d5';
+    const c = await conn();
+    await c.request('register_session', { sessionId: B, instanceId: 'iB', processId: 2, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', requestedSessionName: 'ctrl-recv' });
+    await c.request('signal_readiness', { ackAvailable: true, versionOk: true });
+    const before = activityAt(B);
+    clock.advance(60_000);
+    // An intentional pause is a meaningful control change — must refresh the idle timer.
+    await c.request('set_control', { mode: 'paused' });
+    const afterPause = activityAt(B);
+    expect(afterPause).not.toBe(before);
+    expect(new Date(afterPause!).getTime()).toBeGreaterThan(new Date(before!).getTime());
+    // Resume is also meaningful.
+    clock.advance(60_000);
+    await c.request('set_control', { mode: 'active' });
+    expect(new Date(activityAt(B)!).getTime()).toBeGreaterThan(new Date(afterPause!).getTime());
+  });
 });

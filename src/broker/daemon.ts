@@ -297,6 +297,13 @@ export class BrokerDaemon {
     // success → failed, identity change). A new award is set only on full success.
     this.connAwarded.delete(conn.id);
     const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
+    // The register frame's role is the connection's declared authority role. It is NOT a
+    // privilege the broker grants: what a role can DO is enforced elsewhere (assertAllowed
+    // per-operation), and for adapter-aware registrations evaluateRegistration cross-checks
+    // that the adapter DECLARATION's role equals this authority role (FORBIDDEN_ROLE on
+    // mismatch — PR #4 trust boundary). The trusted-evidence award is bound to exact
+    // identity and cannot be forged by role choice. So role is read from the register frame
+    // (not cached from hello) by design; there is no self-promotion path.
     const role = p.role && isComponentRole(p.role) ? p.role : ComponentRole.MCP;
     // OPT-IN adapter enforcement. The adapter frame carries ONLY an untrusted
     // DECLARATION (id/version/role/declaredCapabilities). The TRUSTED evidence used to
@@ -462,6 +469,11 @@ export class BrokerDaemon {
     const p = (frame.payload ?? {}) as { mode?: string };
     const mode = (['active', 'paused', 'do_not_disturb', 'manual_checkpoint'].includes(p.mode ?? '') ? p.mode : 'active') as ReceiveControl;
     this.controls.setControl(auth.sessionId, mode);
+    // ADR 0012 D5: an intentional pause/resume/DND control change is MEANINGFUL activity
+    // and must refresh the 15-day idle timer — a user who explicitly pauses a session has
+    // not abandoned it. (refreshMeaningfulActivity is guarded on expired_at IS NULL, so it
+    // never revives a tombstone.)
+    this.store.refreshMeaningfulActivity(auth.sessionId);
     this.audit('CONTROL_SET', { sessionId: auth.sessionId, mode });
     this.reply(conn, 'set_control_ack', { sessionId: auth.sessionId, mode }, frame.requestId);
   }
