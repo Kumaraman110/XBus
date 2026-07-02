@@ -405,6 +405,12 @@ export class BrokerDaemon {
     const marked = this.delivery.markInjected(auth, pending.map((m) => m.messageId));
     const markedSet = new Set(marked);
     this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
+    // ADR 0012 D5: injecting a body at a checkpoint is MEANINGFUL recipient activity, so
+    // it must refresh the 15-day idle timer — on the MCP checkpoint path too, not only
+    // the hook path (onCheckpointPullHook → delivery.checkpointPull → refreshActivity).
+    // Only when a body was actually (newly) injected: an empty/recovery-only pull is not
+    // meaningful (mirrors the body-push guard in delivery.checkpointPull).
+    if (marked.length > 0) this.store.refreshMeaningfulActivity(auth.sessionId);
     const messages = pending.filter((m) => markedSet.has(m.messageId)).map((m) => {
       const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
       return injectionId ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } } : m;
