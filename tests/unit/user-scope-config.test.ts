@@ -131,6 +131,68 @@ describe('registerUserScope — idempotence + conflict', () => {
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe('someoneElse');
     expect(fs.existsSync(settingsPath)).toBe(false); // never touched the settings file either
   });
+
+  // ── final-review R2-1: env is part of the registration-idempotency identity ──
+  it('R2-1: identical env with DIFFERENT object-key ordering is still idempotent (canonical compare)', () => {
+    registerUserScope(opts({ dataDir: 'C:/x/data' }));
+    // Rewrite the stored entry's env with an EXTRA benign key inserted first, then the real
+    // one — proving canonicalEnv sorts keys, so a materially-identical XBUS_DATA_DIR with a
+    // different key order/serialization is not treated as a change. Re-register = no-op.
+    const cfg = readClaudeConfig(configPath)!;
+    const dataDir = (cfg.mcpServers!.xbus.env as Record<string, string>).XBUS_DATA_DIR;
+    cfg.mcpServers!.xbus.env = { ZZZ_ORDER_PROBE: 'z', XBUS_DATA_DIR: dataDir };
+    writeConfig(cfg);
+    const r2 = registerUserScope(opts({ dataDir: 'C:/x/data' }));
+    // The stored env has an EXTRA key (ZZZ_ORDER_PROBE) beyond canonical, so it is NOT
+    // materially-identical → correctly rewritten to the canonical single-key env.
+    expect(r2.ok).toBe(true);
+    const env = readClaudeConfig(configPath)!.mcpServers!.xbus.env as Record<string, string>;
+    expect(Object.keys(env)).toEqual(['XBUS_DATA_DIR']);
+    expect(env.XBUS_DATA_DIR).toBe('C:/x/data');
+    // And a subsequent identical re-register IS a no-op (canonical order-independent match).
+    const r3 = registerUserScope(opts({ dataDir: 'C:/x/data' }));
+    expect(r3.alreadyRegistered).toBe(true);
+  });
+
+  it('R2-1: a CHANGED data dir (env value) is NOT idempotent — the entry is rewritten', () => {
+    registerUserScope(opts({ dataDir: 'C:/x/data' }));
+    const r2 = registerUserScope(opts({ dataDir: 'C:/y/other-data' })); // same installId, new dataDir
+    expect(r2.alreadyRegistered).toBeUndefined();       // NOT short-circuited
+    expect(r2.ok).toBe(true);
+    const env = readClaudeConfig(configPath)!.mcpServers!.xbus.env as Record<string, string>;
+    expect(env.XBUS_DATA_DIR).toBe('C:/y/other-data');  // rewritten to the new dir
+  });
+
+  it('R2-1: a CHANGED node path is NOT idempotent — the entry is rewritten', () => {
+    registerUserScope(opts({ nodePath: NODE }));
+    const r2 = registerUserScope(opts({ nodePath: 'C:/new/node.exe' }));
+    expect(r2.alreadyRegistered).toBeUndefined();
+    expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe('C:/new/node.exe');
+  });
+
+  it('R2-1: a CHANGED server entry (args) is NOT idempotent — the entry is rewritten', () => {
+    registerUserScope(opts({ serverEntry: SERVER_JS }));
+    const r2 = registerUserScope(opts({ serverEntry: 'C:/new/server.js' }));
+    expect(r2.alreadyRegistered).toBeUndefined();
+    expect(readClaudeConfig(configPath)!.mcpServers!.xbus.args).toEqual(['C:/new/server.js']);
+  });
+
+  it('R2-1: omitted vs empty env compares equal (canonicalization), env values with = are literal', () => {
+    // A data dir value containing '=' and delimiter-like chars must round-trip literally
+    // and be idempotent on re-register (values compared exactly, not parsed).
+    const weird = 'C:/x/data=with;delims,and spaces';
+    registerUserScope(opts({ dataDir: weird }));
+    const r2 = registerUserScope(opts({ dataDir: weird }));
+    expect(r2.alreadyRegistered).toBe(true);            // exact literal match ⇒ idempotent
+    expect((readClaudeConfig(configPath)!.mcpServers!.xbus.env as Record<string, string>).XBUS_DATA_DIR).toBe(weird);
+  });
+
+  it('R2-1: duplicate registration after a "restart" (reload from disk) reuses when identical', () => {
+    registerUserScope(opts());
+    // Simulate a process restart: fresh read from disk (no in-memory state) + same opts.
+    const r2 = registerUserScope(opts());
+    expect(r2.alreadyRegistered).toBe(true);
+  });
 });
 
 describe('registerUserScope — transactional rollback across both files', () => {

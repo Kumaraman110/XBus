@@ -125,6 +125,29 @@ export function readClaudeSettings(settingsPath: string): ClaudeSettings | null 
 function xbusMcpEntry(o: UserScopeOptions): McpServerEntry {
   return { type: 'stdio', command: o.nodePath, args: [o.serverEntry], env: { XBUS_DATA_DIR: o.dataDir }, [XBUS_OWNER_TAG]: o.installId };
 }
+
+/**
+ * Registration-idempotency identity rule (ADR 0012 D2/D7): an existing XBus MCP entry is
+ * "materially identical" to the canonical one iff its IDENTITY-BEARING fields match —
+ * `command` (the node executable), `args` (the server entry), and `env` (which carries
+ * XBUS_DATA_DIR). If ANY differs (e.g. the data dir moved, node moved), the entry must be
+ * rewritten, not short-circuited as already-registered. The `env` comparison is CANONICAL:
+ *   • order-independent (keys sorted) — object-key order is not identity;
+ *   • omitted `env` and an empty `{}` are equivalent (both = "no env");
+ *   • values compared exactly (no case/path normalization — env values are literal, and a
+ *     changed XBUS_DATA_DIR value MUST be treated as different).
+ * Never logs env VALUES (only structural equality is computed here).
+ */
+function canonicalEnv(env: Record<string, string> | undefined): string {
+  const e = env ?? {};
+  const keys = Object.keys(e).sort();
+  return JSON.stringify(keys.map((k) => [k, e[k]]));
+}
+function mcpEntryMateriallyEqual(cur: McpServerEntry, canonical: McpServerEntry): boolean {
+  return cur.command === canonical.command
+    && JSON.stringify(cur.args) === JSON.stringify(canonical.args)
+    && canonicalEnv(cur.env) === canonicalEnv(canonical.env);
+}
 /** Our canonical hook handler (EXEC form — no shell, paths passed literally). */
 function xbusHookHandler(o: UserScopeOptions): HookHandler {
   return { type: 'command', command: o.nodePath, args: [o.hookEntry], [XBUS_OWNER_TAG]: o.installId };
@@ -247,10 +270,12 @@ export function registerUserScope(o: UserScopeOptions): RegisterResult {
   }
   const canonical = xbusMcpEntry(o);
   const replacedConflict = !!cur && cur[XBUS_OWNER_TAG] !== undefined && cur[XBUS_OWNER_TAG] !== o.installId;
-  // Idempotent: ours, same id, same command/args, AND our hooks already present.
+  // Idempotent: ours, same id, materially-identical entry (command/args/ENV), AND our
+  // hooks already present. Including env means a moved data dir (or node path) is NOT
+  // mistaken for already-registered — it triggers a rewrite so the entry stays correct.
   const settingsCur = readClaudeSettings(settingsPath) ?? {};
   const hooksPresent = XBUS_HOOK_EVENTS.every((ev) => (settingsCur.hooks?.[ev] ?? []).some((g) => g.hooks.some((h) => (h[XBUS_OWNER_TAG]) === o.installId && isXbusHookHandler(h, o))));
-  if (cur && cur[XBUS_OWNER_TAG] === o.installId && cur.command === canonical.command && JSON.stringify(cur.args) === JSON.stringify(canonical.args) && hooksPresent) {
+  if (cur && cur[XBUS_OWNER_TAG] === o.installId && mcpEntryMateriallyEqual(cur, canonical) && hooksPresent) {
     return { ok: true, dryRun: !!o.dryRun, alreadyRegistered: true };
   }
 
