@@ -13,7 +13,7 @@
  * deterministic and never opens a socket or forks a process.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { ensureBroker, type EnsureBrokerDeps } from '../../src/broker/ensure.js';
+import { ensureBroker, brokerSpawnEnv, type EnsureBrokerDeps } from '../../src/broker/ensure.js';
 
 const ENDPOINT = '\\\\.\\pipe\\xbus-test';
 const DATA = '/tmp/xbus-test-data';
@@ -143,5 +143,37 @@ describe('ensureBroker — failure handling', () => {
       checkSingleton: async () => { throw new Error('boom'); },
     });
     await expect(ensureBroker(d)).resolves.toBeDefined();
+  });
+});
+
+describe('brokerSpawnEnv — detached-broker environment (final-review: least-privilege scrub)', () => {
+  it('scrubs XBUS_ROOT_SECRET from the inherited env (never propagate a secret via env)', () => {
+    const parent = { XBUS_ROOT_SECRET: 'deadbeef'.repeat(8), PATH: '/usr/bin', USERNAME: 'alice' } as NodeJS.ProcessEnv;
+    const env = brokerSpawnEnv(parent, '/data/dir');
+    expect(env.XBUS_ROOT_SECRET).toBeUndefined();
+  });
+
+  it('PRESERVES the OS-critical vars the broker needs (endpoint/crypto/ACL) — NOT a narrow allowlist', () => {
+    // A minimal allowlist would break startup: transport.ts derives the per-user pipe
+    // from USERNAME, and Node crypto + icacls need SystemRoot/TEMP/PATH on Windows.
+    const parent = {
+      USERNAME: 'alice', PATH: '/usr/bin:/bin', SystemRoot: 'C:\\WINDOWS',
+      TEMP: 'C:\\Temp', windir: 'C:\\WINDOWS', LOCALE: 'en_US',
+    } as NodeJS.ProcessEnv;
+    const env = brokerSpawnEnv(parent, '/data/dir');
+    expect(env.USERNAME).toBe('alice');
+    expect(env.PATH).toBe('/usr/bin:/bin');
+    expect(env.SystemRoot).toBe('C:\\WINDOWS');
+    expect(env.TEMP).toBe('C:\\Temp');
+    expect(env.windir).toBe('C:\\WINDOWS');
+  });
+
+  it('pins XBUS_DATA_DIR to the requested dir and does NOT mutate the caller env', () => {
+    const parent = { XBUS_DATA_DIR: '/old', XBUS_ROOT_SECRET: 'x', PATH: '/p' } as NodeJS.ProcessEnv;
+    const env = brokerSpawnEnv(parent, '/new/data');
+    expect(env.XBUS_DATA_DIR).toBe('/new/data');
+    // caller's object is untouched (fresh copy returned)
+    expect(parent.XBUS_DATA_DIR).toBe('/old');
+    expect(parent.XBUS_ROOT_SECRET).toBe('x');
   });
 });

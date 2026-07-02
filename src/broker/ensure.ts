@@ -160,6 +160,24 @@ function brokerEntryScript(): string {
 }
 
 /**
+ * Build the environment for the detached broker child. The broker INHERITS the
+ * parent environment on purpose: it derives its per-user IPC endpoint from
+ * `USERNAME` (see transport.ts) and needs `SystemRoot`/`TEMP`/`PATH` for Node's
+ * crypto + `icacls` on Windows — a narrow allowlist would silently break startup
+ * (a divergent pipe name that never connects, or a crypto/ACL failure). But we
+ * DEFENSIVELY scrub any XBus root secret from the inherited copy: the broker loads
+ * its secret from the ACL-protected data dir, NEVER from an env var, so propagating
+ * one to a long-lived daemon is pure exposure with no benefit. This mirrors the
+ * same scrub the launcher applies (xclaude.ts). Pure + returns a fresh object (the
+ * caller's environment is never mutated), so it is unit-testable without spawning.
+ */
+export function brokerSpawnEnv(parentEnv: NodeJS.ProcessEnv, dataDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...parentEnv, XBUS_DATA_DIR: dataDir };
+  delete (env as Record<string, string | undefined>).XBUS_ROOT_SECRET; // never propagate a secret via env
+  return env;
+}
+
+/**
  * Detach-spawn ONE broker process: `node <dist/cli/main.js> start`. The child is
  * fully detached (its own process group, stdio ignored) and unref'd so the parent
  * (an MCP server, hook, or CLI) can exit without killing the broker. The broker's
@@ -172,7 +190,7 @@ export function spawnDetachedBroker(dataDir: string): Promise<void> {
     try {
       const child = spawn(process.execPath, [brokerEntryScript(), 'start'], {
         cwd: dataDir,
-        env: { ...process.env, XBUS_DATA_DIR: dataDir },
+        env: brokerSpawnEnv(process.env, dataDir),
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
