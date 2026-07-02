@@ -179,3 +179,113 @@ describe('Group 3 — expiry clears name + de-routes the identity', () => {
     expect(st.state).toBe('dead_letter');
   });
 });
+
+describe('send() idempotency × expiry contract (final-review R2-3)', () => {
+  function deliveriesFor(sessionId: string): Array<{ state: string }> {
+    return db.prepare('SELECT state FROM deliveries WHERE recipient_session_id=?').all(sessionId) as Array<{ state: string }>;
+  }
+
+  it('retry BEFORE expiry returns the recorded result, no new delivery (plain idempotency)', () => {
+    const s = ready('c-snd-1'); const r = ready('c-rcv-1');
+    const key = 'k-before';
+    const first = store.send(s, { to: 'c-rcv-1', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    const retry = store.send(s, { to: 'c-rcv-1', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.messageId).toBe(first.messageId);
+    expect(deliveriesFor(r.sessionId)).toHaveLength(1); // no new delivery
+  });
+
+  it('retry AFTER expiry (delivery dead-lettered by the sweep) returns the terminal dead_letter, no revival', () => {
+    const s = ready('c-snd-2'); const r = ready('c-rcv-2');
+    const key = 'k-after';
+    const first = store.send(s, { to: 'c-rcv-2', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep(); // expires r + dead-letters the queued delivery (terminal)
+    const s2 = store.register({ sessionId: s.sessionId, instanceId: 'i2', connectionId: 'c-s2', processId: 9, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', supersede: true, requestedSessionName: 'c-snd-2' });
+    store.signalReadiness(s2, { ackAvailable: true, versionOk: true });
+    const retry = store.send(s2, { to: 'c-rcv-2', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.messageId).toBe(first.messageId);
+    expect(retry.state).toBe('dead_letter');            // terminal recorded outcome
+    expect(deliveriesFor(r.sessionId)).toHaveLength(1);  // NOT re-queued / resurrected
+    expect(deliveriesFor(r.sessionId)[0]!.state).toBe('dead_letter');
+  });
+
+  it('retry to an expired recipient whose delivery is still NON-terminal throws RECIPIENT_SESSION_EXPIRED (no silent live routing)', () => {
+    // Contract edge: expire the recipient WITHOUT the delivery reaching a terminal state
+    // (simulate a not-yet-swept live delivery), then retry. A live (non-terminal) delivery
+    // to a now-expired recipient must be rejected FINAL, not reported as success.
+    const s = ready('c-snd-3'); const r = ready('c-rcv-3');
+    const key = 'k-live-expired';
+    const first = store.send(s, { to: 'c-rcv-3', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    expect((db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(first.messageId) as { state: string }).state).toBe('queued');
+    // Expire the recipient row directly but leave the delivery 'queued' (non-terminal).
+    db.prepare(`UPDATE sessions SET expired_at=?, expiration_reason='recipient_inactive_15_days', session_name_state='retired', normalized_session_name=NULL WHERE session_id=?`).run(clock.nowIso(), r.sessionId);
+    try {
+      store.send(s, { to: 'c-rcv-3', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+      throw new Error('expected the idempotent retry to throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(XBusError);
+      expect((e as XBusError).code).toBe(XBusErrorCode.RECIPIENT_SESSION_EXPIRED);
+    }
+    // No new delivery was created by the rejected retry.
+    expect(deliveriesFor(r.sessionId)).toHaveLength(1);
+  });
+
+  it('a NEW idempotency key to an expired recipient fails with RECIPIENT_SESSION_EXPIRED', () => {
+    const s = ready('c-snd-4'); const r = ready('c-rcv-4');
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    const s2 = store.register({ sessionId: s.sessionId, instanceId: 'i2', connectionId: 'c-s4b', processId: 9, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', supersede: true, requestedSessionName: 'c-snd-4' });
+    store.signalReadiness(s2, { ackAvailable: true, versionOk: true });
+    try {
+      store.send(s2, { to: r.sessionId, text: 'fresh', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: 'brand-new-key' });
+      throw new Error('expected the fresh send to throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(XBusError);
+      expect((e as XBusError).code).toBe(XBusErrorCode.RECIPIENT_SESSION_EXPIRED);
+    }
+  });
+
+  it('recipient RE-REGISTRATION (new epoch) does not resurrect an old body; a same-key retry still returns the old terminal result', () => {
+    const s = ready('c-snd-5'); const r = ready('c-rcv-5');
+    const key = 'k-reepoch';
+    const first = store.send(s, { to: 'c-rcv-5', text: 'old-body', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep(); // r expires, delivery dead-lettered
+    // r re-registers → fresh epoch, tombstone cleared.
+    const r2 = store.register({ sessionId: r.sessionId, instanceId: 'i2', connectionId: 'c-r5b', processId: 7, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', supersede: true, requestedSessionName: 'c-rcv-5' });
+    store.signalReadiness(r2, { ackAvailable: true, versionOk: true });
+    expect(r2.epoch).toBeGreaterThan(r.epoch);
+    // The OLD dead-lettered body is NOT delivered to the new epoch.
+    const got = delivery.checkpointPull({ ...r2, role: 'hook' as never }, 'cp-reepoch', 10);
+    expect(got.find((m) => m.text === 'old-body')).toBeUndefined();
+    // A same-key retry returns the recorded (dead_letter) terminal result — recipient is
+    // NOT expired now (re-registered), delivery is terminal ⇒ faithful replay, no new row.
+    const retry = store.send(s, { to: 'c-rcv-5', text: 'old-body', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.messageId).toBe(first.messageId);
+    expect(retry.state).toBe('dead_letter');
+    // No new delivery row for the old message.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE message_id=?').get(first.messageId) as { n: number }).n).toBe(1);
+  });
+
+  it('is deterministic across a broker restart (reopen the same DB): retry after expiry still returns dead_letter, no new routing', () => {
+    const s = ready('c-snd-6'); const r = ready('c-rcv-6');
+    const key = 'k-restart';
+    const first = store.send(s, { to: 'c-rcv-6', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    // "Restart": close + reopen the same on-disk DB into a fresh store (same clock state).
+    db.close();
+    db = openDatabase(path.join(dir, 'x.sqlite'), { applyPragmas: true });
+    store = new BrokerStore(db, clock, new SeqIdGen('m2'), 'b');
+    const s2 = store.register({ sessionId: s.sessionId, instanceId: 'i2', connectionId: 'c-s6b', processId: 9, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', supersede: true, requestedSessionName: 'c-snd-6' });
+    store.signalReadiness(s2, { ackAvailable: true, versionOk: true });
+    const retry = store.send(s2, { to: 'c-rcv-6', text: 'q', kind: 'request', requiresAck: true, requiresReply: false, idempotencyKey: key });
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.messageId).toBe(first.messageId);
+    expect(retry.state).toBe('dead_letter');
+    expect((db.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=?').get(r.sessionId) as { n: number }).n).toBe(1);
+  });
+});

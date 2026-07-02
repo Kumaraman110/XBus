@@ -539,6 +539,22 @@ export class BrokerStore {
   send(auth: SessionAuthority, input: SendInput): SendResult {
     return this.db.transaction(() => {
       // Idempotency short-circuit BEFORE resolve + BEFORE sequence allocation (F13).
+      //
+      // Idempotency × expiry contract (ADR 0012 Decision 6): a retry with a KNOWN key
+      // must NEVER create new routing to — or revive/requeue a delivery for — a recipient
+      // that has since expired. It returns the ALREADY-RECORDED result. Two sub-cases:
+      //   • the original delivery is TERMINAL (completed / dead_letter / rejected /
+      //     expired): return that terminal result verbatim (deduplicated). This is a
+      //     faithful replay of the recorded outcome, not new routing — nothing is
+      //     re-queued, no body is resurrected. (After the recipient expires, the reaper
+      //     has already moved a queued delivery to dead_letter, so a retry reports
+      //     dead_letter — the honest terminal state.)
+      //   • the original delivery is NON-terminal (still live: queued / retry_wait /
+      //     transport_written) BUT the recipient is now expired: returning success would
+      //     imply live routing to an unroutable session, so reject FINAL with
+      //     RECIPIENT_SESSION_EXPIRED — uniform with the fresh-send path below.
+      // The recipient-expiry read + delivery-state read happen in THIS transaction, so
+      // the decision is consistent with a concurrent expiry sweep (serialized by SQLite).
       if (input.idempotencyKey) {
         const dup = this.db
           .prepare('SELECT message_id, correlation_id, recipient_session_id, recipient_alias, recipient_sequence FROM messages WHERE sender_session_id=? AND idempotency_key=?')
@@ -547,9 +563,19 @@ export class BrokerStore {
           | undefined;
         if (dup) {
           const d = this.db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(dup.message_id) as { state: string } | undefined;
+          const state = d?.state ?? DeliveryState.QUEUED;
+          const terminal = state === DeliveryState.COMPLETED || state === DeliveryState.DEAD_LETTER || state === DeliveryState.REJECTED || state === DeliveryState.EXPIRED;
+          if (!terminal) {
+            const dupExp = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(dup.recipient_session_id) as { expired_at: string | null } | undefined;
+            if (dupExp?.expired_at) {
+              // Live delivery to a now-expired recipient — do not report success on retry.
+              this.audit('SEND_REJECTED_RECIPIENT_EXPIRED', { sessionId: auth.sessionId, recipient: dup.recipient_alias, idempotent: true });
+              throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'recipient session expired (no activity for 15 days); it must re-register', { recipient: dup.recipient_alias });
+            }
+          }
           return {
             messageId: dup.message_id, correlationId: dup.correlation_id, recipientSessionId: dup.recipient_session_id,
-            recipientAlias: dup.recipient_alias, sequence: dup.recipient_sequence, state: d?.state ?? DeliveryState.QUEUED, deduplicated: true,
+            recipientAlias: dup.recipient_alias, sequence: dup.recipient_sequence, state, deduplicated: true,
           };
         }
       }
