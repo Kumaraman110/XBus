@@ -303,7 +303,8 @@ describe('unregisterUserScope — ownership-scoped removal across both files', (
 
 describe('Windows backslash paths (exec form — paths passed literally)', () => {
   const winNode = 'C:\\Program Files\\nodejs\\node.exe';
-  const winHook = 'C:\\Users\\v\\.claude\\xbus-install\\plugin\\dist\\channel\\hook-entry.js';
+  // Synthetic Windows path (no real user home) — exercises backslash-literal storage.
+  const winHook = 'C:\\ProgramData\\example-user\\.claude\\xbus-install\\plugin\\dist\\channel\\hook-entry.js';
   it('stores node + hook path LITERALLY in args (no JSON backslash doubling)', () => {
     registerUserScope(opts({ nodePath: winNode, hookEntry: winHook }));
     const h = readClaudeSettings(settingsPath)!.hooks!.UserPromptSubmit![0]!.hooks[0]!;

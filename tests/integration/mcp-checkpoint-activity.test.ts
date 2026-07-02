@@ -74,6 +74,47 @@ describe('MCP checkpoint_pull refreshes meaningful activity (final-review #5)', 
     expect(after).toBe(clock.nowIso());
   });
 
+  it('final-review R5: an injected body ALWAYS carries a valid xbus_injection_id', async () => {
+    const A = 'a11a0000-0000-4000-8000-0000000000a6';
+    const B = 'b11b0000-0000-4000-8000-0000000000b6';
+    const sender = await conn();
+    await sender.request('register_session', { sessionId: A, instanceId: 'iA', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'inj-sender' });
+    const recv = await conn();
+    await recv.request('register_session', { sessionId: B, instanceId: 'iB', processId: 2, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'inj-receiver' });
+    await recv.request('signal_readiness', { ackAvailable: true, versionOk: true });
+    await sender.request('send_message', { to: 'inj-receiver', text: 'body-needs-id', kind: 'request', requiresAck: true, requiresReply: false });
+    const pull = await recv.request('checkpoint_pull', { limit: 10 });
+    const msgs = (pull.payload as { messages: Array<{ metadata?: Record<string, string> }> }).messages ?? [];
+    expect(msgs.length).toBe(1);
+    // The invariant: a returned body is REFERABLE — it has a non-empty injection id.
+    const injId = msgs[0]!.metadata?.xbus_injection_id;
+    expect(typeof injId).toBe('string');
+    expect(injId!.length).toBeGreaterThan(0);
+  });
+
+  it('final-review R5: a marked body whose injection id is (unexpectedly) absent is DROPPED, never returned id-less', async () => {
+    // Enforce the documented invariant structurally: if injectionIdFor() returns null
+    // for a freshly-marked message (a race / concurrent deletion / corruption), the MCP
+    // checkpoint_pull path must SUPPRESS the body rather than present it without a valid,
+    // referable injection id. Simulate the null by stubbing injectionIdFor on this
+    // daemon's delivery instance AFTER the message is marked-injected inside the handler.
+    const A = 'a22a0000-0000-4000-8000-0000000000a7';
+    const B = 'b22b0000-0000-4000-8000-0000000000b7';
+    const sender = await conn();
+    await sender.request('register_session', { sessionId: A, instanceId: 'iA', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'drop-sender' });
+    const recv = await conn();
+    await recv.request('register_session', { sessionId: B, instanceId: 'iB', processId: 2, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'drop-receiver' });
+    await recv.request('signal_readiness', { ackAvailable: true, versionOk: true });
+    await sender.request('send_message', { to: 'drop-receiver', text: 'body-should-be-dropped', kind: 'request', requiresAck: true, requiresReply: false });
+    // Force the id lookup to fail for every message on THIS daemon's delivery layer.
+    const delivery = (daemon as unknown as { delivery: { injectionIdFor: (m: string, e: number) => string | null } }).delivery;
+    delivery.injectionIdFor = () => null;
+    const pull = await recv.request('checkpoint_pull', { limit: 10 });
+    const msgs = (pull.payload as { messages: unknown[] }).messages ?? [];
+    // Body suppressed — better to withhold than to present an unreferable (id-less) body.
+    expect(msgs.length).toBe(0);
+  });
+
   it('an EMPTY checkpoint_pull (nothing to inject) does NOT refresh activity', async () => {
     const B = 'cccc0000-0000-4000-8000-0000000000c5';
     const recv = await conn();

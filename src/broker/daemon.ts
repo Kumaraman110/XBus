@@ -418,10 +418,22 @@ export class BrokerDaemon {
     // Only when a body was actually (newly) injected: an empty/recovery-only pull is not
     // meaningful (mirrors the body-push guard in delivery.checkpointPull).
     if (marked.length > 0) this.store.refreshMeaningfulActivity(auth.sessionId);
-    const messages = pending.filter((m) => markedSet.has(m.messageId)).map((m) => {
-      const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
-      return injectionId ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } } : m;
-    });
+    // LAYER-3 INVARIANT (see the promise on lines above + delivery.checkpointPull):
+    // a returned body must NEVER lack a valid injection id. `marked` already contains
+    // only messages whose receipts.issue() succeeded, so injectionIdFor() is expected
+    // non-null — but ENFORCE it structurally rather than trust it: if the id is somehow
+    // absent (race / concurrent deletion / corruption) DROP the body (never present one
+    // without a referable id for ack/reply), mirroring the hook path's body-suppress.
+    const messages = pending
+      .filter((m) => markedSet.has(m.messageId))
+      .flatMap((m) => {
+        const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
+        if (!injectionId) {
+          this.audit('INJECTION_ID_MISSING_BODY_SUPPRESSED', { sessionId: auth.sessionId, messageId: m.messageId });
+          return [];
+        }
+        return [{ ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } }];
+      });
     this.reply(conn, 'checkpoint_pull_ack', { messages }, frame.requestId);
   }
 
