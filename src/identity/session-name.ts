@@ -44,6 +44,11 @@ const ASCII_NAME_RE = /^[A-Za-z0-9._-]+$/;
 const ALL_NUMERIC_RE = /^[0-9]+$/;
 /** Canonical UUID shape, and the looser hex-blocks-with-dashes generated-id shape. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** Filesystem-path-like: a path separator (`/` `\`), a colon, or a `C:`-style drive
+ *  letter. Redundant with the ASCII charset gate (which already excludes these), but
+ *  made EXPLICIT to match ADR 0012 Decision 3's documented rejection category and to
+ *  emit a specific, actionable error rather than the generic charset message. */
+const PATH_LIKE_RE = /[:/\\]|^[A-Za-z]:/;
 
 /** Administrative identities that must never be user-claimable. */
 export const RESERVED_SESSION_NAMES: ReadonlySet<string> = new Set([
@@ -79,7 +84,16 @@ export function validateSessionName(raw: unknown): NormalizedSessionName {
     throw new XBusError(XBusErrorCode.INVALID_SESSION_NAME, 'session name must be a non-empty string');
   }
   const nfc = raw.normalize('NFC');
-  // ASCII gate FIRST (pre-casefold) — a homoglyph must never reach the casefold step.
+  // Explicit path-like rejection (ADR 0012 D3) — checked BEFORE the charset gate so a
+  // path gets a specific error. (The ASCII gate would also reject these, but the spec
+  // calls out path-like names as their own category, so make it self-documenting.)
+  if (PATH_LIKE_RE.test(nfc)) {
+    throw new XBusError(
+      XBusErrorCode.INVALID_SESSION_NAME,
+      'session name must not be filesystem-path-like (no "/", "\\", ":", or drive letter)',
+    );
+  }
+  // ASCII gate (pre-casefold) — a homoglyph must never reach the casefold step.
   if (!ASCII_NAME_RE.test(nfc)) {
     throw new XBusError(
       XBusErrorCode.INVALID_SESSION_NAME,

@@ -86,12 +86,23 @@ function toEvidenceSource(s: TrustedEvidenceSource): EvidenceSource {
   }
 }
 
+/** Resolve the independent secret/telemetry redaction flags from broker-owned evidence,
+ *  falling back to the deprecated single `redactionVerified` when a specific flag is
+ *  absent (conservative: the old flag stood for both together). */
+function secretRedactionOf(ev: BrokerTrustedEvidence): boolean {
+  return ev.security.secretRedactionVerified ?? ev.security.redactionVerified ?? false;
+}
+function telemetryRedactionOf(ev: BrokerTrustedEvidence): boolean {
+  return ev.security.telemetryRedactionVerified ?? ev.security.redactionVerified ?? false;
+}
+
 /** Build a source-capped ValidationEvidence from BROKER-OWNED evidence (never adapter input). */
 function trustedToValidationEvidence(ev: BrokerTrustedEvidence): ValidationEvidence {
   const source = toEvidenceSource(ev.source);
   const fullRuntime =
     ev.durability.brokerRestartVerified && ev.durability.reconnectVerified && ev.durability.queuedDeliveryVerified &&
-    ev.security.fencingVerified && ev.security.redactionVerified && ev.security.packagedRuntimeVerified;
+    // full-runtime requires BOTH redaction properties independently verified.
+    ev.security.fencingVerified && secretRedactionOf(ev) && telemetryRedactionOf(ev) && ev.security.packagedRuntimeVerified;
   // buildValidationEvidence source-caps live/full: a conformance_runner (fake_runtime)
   // can never set liveReceiveVerified/fullRuntimeValidation true, no matter the flags.
   return buildValidationEvidence(source, {
@@ -177,7 +188,7 @@ export function evaluateRegistration(args: EvaluateArgs): EnforcementResult | nu
       capabilitiesVerified: [],
       conformanceCasesPassed: [],
       durability: { brokerRestart: trustedEvidence?.durability.brokerRestartVerified ?? false, adapterRestart: trustedEvidence?.durability.reconnectVerified ?? false, queuedDeliveryPreserved: trustedEvidence?.durability.queuedDeliveryVerified ?? false },
-      security: { aliasFencing: trustedEvidence?.security.fencingVerified ?? false, secretRedaction: trustedEvidence?.security.redactionVerified ?? false, telemetryRedaction: trustedEvidence?.security.redactionVerified ?? false, packagedRuntime: trustedEvidence?.security.packagedRuntimeVerified ?? false },
+      security: { aliasFencing: trustedEvidence?.security.fencingVerified ?? false, secretRedaction: trustedEvidence ? secretRedactionOf(trustedEvidence) : false, telemetryRedaction: trustedEvidence ? telemetryRedactionOf(trustedEvidence) : false, packagedRuntime: trustedEvidence?.security.packagedRuntimeVerified ?? false },
     },
     fullConformancePassed,
   );

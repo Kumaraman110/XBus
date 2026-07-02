@@ -46,7 +46,21 @@ export interface BrokerTrustedEvidence {
     ackReplyVerified: boolean;
   };
   durability: { brokerRestartVerified: boolean; reconnectVerified: boolean; queuedDeliveryVerified: boolean };
-  security: { fencingVerified: boolean; redactionVerified: boolean; packagedRuntimeVerified: boolean };
+  /**
+   * Security verifications. Secret-redaction and telemetry-redaction are ORTHOGONAL
+   * properties and are tracked independently (`secretRedactionVerified` /
+   * `telemetryRedactionVerified`) so the broker can prove one without implying the other.
+   * `redactionVerified` is the DEPRECATED single-flag form retained for back-compat; when
+   * the specific flags are absent it is used as the value for BOTH (conservative: a source
+   * that only recorded the old flag verified both or neither together).
+   */
+  security: {
+    fencingVerified: boolean;
+    redactionVerified?: boolean;
+    secretRedactionVerified?: boolean;
+    telemetryRedactionVerified?: boolean;
+    packagedRuntimeVerified: boolean;
+  };
   conformanceVersion?: number;
   evidenceId?: string;
 }

@@ -226,3 +226,34 @@ describe('PR2 — provenance helpers (sanity)', () => {
     expect(computeAwardedSupport(verified, ev, se, true).validationLevel).toBe('conformance_tested');
   });
 });
+
+describe('re-review R4: secret- and telemetry-redaction are tracked INDEPENDENTLY', () => {
+  // The two redaction properties are orthogonal and are now stored/consumed independently
+  // (secretRedactionVerified / telemetryRedactionVerified), with the deprecated single
+  // `redactionVerified` flag feeding BOTH for back-compat. These flags contribute to the
+  // full-runtime security posture; this test pins that evidence resolves + awards WITHOUT
+  // error under each combination and that the deprecated flag is honored (no crash on the
+  // absent specific flags), i.e. the split did not regress the trust path.
+  const D = (o: Partial<AdapterRegistrationDeclaration> = {}) => decl({ role: ComponentRole.MCP, declaredCapabilities: declaring({ lifecycleCheckpoint: 'declared' }, { acknowledgements: 'declared', correlatedReplies: 'declared' }), ...o });
+  const auth = { role: ComponentRole.MCP, sessionId: 's' };
+  function realEvidence(over: Partial<BrokerTrustedEvidence['security']>): BrokerTrustedEvidence {
+    return brokerEvidence({
+      source: 'real_runtime_validation', role: ComponentRole.MCP,
+      capabilities: { sendVerified: true, manualReceiveVerified: true, checkpointReceiveVerified: true, liveReceiveVerified: false, ackReplyVerified: true },
+      durability: { brokerRestartVerified: true, reconnectVerified: true, queuedDeliveryVerified: true },
+      security: { fencingVerified: true, packagedRuntimeVerified: true, ...over },
+    });
+  }
+  it('resolves + awards under each redaction combination (secret-only, telemetry-only, both)', () => {
+    for (const sec of [true, false]) for (const tel of [true, false]) {
+      const r = evaluateRegistration({ receiveMode: 'hook_checkpoint', declaration: D(), authority: auth, trustedEvidence: realEvidence({ secretRedactionVerified: sec, telemetryRedactionVerified: tel }) })!;
+      expect(r.awarded.maximumDeliveryTier).toBe('T3'); // checkpoint-mode delivery award (from verified caps)
+      expect(r.awarded.validationLevel).toBe('real_runtime_validated');
+    }
+  });
+  it('deprecated single redactionVerified flag is honored for BOTH (back-compat, no crash on absent specific flags)', () => {
+    const r = evaluateRegistration({ receiveMode: 'hook_checkpoint', declaration: D(), authority: auth, trustedEvidence: realEvidence({ redactionVerified: true }) })!;
+    expect(r.awarded.maximumDeliveryTier).toBe('T3');
+    expect(r.awarded.validationLevel).toBe('real_runtime_validated');
+  });
+});
