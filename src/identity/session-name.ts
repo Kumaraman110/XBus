@@ -42,7 +42,8 @@ const SESSION_NAME_RE = /^[a-z0-9][a-z0-9._-]{1,47}$/;
 const ASCII_NAME_RE = /^[A-Za-z0-9._-]+$/;
 /** A name that is ENTIRELY digits (a raw process id / number). */
 const ALL_NUMERIC_RE = /^[0-9]+$/;
-/** Canonical UUID shape, and the looser hex-blocks-with-dashes generated-id shape. */
+/** Canonical UUID shape (8-4-4-4-12 hex). Other generated-id shapes are caught by the
+ *  all-numeric / charset / length / reserved rules rather than this specific pattern. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Filesystem-path-like: a path separator (`/` `\`), a colon, or a `C:`-style drive
  *  letter. Redundant with the ASCII charset gate (which already excludes these), but
