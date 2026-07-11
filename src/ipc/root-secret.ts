@@ -13,17 +13,52 @@ export function secretPath(dataDir: string): string {
   return path.join(dataDir, 'auth', 'root.secret');
 }
 
-function writeSecret(p: string, authDir: string, secret: Buffer): Buffer {
+/**
+ * Atomically create the secret file if and only if it does not already exist, and
+ * return the secret that is NOW authoritative on disk.
+ *
+ * CONCURRENCY (first-writer-wins): two brokers racing a genuine first-run create — both
+ * passed checkSingleton before either bound, an explicitly designed-for race (ensure.ts)
+ * — MUST converge on ONE on-disk secret. The old tmp-write + `renameSync` was
+ * last-writer-wins: the bind winner could hold secret S_B in memory while a loser's
+ * rename left S_C on disk, so every client (which derives keys from the DISK secret)
+ * would fail the handshake against the winner's in-memory S_B — all auth broken until a
+ * manual restart. Fix: tmp-write + hard-`linkSync` (NOT rename). `link` fails EEXIST when
+ * the path already exists, so the FIRST writer wins; any loser deletes its tmp, reads the
+ * winner's secret, and returns THAT. Every racer — including the eventual bind winner —
+ * therefore ends holding the exact secret that is on disk. Preserves the old atomic
+ * no-partial-file guarantee (the final path only ever appears via link of a fully-written
+ * tmp). tmp is per-pid so two racers never collide on the tmp name itself.
+ */
+export function writeSecretExclusive(p: string, authDir: string, secret: Buffer): Buffer {
   const tmp = `${p}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, secret, { mode: 0o600 });
-  fs.renameSync(tmp, p);
+  const winner = secret;
+  try {
+    fs.linkSync(tmp, p); // atomic create-if-absent; EEXIST if another writer already won
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+      // A concurrent create won the race — ADOPT its secret; never overwrite it.
+      const existing = fs.readFileSync(p);
+      if (existing.length !== ROOT_SECRET_BYTES) {
+        throw new XBusError(
+          XBusErrorCode.AUTH_FAILED,
+          `root secret at ${p} appeared malformed (${existing.length} bytes) after a concurrent create; stop XBus and re-initialize`,
+        );
+      }
+      return existing;
+    }
+    throw e;
+  }
+  try { fs.unlinkSync(tmp); } catch { /* best effort */ }
   // Real restriction (Windows ACL / Unix mode). This runs ONLY on create/re-init (rare —
   // first use), so the icacls spawns are off the hot path. The auth DIRECTORY is hardened
   // with hardenDir (0700 on Unix / inheritance-strip + recursive re-grant on Windows) —
   // NOT hardenFile, which would chmod a directory to 0600 and drop the traversal bit.
   try { hardenDir(authDir); } catch { /* best effort */ }
   try { hardenFile(p); } catch { /* best effort */ }
-  return secret;
+  return winner;
 }
 
 /**
@@ -98,9 +133,24 @@ export function loadOrCreateRootSecret(dataDir: string, opts: { forceReinit?: bo
     if (reappeared) return reappeared;
   }
 
-  // Create branch (genuine first use / forceReinit). auth/ access was just re-granted
-  // above, so the tmp write cannot EPERM on an orphaned dir.
-  return writeSecret(p, authDir, generateRootSecret());
+  // Create branch. auth/ access was just re-granted above, so the tmp write cannot
+  // EPERM on an orphaned dir.
+  //  - genuine first use: exclusive create (first-writer-wins) so two racing first-run
+  //    brokers converge on ONE on-disk secret and every racer returns THAT (see
+  //    writeSecretExclusive). This is the concurrent-create fix.
+  //  - forceReinit: an EXPLICIT operator replace of a malformed secret — it MUST
+  //    overwrite (last-writer), never adopt the malformed/existing file, so it keeps the
+  //    deliberate rename path.
+  if (forceReinit) {
+    const tmp = `${p}.tmp-${process.pid}`;
+    const secret = generateRootSecret();
+    fs.writeFileSync(tmp, secret, { mode: 0o600 });
+    fs.renameSync(tmp, p);
+    try { hardenDir(authDir); } catch { /* best effort */ }
+    try { hardenFile(p); } catch { /* best effort */ }
+    return secret;
+  }
+  return writeSecretExclusive(p, authDir, generateRootSecret());
 }
 
 /** Rotate: generate a new secret, atomically replace. Existing sessions must

@@ -11,7 +11,8 @@ import fs from 'node:fs';
 import { startBrokerHost, type RunningBroker } from '../../src/broker/host.js';
 import { IpcClient } from '../../src/ipc/client.js';
 import { clientHello } from '../../src/ipc/hello.js';
-import { secretPath } from '../../src/ipc/root-secret.js';
+import { secretPath, writeSecretExclusive, loadOrCreateRootSecret } from '../../src/ipc/root-secret.js';
+import { generateRootSecret } from '../../src/ipc/secure-channel.js';
 
 let dataDir: string;
 let broker: RunningBroker;
@@ -119,5 +120,48 @@ describe('root-secret exposure audit (§2)', () => {
     // evidence; a raw byte capture is covered by the dir scan above.
     a.close();
     expect(true).toBe(true);
+  });
+});
+
+describe('final-review R8: concurrent first-run secret create converges (first-writer-wins)', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-secret-race-')); fs.mkdirSync(path.dirname(secretPath(dir)), { recursive: true }); });
+  afterEach(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+  it('a loser ADOPTS the winner\'s on-disk secret instead of overwriting it', () => {
+    const p = secretPath(dir);
+    const authDir = path.dirname(p);
+    const first = generateRootSecret();
+    const second = generateRootSecret();
+    expect(first.equals(second)).toBe(false);
+    // Writer A wins the create.
+    const a = writeSecretExclusive(p, authDir, first);
+    expect(a.equals(first)).toBe(true);
+    // Writer B races a create with a DIFFERENT secret — it must return the winner's
+    // (adopt), and disk must be UNCHANGED (never last-writer-wins).
+    const b = writeSecretExclusive(p, authDir, second);
+    expect(b.equals(first)).toBe(true);            // B adopted A's secret
+    expect(b.equals(second)).toBe(false);          // B's own secret was discarded
+    expect(fs.readFileSync(p).equals(first)).toBe(true); // disk holds A's, not B's
+  });
+
+  it('every racer ends holding the SAME secret that is on disk (the auth-break invariant)', () => {
+    const p = secretPath(dir);
+    const authDir = path.dirname(p);
+    // Simulate N racers each generating a distinct secret and calling the exclusive
+    // create. Exactly one wins; all others adopt it. The set of returned secrets must
+    // be a singleton equal to the on-disk secret — otherwise a broker could hold a
+    // secret different from disk and break all client auth.
+    const returned = Array.from({ length: 5 }, () => writeSecretExclusive(p, authDir, generateRootSecret()));
+    const onDisk = fs.readFileSync(p);
+    for (const r of returned) expect(r.equals(onDisk)).toBe(true);
+  });
+
+  it('loadOrCreateRootSecret create-branch uses exclusive create and is idempotent under repeat', () => {
+    // First call creates; a second call must READ the same secret, never regenerate.
+    const s1 = loadOrCreateRootSecret(dir);
+    const s2 = loadOrCreateRootSecret(dir);
+    expect(s1.equals(s2)).toBe(true);
+    expect(fs.readFileSync(secretPath(dir)).equals(s1)).toBe(true);
   });
 });

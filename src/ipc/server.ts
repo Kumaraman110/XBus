@@ -103,10 +103,18 @@ export class IpcServer {
         if (err.code === 'EADDRINUSE' && allowStaleSocketRecovery && this.isUnixSocketEndpoint()) {
           // Capture the inode of the offending socket NOW, then probe it. If it is
           // unreachable (stale), unlink it and retry — but ONLY if the inode is
-          // unchanged at unlink time, so a broker that bound a NEW socket at this path
-          // in the probe→unlink gap is never clobbered (TOCTOU close: we remove the
-          // EXACT stale inode we probed, or nothing). The upstream checkSingleton /
-          // probeExisting layer is still the primary arbiter for the common case.
+          // unchanged at unlink time, which SHRINKS the clobber window from the full
+          // ~probe duration down to the gap between the statSync (line ~115) and the
+          // unlinkSync (line ~116). NOTE: this is unlink-BY-PATH, not by held inode, so
+          // it is not a fully atomic TOCTOU close — a broker that both re-created the
+          // path AND bound a new socket within that two-syscall gap could in principle
+          // be unlinked. That residual window is small and this whole recovery is
+          // POSIX-only (Windows named pipes need no unlink — isUnixSocketEndpoint gate
+          // below); the upstream checkSingleton / probeExisting layer remains the
+          // PRIMARY singleton arbiter, and the bind itself is the final authority, so a
+          // clobber degrades to a re-contended bind rather than silent split-brain in
+          // the common path. A future hardening is to unlink by an open+fstat'd inode
+          // handle or hold an advisory lock across recovery.
           let inoBefore: number | undefined;
           try { inoBefore = fs.statSync(this.endpoint).ino; } catch { inoBefore = undefined; }
           this.probeStaleSocket().then((reachable) => {
