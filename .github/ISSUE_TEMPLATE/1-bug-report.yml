@@ -59,8 +59,8 @@ body:
     id: xbus-version
     attributes:
       label: XBus version
-      description: Output of `xbus version` (or the release tag, e.g. v0.1.0-beta.3). Include the compatibilityId if you have it.
-      placeholder: "e.g. 0.1.0-beta.3 (xbus-p1-stp1-s5)"
+      description: Output of `xbus version` (or the release tag, e.g. v0.1.0-beta.4). Include the compatibilityId if you have it.
+      placeholder: "e.g. 0.1.0-beta.4 (xbus-p1-stp1-s6)"
     validations:
       required: true
   - type: input
