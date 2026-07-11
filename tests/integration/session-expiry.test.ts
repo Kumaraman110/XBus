@@ -199,6 +199,7 @@ describe('15-day expiry sweep', () => {
     expect(sessRow(victim.sessionId).state).toBe('retired');
     // The live connection's epoch is unchanged (expiry doesn't bump it), so rename's
     // epoch check passes — exactly the bite case.
+    const autoAlias = (db.prepare('SELECT automatic_alias AS a FROM sessions WHERE session_id=?').get(victim.sessionId) as { a: string }).a;
     const out = store.renameSession(victim, 'rr-victim-renamed');
     expect(out.state).toBe('active');
     const row = sessRow(victim.sessionId);
@@ -208,6 +209,16 @@ describe('15-day expiry sweep', () => {
     // Routable again by the new name (would be UNROUTABLE if expired_at were still set).
     const send = store.send(sender, { to: 'rr-victim-renamed', text: 'back', kind: 'request', requiresAck: false, requiresReply: false });
     expect(send.recipientSessionId).toBe(victim.sessionId);
+    // final-review R10 (major): rename-resurrect must also REACTIVATE the retired
+    // automatic_alias — the expiry sweep set active=0 on ALL alias rows, and a resurrect
+    // that only restores the user name leaves the session unroutable by its session-<hex>
+    // fallback (asymmetric with the register-based expired-resume path).
+    const viaAuto = store.send(sender, { to: autoAlias, text: 'via-auto', kind: 'request', requiresAck: false, requiresReply: false });
+    expect(viaAuto.recipientSessionId).toBe(victim.sessionId);
+    // final-review R10 (minor): readiness must be restored to a delivering-capable state
+    // ('initializing', mirroring register-resume) — the reaper forced 'disconnected', and
+    // if left there the revived session would never be injected queued messages.
+    expect(sessRow(victim.sessionId).readiness).toBe('initializing');
     // And another session can NOT be blocked from a DIFFERENT name (no lock leak):
     const other = ready('rr-other');
     expect(sessRow(other.sessionId).state).toBe('active');

@@ -454,11 +454,33 @@ export class BrokerStore {
       // brings the session back.
       const wasExpired = s.expiredAt !== null;
       try {
-        this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, expired_at=NULL, expiration_reason=NULL, updated_at=? WHERE session_id=?`)
-          .run(norm.display, norm.normalized, now, auth.sessionId);
+        // On a rename that RESURRECTS an expired session, also restore readiness to
+        // 'initializing' (mirroring the register-based expired-resume at the freshLifecycle
+        // branch). The reaper forced readiness='disconnected' at expiry; if left there the
+        // revived session — though now name-active and routable — would never be injected
+        // queued messages until it independently re-signalled. 'initializing' is the safe
+        // resume state: the live MCP's next signalReadiness (or its already-sent hints)
+        // resolves it to a delivering state. A NON-expired rename must NOT touch readiness.
+        if (wasExpired) {
+          this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, expired_at=NULL, expiration_reason=NULL, readiness='initializing', readiness_updated_at=?, updated_at=? WHERE session_id=?`)
+            .run(norm.display, norm.normalized, now, now, auth.sessionId);
+        } else {
+          this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, expired_at=NULL, expiration_reason=NULL, updated_at=? WHERE session_id=?`)
+            .run(norm.display, norm.normalized, now, auth.sessionId);
+        }
       } catch {
         // Unique-index race: someone else acquired it between the check and the write.
         throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      }
+      if (wasExpired) {
+        // The expiry sweep retired ALL alias rows (active=0), including the broker-minted
+        // automatic_alias (session-<8hex>) — the always-present fallback address. A
+        // resurrected session must be routable by that alias again, exactly as the
+        // register-based expired-resume path reactivates it (see register()). Reactivate
+        // the row (re-upsert if it was pruned). Any user name is set above.
+        const auto = automaticAlias(auth.sessionId);
+        const reactivated = this.db.prepare(`UPDATE aliases SET active=1, retired_at=NULL WHERE session_id=? AND alias_ci=? AND scope='global'`).run(auth.sessionId, auto.ci);
+        if (reactivated.changes === 0) this.upsertAliasRow(auto, 'global', null, auth.sessionId, now);
       }
       this.refreshMeaningfulActivity(auth.sessionId, now); // now applies (expired_at cleared above)
       this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
