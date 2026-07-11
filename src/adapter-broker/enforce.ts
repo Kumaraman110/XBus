@@ -18,7 +18,7 @@
  */
 
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
-import { confirmCapabilities, toVerified, type AgentCapabilities } from '../adapter/capabilities.js';
+import { confirmCapabilities, toVerified, isCapabilityState, type AgentCapabilities } from '../adapter/capabilities.js';
 import { calculateMaximumTier, type ValidationEvidence } from '../adapter/tier.js';
 import {
   computeAwardedSupport, buildValidationEvidence, type AwardedSupport, type EvidenceSource,
@@ -65,6 +65,38 @@ export interface EvaluateArgs {
   trustedEvidence: BrokerTrustedEvidence | undefined;
 }
 
+/**
+ * Validate the shape of the UNTRUSTED, adapter-supplied `declaredCapabilities` before
+ * it is dereferenced. The frame is cast unchecked at the daemon boundary, and
+ * confirmCapabilities()/toVerified() blindly read `.receive.manualPull`,
+ * `.messaging.acknowledgements`, etc. — so a malformed declaration (omitted, or missing
+ * the `receive`/`messaging` groups, or a leaf that is not a CapabilityState) would throw
+ * a raw TypeError, surfaced to the peer as a mislabeled generic internal error. Since
+ * declarations are UNTRUSTED (trust-boundary invariant), validate the structure here and
+ * fail with a clean PROTOCOL_VIOLATION. Only the groups/leaves the tier computation reads
+ * are required; extra fields are ignored (forward-compatible).
+ */
+function assertDeclaredCapabilitiesShape(caps: unknown): asserts caps is AgentCapabilities {
+  if (!caps || typeof caps !== 'object') {
+    throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'adapter declaredCapabilities is missing or not an object');
+  }
+  const required: Record<'receive' | 'messaging', readonly string[]> = {
+    receive: ['manualPull', 'lifecycleCheckpoint', 'livePush', 'backgroundWake', 'idleWake'],
+    messaging: ['acknowledgements', 'correlatedReplies', 'progressEvents', 'cancellation', 'streaming', 'structuredPayloads', 'attachments'],
+  };
+  for (const group of ['receive', 'messaging'] as const) {
+    const g = (caps as Record<string, unknown>)[group];
+    if (!g || typeof g !== 'object') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `adapter declaredCapabilities.${group} is missing or not an object`, { group });
+    }
+    for (const leaf of required[group]) {
+      if (!isCapabilityState((g as Record<string, unknown>)[leaf])) {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `adapter declaredCapabilities.${group}.${leaf} is not a valid CapabilityState`, { group, leaf });
+      }
+    }
+  }
+}
+
 /** Map a receive mode to the verified capability it REQUIRES (if any). */
 export function modeRequires(receiveMode: string): keyof ReturnType<typeof toVerified>['receive'] | 'none' {
   switch (receiveMode) {
@@ -86,12 +118,23 @@ function toEvidenceSource(s: TrustedEvidenceSource): EvidenceSource {
   }
 }
 
+/** Resolve the independent secret/telemetry redaction flags from broker-owned evidence,
+ *  falling back to the deprecated single `redactionVerified` when a specific flag is
+ *  absent (conservative: the old flag stood for both together). */
+function secretRedactionOf(ev: BrokerTrustedEvidence): boolean {
+  return ev.security.secretRedactionVerified ?? ev.security.redactionVerified ?? false;
+}
+function telemetryRedactionOf(ev: BrokerTrustedEvidence): boolean {
+  return ev.security.telemetryRedactionVerified ?? ev.security.redactionVerified ?? false;
+}
+
 /** Build a source-capped ValidationEvidence from BROKER-OWNED evidence (never adapter input). */
 function trustedToValidationEvidence(ev: BrokerTrustedEvidence): ValidationEvidence {
   const source = toEvidenceSource(ev.source);
   const fullRuntime =
     ev.durability.brokerRestartVerified && ev.durability.reconnectVerified && ev.durability.queuedDeliveryVerified &&
-    ev.security.fencingVerified && ev.security.redactionVerified && ev.security.packagedRuntimeVerified;
+    // full-runtime requires BOTH redaction properties independently verified.
+    ev.security.fencingVerified && secretRedactionOf(ev) && telemetryRedactionOf(ev) && ev.security.packagedRuntimeVerified;
   // buildValidationEvidence source-caps live/full: a conformance_runner (fake_runtime)
   // can never set liveReceiveVerified/fullRuntimeValidation true, no matter the flags.
   return buildValidationEvidence(source, {
@@ -140,6 +183,11 @@ export function evaluateRegistration(args: EvaluateArgs): EnforcementResult | nu
     );
   }
 
+  // (a.2) The declaration is UNTRUSTED — validate declaredCapabilities' STRUCTURE (not just
+  //       its role) before anything dereferences it, so malformed input fails with a clean
+  //       PROTOCOL_VIOLATION instead of a raw TypeError mislabeled as an internal error.
+  assertDeclaredCapabilitiesShape(declaration.declaredCapabilities);
+
   // (b) Resolve broker-owned evidence (already identity-checked by the registry). When
   //     absent, evidence is the empty/'none' baseline ⇒ nothing is verified.
   const evidence: ValidationEvidence = trustedEvidence
@@ -177,7 +225,7 @@ export function evaluateRegistration(args: EvaluateArgs): EnforcementResult | nu
       capabilitiesVerified: [],
       conformanceCasesPassed: [],
       durability: { brokerRestart: trustedEvidence?.durability.brokerRestartVerified ?? false, adapterRestart: trustedEvidence?.durability.reconnectVerified ?? false, queuedDeliveryPreserved: trustedEvidence?.durability.queuedDeliveryVerified ?? false },
-      security: { aliasFencing: trustedEvidence?.security.fencingVerified ?? false, secretRedaction: trustedEvidence?.security.redactionVerified ?? false, telemetryRedaction: trustedEvidence?.security.redactionVerified ?? false, packagedRuntime: trustedEvidence?.security.packagedRuntimeVerified ?? false },
+      security: { aliasFencing: trustedEvidence?.security.fencingVerified ?? false, secretRedaction: trustedEvidence ? secretRedactionOf(trustedEvidence) : false, telemetryRedaction: trustedEvidence ? telemetryRedactionOf(trustedEvidence) : false, packagedRuntime: trustedEvidence?.security.packagedRuntimeVerified ?? false },
     },
     fullConformancePassed,
   );

@@ -20,7 +20,7 @@ import type { ReadinessHints } from './readiness.js';
 import { XBusError, XBusErrorCode, isXBusError } from '../protocol/errors.js';
 import { validateSendInput } from '../protocol/schemas.js';
 import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../identity/components.js';
-import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, type HelloInfo } from '../protocol/handshake.js';
+import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, BUILD_ID, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
@@ -164,6 +164,42 @@ export class BrokerDaemon {
     this.reply(conn, 'error', xe.toWire(), reqId);
   }
 
+  /**
+   * Validate the untrusted, optional `limit` payload field on the read/pull handlers.
+   * `limit` flows into a SQL `LIMIT ?` bind; node:sqlite throws a raw
+   * TypeError/ERR_SQLITE_ERROR (mislabeled as DATABASE_ERROR "internal error") if it is a
+   * non-number (boolean/string/object/array), a NaN/Infinity, a non-integer (2.5), or an
+   * out-of-range value (1e21). Reject anything but a non-negative safe integer with a clean
+   * PROTOCOL_VIOLATION; `undefined` passes through to the caller's default. Returns the
+   * validated number | undefined.
+   */
+  private validatedLimit(raw: unknown): number | undefined {
+    if (raw === undefined) return undefined;
+    // Must be a NON-NEGATIVE SAFE INTEGER. A finite NON-integer (2.5) or an out-of-range
+    // value (1e21) still fails the `LIMIT ?` bind with a raw node:sqlite "datatype mismatch"
+    // that would be mislabeled DATABASE_ERROR — so reject anything but a clean integer here.
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw > Number.MAX_SAFE_INTEGER) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'limit must be a non-negative integer');
+    }
+    return raw;
+  }
+
+  /**
+   * Validate an untrusted, OPTIONAL string payload field before it flows to a SQL bind or
+   * string method. node:sqlite throws a raw ERR_INVALID_ARG_TYPE (boolean) / datatype
+   * mismatch (object/array) on a non-string/non-number bind, which handle() would mislabel
+   * as DATABASE_ERROR "internal error". Reject a present-but-non-string value with a clean
+   * PROTOCOL_VIOLATION; `undefined` passes through. Used for every optional string field on
+   * the frame handlers (note/injectionId/idempotencyKey/checkpointId/…).
+   */
+  private optString(raw: unknown, field: string): string | undefined {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== 'string') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `${field} must be a string when present`, { field });
+    }
+    return raw;
+  }
+
   private onConnClose(id: string): void {
     const auth = this.connAuth.get(id);
     if (auth) {
@@ -204,6 +240,8 @@ export class BrokerDaemon {
           return this.onRegister(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
+        case 'rename_session':
+          return this.onRenameSession(conn, frame);
         case 'send_message':
           return this.onSend(conn, frame);
         case 'checkpoint_pull':
@@ -294,7 +332,42 @@ export class BrokerDaemon {
     // award can never survive a re-registration (adapter-aware → legacy, high → low,
     // success → failed, identity change). A new award is set only on full success.
     this.connAwarded.delete(conn.id);
-    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
+    const p = (frame.payload ?? {}) as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
+    // Validate the required untrusted identity fields → clean PROTOCOL_VIOLATION. Without
+    // this, an omitted field (e.g. a null/empty payload) reaches a SQL bind inside
+    // store.register and throws a raw error mislabeled as DATABASE_ERROR "internal error".
+    for (const field of ['sessionId', 'instanceId', 'projectId', 'cwd', 'receiveMode'] as const) {
+      if (typeof p[field] !== 'string' || !p[field]) {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session requires a non-empty ${field}`, { field });
+      }
+    }
+    if (typeof p.processId !== 'number') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session requires a numeric processId');
+    }
+    // Optional string fields are forwarded verbatim into the sessions INSERT (TEXT columns).
+    // A boolean value throws ERR_INVALID_ARG_TYPE at the bind (mislabeled DATABASE_ERROR), so
+    // reject a present-but-non-string here. (requestedSessionName is exempt: it routes
+    // through validateSessionName, which type-checks and fails soft to pending.)
+    for (const field of ['repositoryRoot', 'claudeCodeVersion', 'agentType'] as const) {
+      if (p[field] !== undefined && typeof p[field] !== 'string') {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session ${field} must be a string when present`, { field });
+      }
+    }
+    // `capabilities` is the one ARRAY-typed untrusted field. It is JSON.stringify'd into
+    // capabilities_json at register (which never throws for a non-array), then JSON.parse'd
+    // and `.includes()`-ed by resolveReadiness on a later signal_readiness — where a
+    // non-array (boolean/number/object) throws a raw TypeError mislabeled as DATABASE_ERROR.
+    // Reject a present-but-non-array value here with a clean PROTOCOL_VIOLATION.
+    if (p.capabilities !== undefined && !Array.isArray(p.capabilities)) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session capabilities must be an array when present', { field: 'capabilities' });
+    }
+    // The register frame's role is the connection's declared authority role. It is NOT a
+    // privilege the broker grants: what a role can DO is enforced elsewhere (assertAllowed
+    // per-operation), and for adapter-aware registrations evaluateRegistration cross-checks
+    // that the adapter DECLARATION's role equals this authority role (FORBIDDEN_ROLE on
+    // mismatch — PR #4 trust boundary). The trusted-evidence award is bound to exact
+    // identity and cannot be forged by role choice. So role is read from the register frame
+    // (not cached from hello) by design; there is no self-promotion path.
     const role = p.role && isComponentRole(p.role) ? p.role : ComponentRole.MCP;
     // OPT-IN adapter enforcement. The adapter frame carries ONLY an untrusted
     // DECLARATION (id/version/role/declaredCapabilities). The TRUSTED evidence used to
@@ -326,11 +399,28 @@ export class BrokerDaemon {
       supersede: p.supersede === true,
       ...(p.repositoryRoot !== undefined ? { repositoryRoot: p.repositoryRoot } : {}),
       ...(p.claudeCodeVersion !== undefined ? { claudeCodeVersion: p.claudeCodeVersion } : {}),
+      // Beta.4 (ADR 0012): optional name request + agent type. The store awards the
+      // name (active) or falls to pending_name; never fails registration over it.
+      ...(p.requestedSessionName !== undefined ? { requestedSessionName: p.requestedSessionName } : {}),
+      ...(p.agentType !== undefined ? { agentType: p.agentType } : {}),
     });
     this.connAuth.set(conn.id, auth);
-    // Awarded support is in-memory only (no schema change); surfaced in the ack ONLY
-    // for adapter-aware registrations, so a legacy ack is byte-identical to before.
-    const ackPayload: Record<string, unknown> = { sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId, role: auth.role, epoch: auth.epoch, generation: auth.generation };
+    // Composition (ADR 0012 §5 + PR #4): the register ack carries THREE additive,
+    // orthogonal field-sets on top of the frozen base (sessionId/instanceId/
+    // componentInstanceId/role/epoch/generation):
+    //   • beta.4 naming — sessionNameState + awardedSessionName (present once a name is
+    //     awarded or pending);
+    //   • PR #4 enforcement — awardedSupport, present ONLY for adapter-aware
+    //     registrations (in-memory award; no schema change; a legacy ack is byte-identical).
+    // All are unknown-field-tolerant, so the two feature lines compose without touching
+    // the frozen wire bytes. The connAwarded map is set here (success) and was already
+    // cleared at the start of this attempt, so a stale award can never survive.
+    const ackPayload: Record<string, unknown> = {
+      sessionId: auth.sessionId, instanceId: auth.instanceId, componentInstanceId: auth.componentInstanceId,
+      role: auth.role, epoch: auth.epoch, generation: auth.generation,
+      ...(auth.sessionNameState !== undefined ? { sessionNameState: auth.sessionNameState } : {}),
+      ...(auth.awardedSessionName != null ? { awardedSessionName: auth.awardedSessionName } : {}),
+    };
     if (enforcement) {
       this.connAwarded.set(conn.id, enforcement.awarded);
       ackPayload.awardedSupport = enforcement.awarded;
@@ -338,10 +428,21 @@ export class BrokerDaemon {
     this.reply(conn, 'register_session_ack', ackPayload, frame.requestId);
   }
 
+  private onRenameSession(conn: ServerConn, frame: Frame): void {
+    // Beta.4 (ADR 0012 D4): choose/change the session's human-readable name. This is
+    // the resolution path for a session stranded in pending_name (e.g. two sessions
+    // launched from the same project picked the same suggested name). mcp-role only;
+    // SESSION_NAME_TAKEN / INVALID_SESSION_NAME surface to the model so it can retry.
+    const auth = this.requireAuth(conn);
+    const p = (frame.payload ?? {}) as { name?: string };
+    const r = this.store.renameSession(auth, p.name as string);
+    this.reply(conn, 'rename_session_ack', { name: r.name, sessionNameState: r.state }, frame.requestId);
+  }
+
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { alias: string };
-    const r = this.store.registerAlias(auth, p.alias);
+    const p = (frame.payload ?? {}) as { alias?: string };
+    const r = this.store.registerAlias(auth, p.alias as string);
     this.reply(conn, 'register_alias_ack', r, frame.requestId);
   }
 
@@ -366,7 +467,8 @@ export class BrokerDaemon {
   private onCheckpointPull(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number };
-    const pending = this.delivery.pendingForSession(auth, p.limit !== undefined ? { limit: p.limit } : {});
+    const limit = this.validatedLimit(p.limit);
+    const pending = this.delivery.pendingForSession(auth, limit !== undefined ? { limit } : {});
     // Mark them injected (transport_written) — ack deadline starts now. markInjected
     // reports only NEWLY-injected ids; an already-injected message re-selected after
     // an ack-timeout requeue is re-armed but NOT reported, so its body is not
@@ -375,10 +477,28 @@ export class BrokerDaemon {
     const marked = this.delivery.markInjected(auth, pending.map((m) => m.messageId));
     const markedSet = new Set(marked);
     this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
-    const messages = pending.filter((m) => markedSet.has(m.messageId)).map((m) => {
-      const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
-      return injectionId ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } } : m;
-    });
+    // ADR 0012 D5: injecting a body at a checkpoint is MEANINGFUL recipient activity, so
+    // it must refresh the 15-day idle timer — on the MCP checkpoint path too, not only
+    // the hook path (onCheckpointPullHook → delivery.checkpointPull → refreshActivity).
+    // Only when a body was actually (newly) injected: an empty/recovery-only pull is not
+    // meaningful (mirrors the body-push guard in delivery.checkpointPull).
+    if (marked.length > 0) this.store.refreshMeaningfulActivity(auth.sessionId);
+    // LAYER-3 INVARIANT (see the promise on lines above + delivery.checkpointPull):
+    // a returned body must NEVER lack a valid injection id. `marked` already contains
+    // only messages whose receipts.issue() succeeded, so injectionIdFor() is expected
+    // non-null — but ENFORCE it structurally rather than trust it: if the id is somehow
+    // absent (race / concurrent deletion / corruption) DROP the body (never present one
+    // without a referable id for ack/reply), mirroring the hook path's body-suppress.
+    const messages = pending
+      .filter((m) => markedSet.has(m.messageId))
+      .flatMap((m) => {
+        const injectionId = this.delivery.injectionIdFor(m.messageId, auth.epoch);
+        if (!injectionId) {
+          this.audit('INJECTION_ID_MISSING_BODY_SUPPRESSED', { sessionId: auth.sessionId, messageId: m.messageId });
+          return [];
+        }
+        return [{ ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: injectionId } }];
+      });
     this.reply(conn, 'checkpoint_pull_ack', { messages }, frame.requestId);
   }
 
@@ -391,8 +511,9 @@ export class BrokerDaemon {
   private onCheckpointPullHook(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { checkpointId?: string; limit?: number };
-    const checkpointId = p.checkpointId ?? this.ids.next();
-    const messages = this.delivery.checkpointPull(auth, checkpointId, p.limit ?? 10);
+    const limit = this.validatedLimit(p.limit);
+    const checkpointId = this.optString(p.checkpointId, 'checkpointId') ?? this.ids.next();
+    const messages = this.delivery.checkpointPull(auth, checkpointId, limit ?? 10);
     if (messages.length > 0) {
       this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
     }
@@ -426,6 +547,11 @@ export class BrokerDaemon {
     const p = (frame.payload ?? {}) as { mode?: string };
     const mode = (['active', 'paused', 'do_not_disturb', 'manual_checkpoint'].includes(p.mode ?? '') ? p.mode : 'active') as ReceiveControl;
     this.controls.setControl(auth.sessionId, mode);
+    // ADR 0012 D5: an intentional pause/resume/DND control change is MEANINGFUL activity
+    // and must refresh the 15-day idle timer — a user who explicitly pauses a session has
+    // not abandoned it. (refreshMeaningfulActivity is guarded on expired_at IS NULL, so it
+    // never revives a tombstone.)
+    this.store.refreshMeaningfulActivity(auth.sessionId);
     this.audit('CONTROL_SET', { sessionId: auth.sessionId, mode });
     this.reply(conn, 'set_control_ack', { sessionId: auth.sessionId, mode }, frame.requestId);
   }
@@ -448,7 +574,9 @@ export class BrokerDaemon {
     assertAllowed(auth.role, Operation.DEAD_LETTER);
     const p = (frame.payload ?? {}) as { action?: string; messageId?: string };
     if (p.action === 'inspect') {
-      if (!p.messageId) { this.reply(conn, 'error', { code: XBusErrorCode.PROTOCOL_VIOLATION, message: 'inspect requires messageId' }, frame.requestId); return; }
+      // messageId must be a non-empty STRING (a boolean would throw ERR_INVALID_ARG_TYPE at
+      // the SQL bind in deadLetters.inspect; check the type, not just falsiness).
+      if (typeof p.messageId !== 'string' || !p.messageId) { this.reply(conn, 'error', { code: XBusErrorCode.PROTOCOL_VIOLATION, message: 'inspect requires messageId' }, frame.requestId); return; }
       const record = this.deadLetters.inspect(p.messageId);
       this.reply(conn, 'dead_letter_ack', { record }, frame.requestId);
       return;
@@ -461,7 +589,10 @@ export class BrokerDaemon {
   private onBlockPeer(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { alias?: string; unblock?: boolean };
-    if (!p.alias) throw new XBusError(XBusErrorCode.INVALID_ALIAS, 'alias required');
+    // Reject a non-string (or empty) alias here: the guard must check the TYPE, not just
+    // falsiness — a numeric alias would otherwise reach ControlsStore.blockedAliasCi
+    // .toLowerCase() and throw a raw TypeError mislabeled as DATABASE_ERROR "internal error".
+    if (typeof p.alias !== 'string' || !p.alias) throw new XBusError(XBusErrorCode.INVALID_ALIAS, 'alias required');
     if (p.unblock) this.controls.unblockPeer(auth.sessionId, p.alias);
     else this.controls.blockPeer(auth.sessionId, p.alias, () => this.ids.next());
     this.reply(conn, 'block_peer_ack', { alias: p.alias, blocked: !p.unblock }, frame.requestId);
@@ -469,17 +600,30 @@ export class BrokerDaemon {
 
   private onAck(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { messageId: string; status: 'accepted' | 'rejected'; note?: string; injectionId?: string };
-    const r = this.delivery.ack(auth, { messageId: p.messageId, status: p.status, ...(p.note !== undefined ? { note: p.note } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) });
+    const p = (frame.payload ?? {}) as { messageId?: string; status?: 'accepted' | 'rejected'; note?: string; injectionId?: string };
+    // Validate required untrusted fields → clean PROTOCOL_VIOLATION (an undefined messageId
+    // would otherwise reach a SQL bind and throw a raw error mislabeled as DATABASE_ERROR).
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'ack requires a messageId');
+    if (p.status !== 'accepted' && p.status !== 'rejected') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "ack requires status 'accepted' or 'rejected'");
+    const note = this.optString(p.note, 'note');
+    const injectionId = this.optString(p.injectionId, 'injectionId');
+    const r = this.delivery.ack(auth, { messageId: p.messageId, status: p.status, ...(note !== undefined ? { note } : {}), ...(injectionId !== undefined ? { injectionId } : {}) });
     this.reply(conn, 'ack_message_ack', r, frame.requestId);
   }
 
   private onReply(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { messageId: string; text: string; outcome: 'completed' | 'failed' | 'partial'; idempotencyKey?: string; metadata?: Record<string, string>; injectionId?: string };
+    const p = (frame.payload ?? {}) as { messageId?: string; text?: string; outcome?: 'completed' | 'failed' | 'partial'; idempotencyKey?: string; metadata?: Record<string, string>; injectionId?: string };
+    // Validate required untrusted fields → clean PROTOCOL_VIOLATION (an undefined messageId
+    // would otherwise reach a SQL bind and throw a raw error mislabeled as DATABASE_ERROR).
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires a messageId');
+    if (typeof p.text !== 'string') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires text');
+    if (p.outcome !== 'completed' && p.outcome !== 'failed' && p.outcome !== 'partial') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "reply requires outcome 'completed' | 'failed' | 'partial'");
+    const idempotencyKey = this.optString(p.idempotencyKey, 'idempotencyKey');
+    const replyInjectionId = this.optString(p.injectionId, 'injectionId');
     const r = this.delivery.reply(
       auth,
-      { messageId: p.messageId, text: p.text, outcome: p.outcome, ...(p.idempotencyKey !== undefined ? { idempotencyKey: p.idempotencyKey } : {}), ...(p.metadata !== undefined ? { metadata: p.metadata } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) },
+      { messageId: p.messageId, text: p.text, outcome: p.outcome, ...(idempotencyKey !== undefined ? { idempotencyKey } : {}), ...(p.metadata !== undefined ? { metadata: p.metadata } : {}), ...(replyInjectionId !== undefined ? { injectionId: replyInjectionId } : {}) },
       (recipientSessionId) => this.allocSequence(recipientSessionId),
     );
     this.reply(conn, 'reply_message_ack', r, frame.requestId);
@@ -488,23 +632,29 @@ export class BrokerDaemon {
   private onInbox(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number; markInjected?: boolean; checkpointId?: string };
+    const limit = this.validatedLimit(p.limit);
+    const checkpointId = this.optString(p.checkpointId, 'checkpointId');
     if (p.markInjected === false) {
       // Peek: list without marking injected / issuing a receipt.
-      const peek = this.delivery.pendingForSession(auth, p.limit !== undefined ? { limit: p.limit } : {});
+      const peek = this.delivery.pendingForSession(auth, limit !== undefined ? { limit } : {});
       this.reply(conn, 'inbox_ack', { messages: peek }, frame.requestId);
       return;
     }
     // §1: inbox VIEW — body included once (first injection), already-presented
     // entries return metadata + bodyIncluded:false (no model-visible duplicate).
-    const messages = this.delivery.inboxView(auth, p.checkpointId ?? this.ids.next(), p.limit ?? 50);
+    const messages = this.delivery.inboxView(auth, checkpointId ?? this.ids.next(), limit ?? 50);
     this.reply(conn, 'inbox_ack', { messages }, frame.requestId);
   }
 
   private onRedeliver(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { messageId?: string; reason?: string };
-    if (!p.messageId) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'messageId required');
-    const entry = this.delivery.redeliver(auth, p.messageId, p.reason ?? 'explicit');
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'messageId required');
+    // `reason` is untrusted + optional: only honor a string (it is later .slice()'d for the
+    // audit record); a non-string falls back to the default rather than throwing a raw
+    // TypeError mislabeled as DATABASE_ERROR.
+    const reason = typeof p.reason === 'string' ? p.reason : 'explicit';
+    const entry = this.delivery.redeliver(auth, p.messageId, reason);
     if (!entry) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such message for this session');
     this.reply(conn, 'redeliver_ack', { entry, warning: 'the receiving model may process this request twice' }, frame.requestId);
   }
@@ -529,7 +679,7 @@ export class BrokerDaemon {
   private onListSessions(conn: ServerConn, frame: Frame): void {
     this.requireAuth(conn);
     const rows = this.db
-      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at FROM sessions s`)
+      .prepare(`SELECT s.session_id, s.automatic_alias, s.project_id, s.project_alias, s.state, s.receive_mode, s.readiness, s.readiness_updated_at, s.last_checkpoint_at, s.session_name, s.session_name_state, s.expired_at FROM sessions s`)
       .all() as Array<Record<string, unknown>>;
     const sessions = rows.map((r) => {
       const sid = r.session_id as string;
@@ -537,6 +687,12 @@ export class BrokerDaemon {
       const unacked = (this.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=? AND state='transport_written'`).get(sid) as { n: number }).n;
       const aliases = (this.db.prepare(`SELECT alias FROM aliases WHERE session_id=? AND active=1 AND alias NOT LIKE 'session-%'`).all(sid) as Array<{ alias: string }>).map((a) => a.alias);
       return {
+        // Beta.4: the human-readable session NAME (the primary user-facing address)
+        // + its lifecycle state, so peers can discover a session by name and see
+        // whether it is active / pending (unroutable) / expired. ADR 0012 D2/D3.
+        name: (r.session_name as string) ?? null,
+        sessionNameState: (r.session_name_state as string) ?? 'unnamed',
+        expired: (r.expired_at as string | null) !== null,
         alias: aliases[0] ?? (r.automatic_alias as string),
         project: (r.project_alias as string) ?? (r.project_id as string),
         // connection (is a socket attached?), receiveMode (HOW it takes delivery),
@@ -607,11 +763,44 @@ export class BrokerDaemon {
   }
 
   private onStatus(conn: ServerConn, frame: Frame): void {
+    // Report the CALLER's own broker-owned identity. The session is keyed by the
+    // AUTHENTICATED connection (this.connAuth), never a caller-supplied id — a caller
+    // cannot spoke another session's id to read its state. This is a pure read: a plain
+    // SELECT that never refreshes meaningful activity and never revives an expired row.
     const auth = this.connAuth.get(conn.id);
+    let session: Record<string, unknown> | null = null;
+    if (auth) {
+      const row = this.db.prepare(
+        `SELECT session_name AS name, normalized_session_name AS norm, session_name_state AS state,
+                agent_type AS agentType, cwd, readiness, last_meaningful_activity_at AS lastActivity,
+                expires_at AS expiresAt, expired_at AS expiredAt
+         FROM sessions WHERE session_id=?`,
+      ).get(auth.sessionId) as
+        | { name: string | null; norm: string | null; state: string | null; agentType: string | null; cwd: string | null; readiness: string | null; lastActivity: string | null; expiresAt: string | null; expiredAt: string | null }
+        | undefined;
+      // sessionName reports the ACTIVE display name only; pending/unnamed/retired ⇒ null
+      // (a pending session holds no routable name). session_name_state carries the nuance.
+      const active = row?.state === 'active';
+      session = {
+        sessionId: auth.sessionId,
+        instanceId: auth.instanceId,
+        generation: auth.generation,
+        epoch: auth.epoch,
+        sessionName: active ? (row?.name ?? null) : null,
+        sessionNameState: row?.state ?? 'unnamed',
+        agentType: row?.agentType ?? null,
+        cwd: row?.cwd ?? null,
+        readiness: row?.readiness ?? null,
+        lastMeaningfulActivityAt: row?.lastActivity ?? null,
+        expiresAt: row?.expiresAt ?? null,
+        expired: row?.expiredAt != null,
+      };
+    }
     const payload = {
       broker: 'connected',
       brokerInstanceId: this.brokerInstanceId,
-      session: auth ? { sessionId: auth.sessionId, instanceId: auth.instanceId, generation: auth.generation } : null,
+      compatibilityId: BUILD_ID,
+      session,
     };
     this.reply(conn, 'get_status_ack', payload, frame.requestId);
   }

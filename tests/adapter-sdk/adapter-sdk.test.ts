@@ -253,9 +253,17 @@ describe('adapter SDK — compatibility protection (§16.22-25, §14)', () => {
     expect(FROZEN_PROTOCOL_COMPAT).toEqual({ protocol: 1, minProtocol: 1, schema: 5, stp: 1 });
     expect(SUPPORTED_MANIFEST_VERSION).toBe(1);
   });
-  it('23/24. the live protocol + schema constants are unchanged (the SDK did not bump them)', () => {
+  it('23/24. the SDK frozen tuple is independent of the live broker schema', () => {
+    // The adapter SDK pins its TARGET wire tuple at schema 5 (FROZEN_PROTOCOL_COMPAT,
+    // asserted above) — that is the contract an adapter manifest must declare and is
+    // PR #4's territory, deliberately left at s5 while the adapter-broker enforcement
+    // is dormant on this branch. Beta.4 (ADR 0012 §3) moved the LIVE broker schema to
+    // 6 via migration v6, so SCHEMA_VERSION is now 6. The two are intentionally
+    // decoupled: the SDK does not control SCHEMA_VERSION, and the frozen tuple moves
+    // to s6 only when adapters are actually wired to the s6 broker.
     expect(PROTOCOL_VERSION).toBe(1);
-    expect(SCHEMA_VERSION).toBe(5);
+    expect(SCHEMA_VERSION).toBe(6);
+    expect(FROZEN_PROTOCOL_COMPAT.schema).toBe(5);
   });
   it('a manifest whose protocolCompat != the frozen tuple is INCOMPATIBLE', () => {
     expect(() => validateManifest(baseManifest({ protocolCompat: { protocol: 2, minProtocol: 1, schema: 5, stp: 1 } as AdapterManifest['protocolCompat'] }))).toThrow(/xbus-p1-stp1-s5|tuple/);

@@ -14,6 +14,7 @@ import type { Clock, IdGen } from '../shared/clock.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { DeliveryState } from '../protocol/states.js';
 import type { SessionAuthority, SendResult } from './store.js';
+import { MEANINGFUL_ACTIVITY_RETENTION_MS } from './store.js';
 import { ReceiptStore } from './receipts.js';
 import { ControlsStore } from './controls.js';
 import { assertAllowed, Operation, ComponentRole } from '../identity/components.js';
@@ -120,6 +121,19 @@ export class DeliveryOps {
     this.db
       .prepare('INSERT INTO audit_events (audit_id, event_type, actor_session_id, actor_instance_id, message_id, trace_id, safe_metadata_json, created_at) VALUES (?,?,?,?,?,?,?,?)')
       .run(this.ids.next(), eventType, fields.sessionId ?? null, fields.instanceId ?? null, fields.messageId ?? null, null, JSON.stringify(fields), this.clock.nowIso());
+  }
+
+  /**
+   * Beta.4 (ADR 0012 Decision 5): refresh the RECIPIENT's meaningful-activity
+   * timestamp (+ recompute the 15-day expiry). Called from genuinely meaningful
+   * recipient ops — ack, reject, reply, explicit redelivery, and a body-injecting
+   * checkpoint pull — but NEVER from a body-suppressed re-injection, a deferred
+   * (not-ready) pull, or any passive path. Idempotent; runs in the caller's txn.
+   * Skips an already-expired session (a tombstone must not be revived by activity).
+   */
+  private refreshActivity(sessionId: string, now: string): void {
+    const expiresAt = new Date(this.clock.nowMs() + MEANINGFUL_ACTIVITY_RETENTION_MS).toISOString();
+    this.db.prepare('UPDATE sessions SET last_meaningful_activity_at=?, expires_at=?, updated_at=? WHERE session_id=? AND expired_at IS NULL').run(now, expiresAt, now, sessionId);
   }
 
   /**
@@ -270,6 +284,10 @@ export class DeliveryOps {
         // message (no ack, no reply) becomes terminal immediately.
         this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
+      // Beta.4: receiving a body at a checkpoint is meaningful RECIPIENT activity —
+      // but ONLY when a body was actually presented (a body-suppressed re-injection
+      // or an empty pull is not activity). ADR 0012 Decision 5.
+      if (out.length > 0) this.refreshActivity(auth.sessionId, now);
       return out;
     });
   }
@@ -316,6 +334,7 @@ export class DeliveryOps {
         out.push({ ...m, metadata: md });
         this.completeIfNoResponseRequired(m.messageId, m.requiresAck, m.requiresReply, now);
       }
+      if (out.length > 0) this.refreshActivity(auth.sessionId, now); // ADR 0012 D5
       return out;
     });
   }
@@ -355,11 +374,20 @@ export class DeliveryOps {
       allowedActions: m.requiresAck ? ['ack', 'reject', 'reply'] : ['reply'],
     }));
     // 2) already-injected-but-unacked for THIS epoch — body NOT repeated.
+    // The injection id is resolved via a CORRELATED SUBQUERY that pins the CURRENT
+    // (highest logical_injection_number) injection for THIS (message, epoch) — not a
+    // multi-row LEFT JOIN. A plain LEFT JOIN on context_injections returns one row PER
+    // injection, so a message with >1 injection for the epoch (e.g. after an explicit
+    // redelivery bumps logical_injection_number) would (a) be listed multiple times and
+    // (b) surface an arbitrary/stale injection id. Mirrors injectionIdFor(); one row per
+    // transport_written delivery, always carrying the current epoch-bound injection id.
     const rows = this.db
       .prepare(
-        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at, ci.injection_id
+        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at,
+                (SELECT ci.injection_id FROM context_injections ci
+                   WHERE ci.message_id=m.message_id AND ci.recipient_epoch=?
+                   ORDER BY ci.logical_injection_number DESC LIMIT 1) AS injection_id
          FROM deliveries d JOIN messages m ON m.message_id=d.message_id
-         LEFT JOIN context_injections ci ON ci.message_id=m.message_id AND ci.recipient_epoch=?
          WHERE d.recipient_session_id=? AND d.state='${DeliveryState.TRANSPORT_WRITTEN}'
            AND (m.expires_at IS NULL OR m.expires_at > ?)
          ORDER BY m.recipient_sequence ASC LIMIT ?`,
@@ -414,10 +442,19 @@ export class DeliveryOps {
         return null;
       }
       const injection = this.receipts.issue({ messageId, recipientSessionId: auth.sessionId, recipientEpoch: auth.epoch, checkpointId: `redeliver-${this.ids.next()}`, componentId: auth.componentInstanceId, logicalInjectionNumber: maxLogical + 1 });
+      // Invariant (delivery §1): a returned/injected body ALWAYS carries a valid injection
+      // id. If issue() could not mint one (e.g. a concurrent redelivery already took this
+      // logical number → UNIQUE collision), do NOT return a body with a null id — throw so
+      // the whole txn rolls back (no orphaned injection, no bodiless-id presentation). The
+      // caller can retry; the model never sees an un-referenced body.
+      if (!injection?.injectionId) {
+        throw new XBusError(XBusErrorCode.INVALID_RECEIPT, 'redelivery could not allocate an injection id (concurrent redelivery); retry');
+      }
+      this.refreshActivity(auth.sessionId, this.clock.nowIso()); // ADR 0012 D5: explicit redelivery is meaningful
       this.audit('EXPLICIT_REDELIVERY', { sessionId: auth.sessionId, messageId, reason: reason.slice(0, 120), logical: maxLogical + 1 });
       const pm = this.rowToPending(m);
       return {
-        messageId, injectionId: injection?.injectionId ?? null, senderAlias: pm.senderAlias, recipientAlias: pm.recipientAlias,
+        messageId, injectionId: injection.injectionId, senderAlias: pm.senderAlias, recipientAlias: pm.recipientAlias,
         kind: pm.kind, correlationId: pm.correlationId, causationId: pm.causationId, sequence: pm.sequence,
         requiresAck: pm.requiresAck, requiresReply: pm.requiresReply, state: 'context_injected_unacknowledged',
         bodyAlreadyPresented: true, bodyIncluded: true, text: pm.text, metadata: pm.metadata,
@@ -442,7 +479,15 @@ export class DeliveryOps {
     // injected message is re-armed but not reported), so returning only those
     // bodies upholds the Layer-3 no-repeat-body invariant on this path too.
     const newlyInjected = new Set(this.markInjectedFor(auth, pending.map((m) => m.messageId)));
-    return pending.filter((m) => newlyInjected.has(m.messageId));
+    // Attach the epoch-bound injection id to each returned body, consistent with every
+    // other injecting path (checkpointPull / checkpointPullForced / daemon.onCheckpointPull
+    // / redeliver). Deprecated + test-only, but keeping the Layer-3 "a returned body
+    // carries a valid injection id" invariant uniform across ALL injecting paths avoids a
+    // latent gap if this helper is ever reused.
+    return pending.filter((m) => newlyInjected.has(m.messageId)).map((m) => {
+      const id = this.injectionIdFor(m.messageId, auth.epoch);
+      return id ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: id } } : m;
+    });
   }
 
   private pendingForSessionId(sessionId: string, limit: number): PendingMessage[] {
@@ -622,6 +667,7 @@ export class DeliveryOps {
         .prepare('INSERT INTO receipts (receipt_id, message_id, receiver_session_id, receiver_instance_id, receiver_generation, receipt_type, status, note, body_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
         .run(this.ids.next(), input.messageId, auth.sessionId, auth.instanceId, auth.epoch, 'ack', input.status, input.note ?? null, msg.body_hash, now);
       if (injectionId) this.receipts.consume(injectionId, 'ack');
+      this.refreshActivity(auth.sessionId, now); // ADR 0012 D5: ack/reject is meaningful
       this.audit('ACK', { sessionId: auth.sessionId, messageId: input.messageId, status: input.status });
       return { state: target, duplicate: false };
     });
@@ -643,19 +689,41 @@ export class DeliveryOps {
       if (!orig) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such message');
       if (orig.recipient_session_id !== auth.sessionId) throw new XBusError(XBusErrorCode.NOT_RECIPIENT, 'not the recipient of this message');
 
-      let injectionId: string | null = null;
-      if (this.requireReceipt) {
-        const v = this.receipts.authorize('reply', { messageId: input.messageId, sessionId: auth.sessionId, epoch: auth.epoch, ...(input.injectionId !== undefined ? { injectionId: input.injectionId } : {}) });
-        injectionId = v.injectionId;
-      }
-
-      // Idempotency: a repeated reply with the same key returns the same reply.
+      // Idempotency FIRST (before receipt authorization) — symmetric with ack()
+      // (see the comment there). On the first reply we consume the one-time injection
+      // receipt (below); with requireReceipt=true (the PRODUCTION default) a benign
+      // same-key retry that re-ran authorize() FIRST would find the already-consumed
+      // receipt and throw RECEIPT_REPLAYED before reaching this short-circuit — turning
+      // an idempotent no-op into a hard error and breaking the documented
+      // "Idempotent on (receiver, idempotencyKey)" contract. Checking the duplicate
+      // first makes a genuine retry a clean no-op regardless of receipt-replay state.
       if (input.idempotencyKey) {
         const dup = this.db.prepare('SELECT message_id, correlation_id, recipient_session_id, recipient_alias, recipient_sequence FROM messages WHERE sender_session_id=? AND idempotency_key=?').get(auth.sessionId, input.idempotencyKey) as
           | { message_id: string; correlation_id: string; recipient_session_id: string; recipient_alias: string; recipient_sequence: number } | undefined;
         if (dup) {
           return { messageId: dup.message_id, replyMessageId: dup.message_id, correlationId: dup.correlation_id, recipientSessionId: dup.recipient_session_id, recipientAlias: dup.recipient_alias, sequence: dup.recipient_sequence, state: 'completed', deduplicated: true };
         }
+      }
+
+      // Connection-bound authorization (ADR 0006) for a FIRST (non-duplicate) reply:
+      // authority is the authenticated session+epoch + a recorded injection, consumed
+      // once below. Runs only after the idempotency short-circuit so a benign retry is
+      // never mis-flagged as a receipt replay.
+      let injectionId: string | null = null;
+      if (this.requireReceipt) {
+        const v = this.receipts.authorize('reply', { messageId: input.messageId, sessionId: auth.sessionId, epoch: auth.epoch, ...(input.injectionId !== undefined ? { injectionId: input.injectionId } : {}) });
+        injectionId = v.injectionId;
+      }
+
+      // Beta.4 (ADR 0012 D6): the reply's recipient is the ORIGINAL SENDER. If that
+      // session has expired (>15d idle), it is unroutable — queuing a reply to it
+      // would create a permanent orphan the sweep won't reclaim (its CAS requires
+      // expired_at IS NULL). Reject FINAL, symmetric with store.send()'s guard. This
+      // is AFTER the idempotency short-circuit, so a genuine duplicate still no-ops.
+      const origExpired = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(orig.sender_session_id) as { expired_at: string | null } | undefined;
+      if (origExpired?.expired_at) {
+        this.audit('REPLY_REJECTED_RECIPIENT_EXPIRED', { sessionId: auth.sessionId, messageId: input.messageId });
+        throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'the original sender session has expired (no activity for 15 days); cannot deliver the reply');
       }
 
       const replyId = this.ids.next();
@@ -675,6 +743,7 @@ export class DeliveryOps {
         .prepare('INSERT OR IGNORE INTO receipts (receipt_id, message_id, receiver_session_id, receiver_instance_id, receiver_generation, receipt_type, status, body_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
         .run(this.ids.next(), input.messageId, auth.sessionId, auth.instanceId, auth.epoch, 'reply', input.outcome, orig.body_hash, now);
       if (injectionId) this.receipts.consume(injectionId, 'reply');
+      this.refreshActivity(auth.sessionId, now); // ADR 0012 D5: replying is meaningful
       this.audit('REPLY', { sessionId: auth.sessionId, messageId: input.messageId, replyMessageId: replyId });
       return { messageId: input.messageId, replyMessageId: replyId, correlationId: orig.correlation_id, recipientSessionId: orig.sender_session_id, recipientAlias: orig.sender_alias, sequence, state: DeliveryState.QUEUED, deduplicated: false };
     });

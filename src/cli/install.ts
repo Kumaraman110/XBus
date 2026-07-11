@@ -24,6 +24,7 @@ import { XBUS_VERSION } from '../protocol/version.js';
 import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, type InstallManifest } from '../launcher/install-paths.js';
 import { validateArtifact } from '../shared/artifact-contract.js';
 import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
+import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
 
 export interface InstallOptions {
   /** Source plugin root (the built repo, or a staged artifact). Default cwd. */
@@ -36,6 +37,18 @@ export interface InstallOptions {
   json?: boolean;
   /** Injected clock (ISO) for deterministic manifests in tests. */
   nowIso?: string;
+  /** Beta.4 (ADR 0012 D8): also register XBus into the user-scope Claude config so
+   *  plain `claude` discovers it (no --plugin-dir). Default true. Tests/CI may set
+   *  false (plugin-only install) or point `claudeConfigPath` at a temp file. */
+  registerUserScope?: boolean;
+  /** Override the user Claude MCP config path (tests). Default: platform ~/.claude.json. */
+  claudeConfigPath?: string;
+  /** Override the user Claude SETTINGS path where hooks live (tests). Default:
+   *  platform ~/.claude/settings.json. */
+  claudeSettingsPath?: string;
+  /** Absolute node executable path written into the user-scope MCP/hook command.
+   *  Default: the current process's node. */
+  nodePath?: string;
 }
 
 export interface InstallPlan {
@@ -149,6 +162,13 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
   fs.mkdirSync(installRoot, { recursive: true });
   try { assertNotReparse(installRoot); } catch (e) { return { ok: false, dryRun: false, plan, error: (e as Error).message }; }
 
+  // Hoisted so the OUTER catch can REVERSE a completed user-scope registration: if
+  // the user-scope MCP/hooks write succeeded but a LATER step (manifest rewrite,
+  // migration marker) throws, rollback must also unregister the two config files —
+  // otherwise they're orphaned pointing at a plugin dir the rollback just deleted,
+  // with no manifest left for `uninstall` to key off (adversarial-review minor).
+  let userScopeToReverse: Parameters<typeof unregisterUserScope>[0] | undefined;
+
   // Stage into a temp dir alongside the final plugin dir, then swap atomically.
   const staging = path.join(installRoot, `.plugin.staging-${process.pid}`);
   fs.rmSync(staging, { recursive: true, force: true });
@@ -250,6 +270,39 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       return { ok: false, dryRun: false, plan, health, rolledBack: rb, error: `health check failed: ${health.detail}` };
     }
 
+    // Beta.4 (ADR 0012 D8): register XBus into the user-scope Claude config so plain
+    // `claude` discovers it. Transactional inside the manager; a failure here rolls
+    // back the WHOLE install (fail-closed: fully installed or fully reverted). The
+    // installId (ownership tag) is the broker instance-independent install identity.
+    const wantUserScope = opts.registerUserScope !== false;
+    let userScope: InstallManifest['userScope'];
+    if (wantUserScope) {
+      const installId = `xbus-${now.replace(/[:.]/g, '-')}-${process.pid}`;
+      const configPath = opts.claudeConfigPath ?? defaultClaudeConfigPath();
+      const settingsPath = opts.claudeSettingsPath ?? defaultClaudeSettingsPath();
+      const usrOpts = {
+        configPath,
+        settingsPath,
+        nodePath: opts.nodePath ?? process.execPath,
+        serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
+        hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        dataDir,
+        installId,
+      };
+      const usr = registerUserScope(usrOpts);
+      if (usr.ok) userScopeToReverse = usrOpts; // arm the rollback for any LATER throw
+      if (!usr.ok) {
+        const partial: InstallManifest = { schema: 1, name: 'xbus', version: XBUS_VERSION, commit: readCommit(source), buildId: BUILD_ID, installedAt: now, installRoot, pluginDir, dataDir, files, backups };
+        const rb = rollback(installRoot, partial);
+        return { ok: false, dryRun: false, plan, rolledBack: rb, error: `user-scope config registration failed: ${usr.error}` };
+      }
+      userScope = { configPath, settingsPath, registeredAt: now, ...(usr.backupPath ? { backupPath: usr.backupPath } : {}), ...(usr.settingsBackupPath ? { settingsBackupPath: usr.settingsBackupPath } : {}) };
+      // Persist the userScope record + installId into the manifest (rewrite it).
+      const updated: InstallManifest = { ...manifest, installId, userScope };
+      fs.writeFileSync(manifestPath(installRoot), JSON.stringify(updated, null, 2) + '\n');
+      try { hardenFile(manifestPath(installRoot)); } catch { /* best effort */ }
+    }
+
     // After the upgrade commits (runtime installed + health verified),
     // write the durable migration marker so future installers skip the migration (§12).
     // The legacy source root is RETAINED (never deleted on the initial upgrade).
@@ -271,6 +324,10 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     // creation): remove a swapped plugin dir, restore the most recent backup,
     // and clean staging + any partial manifest. Leaves the install root as it was.
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ }
+    // Reverse a COMPLETED user-scope registration first (best-effort), so a throw
+    // after it succeeded does not orphan ~/.claude.json + ~/.claude/settings.json
+    // entries pointing at the plugin dir we are about to delete.
+    if (userScopeToReverse) { try { unregisterUserScope(userScopeToReverse); } catch { /* best effort */ } }
     let rolledBack = false;
     try {
       if (swapped && fs.existsSync(pluginDir)) fs.rmSync(pluginDir, { recursive: true, force: true });
@@ -349,6 +406,24 @@ export function uninstall(opts: UninstallOptions = {}): UninstallResult {
 
   const removed: string[] = [];
   const couldNotRemove: string[] = [];
+  // Beta.4 (ADR 0012 D8): reverse the user-scope Claude config registration FIRST,
+  // removing ONLY the entries THIS install owns (ownership-tagged). The user's other
+  // mcp servers/hooks are never touched. Best-effort: a config-edit failure must not
+  // block removing the plugin/data files.
+  if (manifest.userScope && manifest.installId) {
+    try {
+      const u = unregisterUserScope({
+        configPath: manifest.userScope.configPath,
+        settingsPath: manifest.userScope.settingsPath,
+        nodePath: process.execPath,
+        serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
+        hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        dataDir: manifest.dataDir,
+        installId: manifest.installId,
+      });
+      if (u.removed) removed.push(`user-scope:${manifest.userScope.configPath}`);
+    } catch { couldNotRemove.push(`user-scope:${manifest.userScope.configPath}`); }
+  }
   for (const target of toRemove) {
     try {
       if (fs.existsSync(target)) { fs.rmSync(target, { recursive: true, force: true }); removed.push(target); }

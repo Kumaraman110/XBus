@@ -52,6 +52,33 @@ describe('PR2 §1-§2 — trusted evidence is broker-owned, never from the frame
   });
 });
 
+describe('final-review R12 — malformed untrusted declaredCapabilities fails PROTOCOL_VIOLATION (not a raw TypeError)', () => {
+  // The adapterRegistration frame is UNTRUSTED and cast unchecked at the daemon boundary.
+  // A malformed declaredCapabilities must be rejected with a clean PROTOCOL_VIOLATION
+  // BEFORE confirmCapabilities/toVerified dereference it — never a raw TypeError surfaced
+  // as a mislabeled internal error. Role still matches authority so we reach the shape check.
+  const bad = (declaredCapabilities: unknown): AdapterRegistrationDeclaration =>
+    ({ adapterId: 'shape', adapterVersion: '1', role: ComponentRole.HOOK, declaredCapabilities } as unknown as AdapterRegistrationDeclaration);
+  const call = (declaredCapabilities: unknown): unknown =>
+    evaluateRegistration({ receiveMode: 'poll_only', declaration: bad(declaredCapabilities), authority: HOOK_AUTH, trustedEvidence: undefined });
+
+  it('omitted declaredCapabilities throws PROTOCOL_VIOLATION (not TypeError)', () => {
+    expect(() => call(undefined)).toThrow(XBusError);
+    try { call(undefined); } catch (e) { expect((e as XBusError).code).toBe('XBUS_PROTOCOL_VIOLATION'); }
+  });
+  it('empty-object declaredCapabilities (missing groups) throws PROTOCOL_VIOLATION', () => {
+    expect(() => call({})).toThrow(/declaredCapabilities\.receive/);
+  });
+  it('a group present but a leaf not a CapabilityState throws PROTOCOL_VIOLATION', () => {
+    const caps = emptyCapabilities() as unknown as Record<string, Record<string, unknown>>;
+    caps.receive.manualPull = 'bogus-state';
+    expect(() => call(caps)).toThrow(/manualPull is not a valid CapabilityState/);
+  });
+  it('a well-formed emptyCapabilities() declaration is accepted (no false positive)', () => {
+    expect(() => call(emptyCapabilities())).not.toThrow();
+  });
+});
+
 describe('PR2 §3 — fail closed when broker evidence is absent', () => {
   it('an adapter-aware registration WITHOUT broker evidence awards nothing & rejects advanced modes', () => {
     // requests hook_checkpoint, declares it verified, but broker has NO evidence
@@ -135,6 +162,24 @@ describe('PR2 §4 — evidence is bound to exact adapter identity (registry reje
     r3.record(brokerEvidence({ adapterId: 'D', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }));
     expect(r3.resolve({ adapterId: 'D', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-2' }).reason).toBe('build_mismatch');
   });
+
+  it('final-review #7: buildId binding is SYMMETRIC (presence/absence is part of the exact tuple)', () => {
+    // Evidence PINNED to a build must NOT resolve for a query that omits buildId
+    // (adapter can\'t drop buildId to borrow build-scoped evidence).
+    const rPinned = new TrustedEvidenceRegistry();
+    rPinned.record(brokerEvidence({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }));
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK }).ok).toBe(false);
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK }).reason).toBe('build_mismatch');
+    // Build-AGNOSTIC evidence (no buildId) must NOT resolve for a query that supplies one
+    // (adapter can\'t invent a buildId to match broad evidence under a narrow claim).
+    const rAgnostic = new TrustedEvidenceRegistry();
+    rAgnostic.record(brokerEvidence({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK })); // no buildId
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'anything' }).ok).toBe(false);
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'anything' }).reason).toBe('build_mismatch');
+    // Exact match (both absent) still resolves; (both present + equal) still resolves.
+    expect(rAgnostic.resolve({ adapterId: 'F', adapterVersion: '1', role: ComponentRole.HOOK }).ok).toBe(true);
+    expect(rPinned.resolve({ adapterId: 'E', adapterVersion: '1', role: ComponentRole.HOOK, buildId: 'build-1' }).ok).toBe(true);
+  });
 });
 
 describe('PR2 §5 — declared role must match authenticated authority', () => {
@@ -169,15 +214,23 @@ describe('PR2 §10 — compatibility invariants + legacy no-op', () => {
     expect(modeRequires('live')).toBe('livePush');
     expect(modeRequires('poll_only')).toBe('none');
   });
-  it('the three frozen wire axes are unchanged', () => {
+  it('the protocol + STP wire axes remain frozen at 1 (proto/STP unchanged by beta.4)', () => {
+    // PR #4 changed NEITHER proto NOR STP; beta.4 also leaves both frozen. Only the
+    // additive DB schema moved (see below). These two are the true wire-compat axes.
     expect(PROTOCOL_VERSION).toBe(1);
     expect(MIN_SUPPORTED_PROTOCOL_VERSION).toBe(1);
     expect(STP_VERSION).toBe(1);
-    expect(SCHEMA_VERSION).toBe(5);
   });
-  it('the DB schema is still at migration 5; BUILD_ID unchanged', () => {
-    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(5);
-    expect(BUILD_ID).toBe('xbus-p1-stp1-s5');
+  it('the live DB schema is at migration 6 / xbus-p1-stp1-s6 post-composition (beta.4 ADR 0012 §3)', () => {
+    // PR #4 itself made NO schema change (it was s5 on its own branch). Composing it
+    // with beta.4 — whose owner-approved migration v6 adds the additive session-name +
+    // 15-day-retention columns — advances the LIVE schema to 6 and the compatibility
+    // id to xbus-p1-stp1-s6 (proto+STP still 1). Fail-closed by design: a beta.3/PR#4
+    // s5 client is told to upgrade. The FROZEN adapter-SDK compat contract that must
+    // stay byte-pinned at schema 5 lives separately in tests/adapter-sdk/adapter-sdk.test.ts.
+    expect(SCHEMA_VERSION).toBe(6);
+    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(6);
+    expect(BUILD_ID).toBe('xbus-p1-stp1-s6');
   });
 });
 
@@ -198,5 +251,36 @@ describe('PR2 — provenance helpers (sanity)', () => {
     const ev = buildValidationEvidence('fake_runtime', { bootedAndRegistered: true });
     const se = { ...emptyStructuredEvidence('s', '1'), source: 'fake_runtime' as EvidenceSource };
     expect(computeAwardedSupport(verified, ev, se, true).validationLevel).toBe('conformance_tested');
+  });
+});
+
+describe('re-review R4: secret- and telemetry-redaction are tracked INDEPENDENTLY', () => {
+  // The two redaction properties are orthogonal and are now stored/consumed independently
+  // (secretRedactionVerified / telemetryRedactionVerified), with the deprecated single
+  // `redactionVerified` flag feeding BOTH for back-compat. These flags contribute to the
+  // full-runtime security posture; this test pins that evidence resolves + awards WITHOUT
+  // error under each combination and that the deprecated flag is honored (no crash on the
+  // absent specific flags), i.e. the split did not regress the trust path.
+  const D = (o: Partial<AdapterRegistrationDeclaration> = {}) => decl({ role: ComponentRole.MCP, declaredCapabilities: declaring({ lifecycleCheckpoint: 'declared' }, { acknowledgements: 'declared', correlatedReplies: 'declared' }), ...o });
+  const auth = { role: ComponentRole.MCP, sessionId: 's' };
+  function realEvidence(over: Partial<BrokerTrustedEvidence['security']>): BrokerTrustedEvidence {
+    return brokerEvidence({
+      source: 'real_runtime_validation', role: ComponentRole.MCP,
+      capabilities: { sendVerified: true, manualReceiveVerified: true, checkpointReceiveVerified: true, liveReceiveVerified: false, ackReplyVerified: true },
+      durability: { brokerRestartVerified: true, reconnectVerified: true, queuedDeliveryVerified: true },
+      security: { fencingVerified: true, packagedRuntimeVerified: true, ...over },
+    });
+  }
+  it('resolves + awards under each redaction combination (secret-only, telemetry-only, both)', () => {
+    for (const sec of [true, false]) for (const tel of [true, false]) {
+      const r = evaluateRegistration({ receiveMode: 'hook_checkpoint', declaration: D(), authority: auth, trustedEvidence: realEvidence({ secretRedactionVerified: sec, telemetryRedactionVerified: tel }) })!;
+      expect(r.awarded.maximumDeliveryTier).toBe('T3'); // checkpoint-mode delivery award (from verified caps)
+      expect(r.awarded.validationLevel).toBe('real_runtime_validated');
+    }
+  });
+  it('deprecated single redactionVerified flag is honored for BOTH (back-compat, no crash on absent specific flags)', () => {
+    const r = evaluateRegistration({ receiveMode: 'hook_checkpoint', declaration: D(), authority: auth, trustedEvidence: realEvidence({ redactionVerified: true }) })!;
+    expect(r.awarded.maximumDeliveryTier).toBe('T3');
+    expect(r.awarded.validationLevel).toBe('real_runtime_validated');
   });
 });

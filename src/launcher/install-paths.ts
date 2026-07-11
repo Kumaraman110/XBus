@@ -38,6 +38,21 @@ export interface InstallManifest {
   /** sha256 of the installed artifact's SHA256SUMS — the exact distributable
    *  identity (see ADR 0011). Absent for a dev install from a built repo (no SHA256SUMS). */
   artifactManifestSha256?: string;
+  /** Beta.4 (ADR 0012 D8): a unique id for THIS install, used as the ownership tag
+   *  on user-scope Claude config entries so uninstall removes only what we created. */
+  installId?: string;
+  /** Beta.4: record of the user-scope Claude MCP+hooks registration (so uninstall
+   *  can reverse it, and doctor/repair can detect drift). Absent if not registered.
+   *  MCP servers live in configPath (~/.claude.json); hooks live in settingsPath
+   *  (~/.claude/settings.json) — two distinct files Claude Code reads separately. */
+  userScope?: {
+    configPath: string;
+    settingsPath: string;
+    registeredAt: string;
+    /** Pre-install backups (restorable). */
+    backupPath?: string;
+    settingsBackupPath?: string;
+  };
 }
 
 export function readInstallManifest(installRoot: string): InstallManifest | null {

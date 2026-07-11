@@ -19,13 +19,28 @@ export interface HardenResult {
   detail: string;
 }
 
-/** Harden a directory so only the current user (+ SYSTEM on Windows) can access it. */
+/**
+ * Harden a directory so only the current user (+ SYSTEM on Windows) can access it.
+ *
+ * Windows ordering hazard (proven on a real host): `/inheritance:r` removes inherited
+ * ACEs. Any child dir/file that ALREADY existed under `dir` was relying on that
+ * inheritance for its own grant — so restricting the parent ORPHANS the pre-existing
+ * child, and the current process then gets EPERM on open/scandir/write inside it (the
+ * child even reads as absent to existsSync). To keep hardening safe regardless of call
+ * order, after restricting the dir we recursively RE-GRANT the two safe principals
+ * across the subtree (add-only `/grant … /T`), which restores access to orphaned
+ * children WITHOUT re-introducing inheritance or any broad principal.
+ */
 export function hardenDir(dir: string): HardenResult {
   if (process.platform !== 'win32') {
     fs.chmodSync(dir, 0o700);
     return { applied: true, method: 'chmod', detail: '0700' };
   }
-  return icaclsRestrict(dir);
+  const r = icaclsRestrict(dir);
+  // Re-establish access to any pre-existing children orphaned by /inheritance:r.
+  // Best-effort: never downgrade the restrict result on a recurse hiccup.
+  reestablishAccess(dir);
+  return r;
 }
 
 /** Harden a file so only the current user (+ SYSTEM on Windows) can read/write it. */
@@ -37,6 +52,11 @@ export function hardenFile(file: string): HardenResult {
   return icaclsRestrict(file);
 }
 
+/** Bound every icacls spawn so a hung subprocess (e.g. a slow network share, or a
+ *  degraded-ACL retry path reached from the hook) can never block indefinitely — a
+ *  timeout throws, is caught, and degrades best-effort. */
+const ICACLS_TIMEOUT_MS = 5000;
+
 function icaclsRestrict(target: string): HardenResult {
   const user = os.userInfo().username;
   try {
@@ -45,11 +65,42 @@ function icaclsRestrict(target: string): HardenResult {
     execFileSync('icacls', [target, '/inheritance:r', '/grant:r', `${user}:F`, 'SYSTEM:F'], {
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
+      timeout: ICACLS_TIMEOUT_MS,
     });
     return { applied: true, method: 'icacls', detail: `inheritance removed; granted ${user}+SYSTEM only` };
   } catch (e) {
     // Fail-closed signal to the caller: we could NOT guarantee the restriction.
     return { applied: false, method: 'icacls', detail: `icacls failed: ${(e as Error).message.slice(0, 120)}` };
+  }
+}
+
+/**
+ * Re-establish the current user's + SYSTEM's access ACROSS a subtree (recursive),
+ * restoring reach to children ORPHANED by a parent `/inheritance:r`.
+ *
+ * Windows ordering hazard: hardening a parent with `/inheritance:r` strips inherited
+ * ACEs; a child dir/file that pre-existed the parent-harden is left with no effective
+ * grant for the current process → EPERM on open/scandir/write, and the file even reads
+ * as absent to existsSync. Unlike `icaclsRestrict`, this uses `/grant` (ADD, not the
+ * `:r` REPLACE) with `/T` (recurse) + `/C` (continue on per-node errors), so it re-adds
+ * the two safe principals to every node WITHOUT re-introducing inheritance or broad
+ * principals. No-op (chmod 0700) on Unix. Best-effort; returns the result.
+ */
+export function reestablishAccess(target: string): HardenResult {
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(target, 0o700); return { applied: true, method: 'chmod', detail: '0700' }; }
+    catch (e) { return { applied: false, method: 'chmod', detail: (e as Error).message.slice(0, 120) }; }
+  }
+  const user = os.userInfo().username;
+  try {
+    execFileSync('icacls', [target, '/grant', `${user}:F`, 'SYSTEM:F', '/T', '/C', '/Q'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+      timeout: ICACLS_TIMEOUT_MS,
+    });
+    return { applied: true, method: 'icacls', detail: `re-granted ${user}+SYSTEM across subtree` };
+  } catch (e) {
+    return { applied: false, method: 'icacls', detail: `icacls /T grant failed: ${(e as Error).message.slice(0, 120)}` };
   }
 }
 
@@ -65,7 +116,7 @@ export function describeAcl(target: string): { platform: string; principals?: st
     return { platform: 'posix', mode, broadAccess: (m & 0o077) !== 0 };
   }
   try {
-    const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true });
+    const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true, timeout: ICACLS_TIMEOUT_MS });
     // icacls output: first line is "<path> PRINCIPAL:(perms)"; continuation lines
     // are "<indent>PRINCIPAL:(perms)". Parse the ACE principals only.
     const lines = out.split(/\r?\n/);

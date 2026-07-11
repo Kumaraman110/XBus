@@ -32,6 +32,15 @@ export interface McpServerDeps {
   endpoint: string;
   /** Installation root secret for the XBUS-STP secure transport. */
   rootSecret: Buffer;
+  /** Beta.4 (ADR 0012): the auto-derived session name to request at registration.
+   *  Valid+unclaimed ⇒ the broker awards it (active); taken/invalid ⇒ pending_name
+   *  (the session is unroutable-by-name until the user picks one). */
+  requestedSessionName?: string;
+  /** Beta.4: the agent/runtime type captured for diagnostics. */
+  agentType?: string;
+  /** Beta.4: ensure a broker is running before connecting (zero-friction
+   *  auto-start). Injected so tests can stub it; defaults to a no-op. */
+  ensureBroker?: () => Promise<void>;
   write: (line: string) => void;
   log?: (line: string) => void;
 }
@@ -106,6 +115,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { alias: { type: 'string' } }, required: ['alias'] },
   },
   {
+    name: 'xbus_rename',
+    description: 'Set or change THIS session\'s human-readable unique name (e.g. "seatmap-api"). Use this when XBus reports your session is pending_name (the suggested name was taken or unsuitable) or to rename. Returns the active name, or an error if the name is taken/invalid — pick another.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'Desired unique session name: [a-z0-9][a-z0-9._-]{1,47}, not reserved/generic.' } }, required: ['name'] },
+  },
+  {
     name: 'xbus_status',
     description: 'Report XBus connection + session status for this session.',
     inputSchema: { type: 'object', properties: {} },
@@ -126,6 +140,11 @@ export class McpServer {
 
   private async ensureBroker(): Promise<void> {
     if (this.connected) return;
+    // Beta.4 (ADR 0012 D7): make sure a broker is RUNNING before we connect — the
+    // user never has to run `xbus start`. Race-safe + degraded-tolerant; a failure
+    // here is non-fatal (the connect below will surface a clean error if truly
+    // unreachable, and the MCP tool layer reports it without crashing Claude).
+    if (this.deps.ensureBroker) { try { await this.deps.ensureBroker(); } catch { /* connect will report */ } }
     // Fresh client each (re)connect — a long-lived MCP server outlives broker
     // restarts, so the prior socket may be dead. onClose flips `connected` so the
     // NEXT tool call transparently reconnects + re-registers (joins current epoch).
@@ -142,6 +161,11 @@ export class McpServer {
       receiveMode: 'hook_checkpoint',
       capabilities: ['ack', 'reply', 'inbox'],
       role: ComponentRole.MCP,
+      // Beta.4: request the auto-derived name + record the agent type. Both are
+      // optional + additive on the wire (broker ignores absence; older brokers
+      // ignore the extra fields).
+      ...(this.deps.requestedSessionName !== undefined ? { requestedSessionName: this.deps.requestedSessionName } : {}),
+      ...(this.deps.agentType !== undefined ? { agentType: this.deps.agentType } : {}),
     });
     // §2: the MCP server is the component that can ack/reply, so once it has
     // registered the session can take delivery. Signal readiness explicitly with
@@ -239,6 +263,10 @@ export class McpServer {
       }
       case 'xbus_register': {
         const f = await this.client.request('register_alias', args);
+        return this.unwrap(f);
+      }
+      case 'xbus_rename': {
+        const f = await this.client.request('rename_session', args);
         return this.unwrap(f);
       }
       case 'xbus_status': {

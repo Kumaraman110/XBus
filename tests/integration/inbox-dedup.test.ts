@@ -94,6 +94,54 @@ describe('§1 model-visible duplicate prevention', () => {
     expect(audit.n).toBe(1); // audited
   });
 
+  it('final-review #6: after redelivery (2 injection rows/epoch), inboxView returns the message ONCE with the HIGHEST-logical injection id (no duplicate, no stale/null)', () => {
+    const { authA, authB } = pair();
+    const s = send(authA);
+    const v1 = delivery.inboxView(authB, 'cp1', 10);            // first injection (logical 1)
+    const inj1 = v1[0]!.injectionId!;
+    const re = delivery.redeliver(authB, s.messageId, 'operator re-show'); // logical 2
+    const inj2 = re!.injectionId!;
+    expect(inj2).not.toBe(inj1);
+    // Two injection rows now exist for this (message, epoch).
+    const rows = db.prepare('SELECT logical_injection_number AS ln, injection_id AS id FROM context_injections WHERE message_id=? ORDER BY logical_injection_number').all(s.messageId) as Array<{ ln: number; id: string }>;
+    expect(rows.map((r) => r.ln)).toEqual([1, 2]);
+    // The recovery inbox view must list the message EXACTLY ONCE, and its injectionId
+    // must be the CURRENT (highest-logical) one — not duplicated, not the stale logical-1,
+    // never null. (Before the fix the LEFT JOIN returned BOTH rows.)
+    const v2 = delivery.inboxView(authB, 'cp2', 10);
+    const forMsg = v2.filter((e) => e.messageId === s.messageId);
+    expect(forMsg).toHaveLength(1);                              // NOT duplicated
+    expect(forMsg[0]!.injectionId).toBe(inj2);                  // highest-logical (current)
+    expect(forMsg[0]!.injectionId).not.toBeNull();
+  });
+
+  it('re-review #4: redeliver ALWAYS returns a non-null injection id with the body (never a bodiless id)', () => {
+    const { authA, authB } = pair();
+    const s = send(authA);
+    delivery.inboxView(authB, 'cp1', 10); // first injection (logical 1)
+    // Several successive redeliveries each mint a fresh, non-null injection id.
+    for (let i = 0; i < 3; i++) {
+      const re = delivery.redeliver(authB, s.messageId, `redeliver-${i}`);
+      expect(re).not.toBeNull();
+      expect(re!.bodyIncluded).toBe(true);
+      expect(re!.injectionId).toBeTruthy();       // NEVER null when a body is returned
+      expect(typeof re!.injectionId).toBe('string');
+    }
+    // Logical numbers advanced monotonically (1 = first inject, 2..4 = redeliveries).
+    const logicals = (db.prepare('SELECT logical_injection_number AS n FROM context_injections WHERE message_id=? ORDER BY n').all(s.messageId) as Array<{ n: number }>).map((r) => r.n);
+    expect(logicals).toEqual([1, 2, 3, 4]);
+  });
+
+  it('final-review #6b: an inbox entry never carries a null injection id for a transport_written body', () => {
+    const { authA, authB } = pair();
+    const s = send(authA);
+    delivery.inboxView(authB, 'cp1', 10); // inject
+    const v2 = delivery.inboxView(authB, 'cp2', 10); // recovery view (transport_written)
+    const e = v2.find((x) => x.messageId === s.messageId)!;
+    expect(e.state).toBe('context_injected_unacknowledged');
+    expect(e.injectionId).toBeTruthy(); // never null for an injected body
+  });
+
   it('10: a reply after recovery is correlated to the ORIGINAL request', () => {
     const { authA, authB } = pair();
     const s = send(authA);

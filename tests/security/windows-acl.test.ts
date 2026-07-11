@@ -13,6 +13,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { startBrokerHost, type RunningBroker } from '../../src/broker/host.js';
 import { describeAcl, hardenDir, hardenFile, assertNotReparse } from '../../src/ipc/acl.js';
+import { loadOrCreateRootSecret, secretPath } from '../../src/ipc/root-secret.js';
+import { ensureDataDir } from '../../src/ipc/transport.js';
 
 let dataDir: string;
 let broker: RunningBroker;
@@ -67,6 +69,54 @@ describe(`runtime artifact permissions (${process.platform})`, () => {
     // after hardening, no broad access
     expect(describeAcl(ff).broadAccess).toBe(false);
     fs.rmSync(t, { recursive: true, force: true });
+  });
+
+  it('loadOrCreateRootSecret works when auth/ pre-exists and the parent inheritance was removed (ACL-orphan regression)', () => {
+    // Regression for a real, deterministic Windows failure (reproduced in plain node,
+    // no vitest/contention): if the `auth/` subdir already exists when the data dir is
+    // hardened with `icacls /inheritance:r`, removing the PARENT's inheritance orphans
+    // the pre-existing child's ACL — the process loses access to auth/, so the secret
+    // read/write fails EPERM (existsSync even misreports the file as absent). The fix
+    // re-hardens auth/ with its own grant before use. This exercises the exact order:
+    //   1) create auth/ (and a file in it) BEFORE hardening,
+    //   2) harden the data dir (parent /inheritance:r), which orphans auth/,
+    //   3) loadOrCreateRootSecret must still succeed (create-or-load), not EPERM.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-aclorphan-'));
+    try {
+      const p = secretPath(dir);
+      const authDir = path.dirname(p);
+      fs.mkdirSync(authDir, { recursive: true });        // auth/ pre-exists (as in a 2nd run / planted secret)
+      fs.writeFileSync(p, Buffer.alloc(32), { mode: 0o600 }); // a valid 32-byte secret already present
+      ensureDataDir(dir);                                 // harden PARENT: icacls /inheritance:r orphans auth/ on Windows
+      // Before the fix this threw EPERM (open ...auth/root.secret.tmp-<pid>); it must load cleanly now.
+      const secret = loadOrCreateRootSecret(dir);
+      expect(secret.length).toBe(32);
+      // auth/ is accessible again and holds no broad principals.
+      const acl = describeAcl(authDir);
+      expect(acl.broadAccess, `auth dir ACL: ${JSON.stringify(acl)}`).toBe(false);
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  it('final-review #1: creating the secret hardens the auth DIRECTORY correctly (dir, not file perms)', () => {
+    // writeSecret must harden authDir with hardenDir (0700 on Unix / inheritance-strip
+    // on Windows), NOT hardenFile (which would chmod a dir to 0600, dropping traversal).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-secretdir-'));
+    try {
+      const p = secretPath(dir);
+      const authDir = path.dirname(p);
+      const secret = loadOrCreateRootSecret(dir); // first-use create → hardens authDir
+      expect(secret.length).toBe(32);
+      // The auth dir must be traversable + own-restricted (no broad principals), and the
+      // secret must be READABLE (proves the dir wasn't 0600'd into non-traversable).
+      expect(describeAcl(authDir).broadAccess).toBe(false);
+      const reread = loadOrCreateRootSecret(dir); // must still read through the dir
+      expect(reread.equals(secret)).toBe(true);
+      if (!isWin) expect(describeAcl(authDir).mode).toBe('700'); // dir mode, not 600
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   });
 
   it('a symlinked data path is rejected (reparse/junction guard)', function () {

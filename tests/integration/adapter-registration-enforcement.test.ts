@@ -142,3 +142,157 @@ describe('adapter registration enforcement (real broker path)', () => {
     expect((a3.payload as { awardedSupport?: unknown }).awardedSupport).toBeUndefined();
   });
 });
+
+describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE_ERROR "internal error" (final-review R12/R13)', () => {
+  const errOf = (ack: { frameType: string; payload: unknown }) => ({ frameType: ack.frameType, ...(ack.payload as { code?: string; message?: string }) });
+
+  it('R12: adapter-aware register with malformed declaredCapabilities is PROTOCOL_VIOLATION', async () => {
+    const c = await conn('hook');
+    // declaredCapabilities present but missing the required groups (an untrusted-frame shape).
+    const ack = await c.request('register_session', baseReg({
+      sessionId: 'mal-caps', role: 'hook',
+      adapterRegistration: { adapterId: 'x', adapterVersion: '1', role: 'hook', declaredCapabilities: {} },
+    }));
+    const e = errOf(ack);
+    expect(e.frameType).toBe('error');
+    expect(e.code).toBe('XBUS_PROTOCOL_VIOLATION');
+    expect(e.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(e.message).not.toMatch(/internal error/);
+  });
+
+  it('R13: null/omitted top-level payload on register/ack/reply/rename/register_alias is NOT a mislabeled internal error', async () => {
+    // Each handler previously cast frame.payload unchecked → a null payload threw a raw
+    // TypeError surfaced as XBUS_DATABASE_ERROR "internal error". After the guard it must be
+    // a clean, client-facing validation/protocol error code instead.
+    const c = await conn('mcp');
+    // Must be registered first so ack/reply/rename/register_alias reach their handler bodies.
+    await c.request('register_session', baseReg({ sessionId: 'r13-s', role: 'mcp' }));
+    for (const frameType of ['ack_message', 'reply_message', 'rename_session', 'register_alias']) {
+      const ack = await c.request(frameType, null as unknown as Record<string, unknown>);
+      const e = errOf(ack);
+      expect(e.frameType, `${frameType} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} must not be mislabeled DATABASE_ERROR`).not.toBe('XBUS_DATABASE_ERROR');
+      expect(e.message ?? '', `${frameType} must not surface "internal error"`).not.toMatch(/internal error/);
+    }
+    // A fresh connection: register itself with a null payload → clean error, not internal error.
+    const c2 = await conn('mcp');
+    const regAck = errOf(await c2.request('register_session', null as unknown as Record<string, unknown>));
+    expect(regAck.frameType).toBe('error');
+    expect(regAck.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(regAck.message ?? '').not.toMatch(/internal error/);
+  });
+
+  it('R13b: WRONG-TYPED untrusted fields (numeric alias on block_peer, numeric reason on redeliver) are not mislabeled internal errors', async () => {
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r13b-s', role: 'mcp' }));
+    // block_peer with a numeric alias: the guard must reject on TYPE, not just falsiness —
+    // a numeric alias previously reached ControlsStore .toLowerCase() → raw TypeError.
+    const bp = errOf(await c.request('block_peer', { alias: 123 } as unknown as Record<string, unknown>));
+    expect(bp.frameType).toBe('error');
+    expect(bp.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(bp.message ?? '').not.toMatch(/internal error/);
+    // redeliver with a numeric reason on an unknown message: must surface MESSAGE_NOT_FOUND
+    // (reason is coerced to the default), never a TypeError-mislabeled DATABASE_ERROR.
+    const rd = errOf(await c.request('redeliver', { messageId: 'no-such-msg', reason: 123 } as unknown as Record<string, unknown>));
+    expect(rd.frameType).toBe('error');
+    expect(rd.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(rd.message ?? '').not.toMatch(/internal error/);
+    // dead_letter inspect with a boolean messageId (truthy, so a falsiness-only guard would
+    // pass it to the SQL bind → ERR_INVALID_ARG_TYPE). Must be a clean PROTOCOL_VIOLATION.
+    const dl = errOf(await c.request('dead_letter', { action: 'inspect', messageId: true } as unknown as Record<string, unknown>));
+    expect(dl.frameType).toBe('error');
+    expect(dl.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(dl.message ?? '').not.toMatch(/internal error/);
+  });
+
+  it('R14: a non-numeric `limit` on checkpoint_pull / inbox is PROTOCOL_VIOLATION, not a SQL-bind internal error', async () => {
+    // `limit` flows into a SQL `LIMIT ?` bind; a non-number (boolean/string/object) threw a
+    // raw node:sqlite error mislabeled as DATABASE_ERROR "internal error". It must now be a
+    // clean PROTOCOL_VIOLATION — the last unguarded numeric-bind in the handler surface.
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r14-s', role: 'mcp' }));
+    for (const [frameType, payload] of [
+      ['checkpoint_pull', { limit: true }],
+      ['inbox', { limit: 'five' }],            // VIEW path (markInjected defaults true)
+      ['inbox', { markInjected: false, limit: {} }], // PEEK path
+      ['checkpoint_pull', { limit: 2.5 }],     // R15: finite NON-integer still fails the bind
+      ['inbox', { limit: 1e21 }],              // R15: out-of-range finite value
+      ['checkpoint_pull', { limit: -3 }],      // R15: negative
+    ] as Array<[string, Record<string, unknown>]>) {
+      const e = errOf(await c.request(frameType, payload as unknown as Record<string, unknown>));
+      expect(e.frameType, `${frameType} ${JSON.stringify(payload)} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} ${JSON.stringify(payload)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.code).not.toBe('XBUS_DATABASE_ERROR');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid numeric limit still works (no false positive).
+    const ok = await c.request('checkpoint_pull', { limit: 5 });
+    expect(ok.frameType).toBe('checkpoint_pull_ack');
+  });
+
+  it('R15: register with a boolean optional string field is PROTOCOL_VIOLATION, not a SQL-bind internal error', async () => {
+    // repositoryRoot / claudeCodeVersion / agentType are forwarded into TEXT columns; a
+    // boolean throws ERR_INVALID_ARG_TYPE at the bind (mislabeled DATABASE_ERROR). Must be
+    // a clean PROTOCOL_VIOLATION. Each needs a FRESH sessionId (first-registration branch).
+    let seq = 0;
+    for (const field of ['repositoryRoot', 'claudeCodeVersion', 'agentType']) {
+      const c = await conn('mcp');
+      const e = errOf(await c.request('register_session', baseReg({ sessionId: `r15-${++seq}`, role: 'mcp', [field]: true })));
+      expect(e.frameType, `${field} should error cleanly`).toBe('error');
+      expect(e.code, `${field} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid string optional field still registers fine (no false positive).
+    const c2 = await conn('mcp');
+    const ok = await c2.request('register_session', baseReg({ sessionId: 'r15-ok', role: 'mcp', agentType: 'claude', repositoryRoot: '/repo', claudeCodeVersion: '2.1.0' }));
+    expect(ok.frameType).toBe('register_session_ack');
+  });
+
+  it('R16: OPTIONAL string fields (ack note/injectionId, reply idempotencyKey/injectionId, inbox/checkpoint_pull_hook checkpointId) are type-guarded', async () => {
+    // Optional string fields forwarded to SQL binds: an object/array value throws at the
+    // bind (mislabeled DATABASE_ERROR). All must surface a clean PROTOCOL_VIOLATION. A
+    // registered recipient is the only precondition. Send a real message so ack/reply reach
+    // their handler bodies (though the guard fires before any delivery work).
+    const sender = await conn('mcp');
+    await sender.request('register_session', baseReg({ sessionId: 'r16-snd', role: 'mcp' }));
+    await sender.request('register_alias', { alias: 'r16snd' });
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r16-rcv', role: 'mcp' }));
+    await c.request('register_alias', { alias: 'r16rcv' });
+    await c.request('signal_readiness', { ackAvailable: true, versionOk: true });
+    const sent = await sender.request('send_message', { to: 'r16rcv', text: 'hi', requiresAck: true, requiresReply: true });
+    const messageId = (sent.payload as { messageId: string }).messageId;
+    for (const [frameType, payload] of [
+      ['ack_message', { messageId, status: 'accepted', note: {} }],
+      ['ack_message', { messageId, status: 'accepted', injectionId: {} }],
+      ['reply_message', { messageId, text: 'x', outcome: 'completed', idempotencyKey: {} }],
+      ['reply_message', { messageId, text: 'x', outcome: 'completed', injectionId: {} }],
+      ['inbox', { checkpointId: {} }],
+      ['checkpoint_pull_hook', { checkpointId: {} }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const e = errOf(await c.request(frameType, payload as unknown as Record<string, unknown>));
+      expect(e.frameType, `${frameType} ${JSON.stringify(payload)} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} ${JSON.stringify(payload)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+  });
+
+  it('R16b: register_session with a non-array `capabilities` is PROTOCOL_VIOLATION (the one array field)', async () => {
+    // capabilities is JSON.stringify'd at register (never throws), then JSON.parse'd and
+    // .includes()'d by resolveReadiness on a later signal_readiness → a non-array throws a
+    // raw TypeError mislabeled DATABASE_ERROR. Must be rejected cleanly at register time.
+    for (const bad of [true, 5, {}]) {
+      const c = await conn('mcp');
+      const e = errOf(await c.request('register_session', baseReg({ sessionId: `r16b-${String(typeof bad)}-${JSON.stringify(bad).slice(0, 3)}`, role: 'mcp', capabilities: bad })));
+      expect(e.frameType, `capabilities=${JSON.stringify(bad)} should error cleanly`).toBe('error');
+      expect(e.code, `capabilities=${JSON.stringify(bad)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid array (incl. empty) still registers + signals readiness with no error.
+    const c2 = await conn('mcp');
+    const ok = await c2.request('register_session', baseReg({ sessionId: 'r16b-ok', role: 'mcp', capabilities: ['ack', 'reply'] }));
+    expect(ok.frameType).toBe('register_session_ack');
+    const sr = await c2.request('signal_readiness', {}); // no ackAvailable hint → resolveReadiness reads capabilities.includes
+    expect(sr.frameType).toBe('signal_readiness_ack');
+  });
+});
