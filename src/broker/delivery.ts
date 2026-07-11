@@ -479,7 +479,15 @@ export class DeliveryOps {
     // injected message is re-armed but not reported), so returning only those
     // bodies upholds the Layer-3 no-repeat-body invariant on this path too.
     const newlyInjected = new Set(this.markInjectedFor(auth, pending.map((m) => m.messageId)));
-    return pending.filter((m) => newlyInjected.has(m.messageId));
+    // Attach the epoch-bound injection id to each returned body, consistent with every
+    // other injecting path (checkpointPull / checkpointPullForced / daemon.onCheckpointPull
+    // / redeliver). Deprecated + test-only, but keeping the Layer-3 "a returned body
+    // carries a valid injection id" invariant uniform across ALL injecting paths avoids a
+    // latent gap if this helper is ever reused.
+    return pending.filter((m) => newlyInjected.has(m.messageId)).map((m) => {
+      const id = this.injectionIdFor(m.messageId, auth.epoch);
+      return id ? { ...m, metadata: { ...(m.metadata ?? {}), [INJECTION_METADATA_KEY]: id } } : m;
+    });
   }
 
   private pendingForSessionId(sessionId: string, limit: number): PendingMessage[] {
@@ -681,19 +689,30 @@ export class DeliveryOps {
       if (!orig) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such message');
       if (orig.recipient_session_id !== auth.sessionId) throw new XBusError(XBusErrorCode.NOT_RECIPIENT, 'not the recipient of this message');
 
-      let injectionId: string | null = null;
-      if (this.requireReceipt) {
-        const v = this.receipts.authorize('reply', { messageId: input.messageId, sessionId: auth.sessionId, epoch: auth.epoch, ...(input.injectionId !== undefined ? { injectionId: input.injectionId } : {}) });
-        injectionId = v.injectionId;
-      }
-
-      // Idempotency: a repeated reply with the same key returns the same reply.
+      // Idempotency FIRST (before receipt authorization) — symmetric with ack()
+      // (see the comment there). On the first reply we consume the one-time injection
+      // receipt (below); with requireReceipt=true (the PRODUCTION default) a benign
+      // same-key retry that re-ran authorize() FIRST would find the already-consumed
+      // receipt and throw RECEIPT_REPLAYED before reaching this short-circuit — turning
+      // an idempotent no-op into a hard error and breaking the documented
+      // "Idempotent on (receiver, idempotencyKey)" contract. Checking the duplicate
+      // first makes a genuine retry a clean no-op regardless of receipt-replay state.
       if (input.idempotencyKey) {
         const dup = this.db.prepare('SELECT message_id, correlation_id, recipient_session_id, recipient_alias, recipient_sequence FROM messages WHERE sender_session_id=? AND idempotency_key=?').get(auth.sessionId, input.idempotencyKey) as
           | { message_id: string; correlation_id: string; recipient_session_id: string; recipient_alias: string; recipient_sequence: number } | undefined;
         if (dup) {
           return { messageId: dup.message_id, replyMessageId: dup.message_id, correlationId: dup.correlation_id, recipientSessionId: dup.recipient_session_id, recipientAlias: dup.recipient_alias, sequence: dup.recipient_sequence, state: 'completed', deduplicated: true };
         }
+      }
+
+      // Connection-bound authorization (ADR 0006) for a FIRST (non-duplicate) reply:
+      // authority is the authenticated session+epoch + a recorded injection, consumed
+      // once below. Runs only after the idempotency short-circuit so a benign retry is
+      // never mis-flagged as a receipt replay.
+      let injectionId: string | null = null;
+      if (this.requireReceipt) {
+        const v = this.receipts.authorize('reply', { messageId: input.messageId, sessionId: auth.sessionId, epoch: auth.epoch, ...(input.injectionId !== undefined ? { injectionId: input.injectionId } : {}) });
+        injectionId = v.injectionId;
       }
 
       // Beta.4 (ADR 0012 D6): the reply's recipient is the ORIGINAL SENDER. If that

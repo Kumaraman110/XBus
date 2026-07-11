@@ -289,3 +289,42 @@ describe('send() idempotency × expiry contract (final-review R2-3)', () => {
     expect((db.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=?').get(r.sessionId) as { n: number }).n).toBe(1);
   });
 });
+
+describe('reply() idempotency holds under requireReceipt=true (final-review R9)', () => {
+  // The PRODUCTION daemon sets requireReceipt=true (daemon.ts). reply() consumes the
+  // one-time injection receipt on the first call; a benign same-key retry must still be
+  // an idempotent no-op. The bug: authorize() ran BEFORE the idempotency short-circuit,
+  // so the retry hit the already-consumed receipt and threw RECEIPT_REPLAYED. The
+  // pre-existing reply-idempotency test masked this by building DeliveryOps WITHOUT
+  // requireReceipt (authorize skipped). This exercises the real production config.
+  function readyR(name: string): SessionAuthority {
+    const s = sid();
+    const auth = store.register({ sessionId: s, instanceId: 'i', connectionId: `c-${s}`, processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: name });
+    store.signalReadiness(auth, { ackAvailable: true, versionOk: true });
+    return auth;
+  }
+  const allocSeq = (rid: string): number => { const row = db.prepare('SELECT next_sequence FROM recipient_sequences WHERE recipient_session_id=?').get(rid) as { next_sequence: number } | undefined; const seq = row ? row.next_sequence : 1; db.prepare('INSERT OR REPLACE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?,?)').run(rid, seq + 1); return seq; };
+
+  it('a same-key reply RETRY is a clean idempotent no-op, NOT RECEIPT_REPLAYED', () => {
+    // Build DeliveryOps exactly as production does: requireReceipt=true.
+    const rrDelivery = new DeliveryOps(db, clock, new SeqIdGen('rr'), 5 * 60_000, undefined, { requireReceipt: true });
+    const a = readyR('r9-a');
+    const b = readyR('r9-b');
+    const { messageId } = store.send(a, { to: 'r9-b', text: 'q', kind: 'request', requiresAck: true, requiresReply: true });
+    // Inject → record the one-time receipt; capture the injection id B must present.
+    const v = rrDelivery.inboxView(b, 'cp-r9', 10);
+    const injectionId = v[0]!.injectionId!;
+    expect(typeof injectionId).toBe('string');
+    rrDelivery.ack(b, { messageId, status: 'accepted', injectionId });
+    const key = 'r9-reply-key';
+    // First reply: authorizes + consumes the receipt.
+    const first = rrDelivery.reply(b, { messageId, text: 'answer', outcome: 'completed', injectionId, idempotencyKey: key }, allocSeq);
+    expect(first.deduplicated).toBe(false);
+    // Benign RETRY with the SAME key — must dedup, NOT throw RECEIPT_REPLAYED.
+    const retry = rrDelivery.reply(b, { messageId, text: 'answer', outcome: 'completed', injectionId, idempotencyKey: key }, allocSeq);
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.replyMessageId).toBe(first.replyMessageId); // same reply, no new one
+    // Exactly one reply message/delivery exists (no duplicate created).
+    expect((db.prepare('SELECT COUNT(*) AS n FROM messages WHERE message_id=?').get(first.replyMessageId) as { n: number }).n).toBe(1);
+  });
+});
