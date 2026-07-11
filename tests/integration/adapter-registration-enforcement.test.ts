@@ -247,4 +247,33 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
     const ok = await c2.request('register_session', baseReg({ sessionId: 'r15-ok', role: 'mcp', agentType: 'claude', repositoryRoot: '/repo', claudeCodeVersion: '2.1.0' }));
     expect(ok.frameType).toBe('register_session_ack');
   });
+
+  it('R16: OPTIONAL string fields (ack note/injectionId, reply idempotencyKey/injectionId, inbox/checkpoint_pull_hook checkpointId) are type-guarded', async () => {
+    // Optional string fields forwarded to SQL binds: an object/array value throws at the
+    // bind (mislabeled DATABASE_ERROR). All must surface a clean PROTOCOL_VIOLATION. A
+    // registered recipient is the only precondition. Send a real message so ack/reply reach
+    // their handler bodies (though the guard fires before any delivery work).
+    const sender = await conn('mcp');
+    await sender.request('register_session', baseReg({ sessionId: 'r16-snd', role: 'mcp' }));
+    await sender.request('register_alias', { alias: 'r16snd' });
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r16-rcv', role: 'mcp' }));
+    await c.request('register_alias', { alias: 'r16rcv' });
+    await c.request('signal_readiness', { ackAvailable: true, versionOk: true });
+    const sent = await sender.request('send_message', { to: 'r16rcv', text: 'hi', requiresAck: true, requiresReply: true });
+    const messageId = (sent.payload as { messageId: string }).messageId;
+    for (const [frameType, payload] of [
+      ['ack_message', { messageId, status: 'accepted', note: {} }],
+      ['ack_message', { messageId, status: 'accepted', injectionId: {} }],
+      ['reply_message', { messageId, text: 'x', outcome: 'completed', idempotencyKey: {} }],
+      ['reply_message', { messageId, text: 'x', outcome: 'completed', injectionId: {} }],
+      ['inbox', { checkpointId: {} }],
+      ['checkpoint_pull_hook', { checkpointId: {} }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const e = errOf(await c.request(frameType, payload as unknown as Record<string, unknown>));
+      expect(e.frameType, `${frameType} ${JSON.stringify(payload)} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} ${JSON.stringify(payload)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+  });
 });

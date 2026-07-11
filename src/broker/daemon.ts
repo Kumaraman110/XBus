@@ -184,6 +184,22 @@ export class BrokerDaemon {
     return raw;
   }
 
+  /**
+   * Validate an untrusted, OPTIONAL string payload field before it flows to a SQL bind or
+   * string method. node:sqlite throws a raw ERR_INVALID_ARG_TYPE (boolean) / datatype
+   * mismatch (object/array) on a non-string/non-number bind, which handle() would mislabel
+   * as DATABASE_ERROR "internal error". Reject a present-but-non-string value with a clean
+   * PROTOCOL_VIOLATION; `undefined` passes through. Used for every optional string field on
+   * the frame handlers (note/injectionId/idempotencyKey/checkpointId/…).
+   */
+  private optString(raw: unknown, field: string): string | undefined {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== 'string') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `${field} must be a string when present`, { field });
+    }
+    return raw;
+  }
+
   private onConnClose(id: string): void {
     const auth = this.connAuth.get(id);
     if (auth) {
@@ -488,7 +504,7 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { checkpointId?: string; limit?: number };
     const limit = this.validatedLimit(p.limit);
-    const checkpointId = p.checkpointId ?? this.ids.next();
+    const checkpointId = this.optString(p.checkpointId, 'checkpointId') ?? this.ids.next();
     const messages = this.delivery.checkpointPull(auth, checkpointId, limit ?? 10);
     if (messages.length > 0) {
       this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
@@ -581,7 +597,9 @@ export class BrokerDaemon {
     // would otherwise reach a SQL bind and throw a raw error mislabeled as DATABASE_ERROR).
     if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'ack requires a messageId');
     if (p.status !== 'accepted' && p.status !== 'rejected') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "ack requires status 'accepted' or 'rejected'");
-    const r = this.delivery.ack(auth, { messageId: p.messageId, status: p.status, ...(p.note !== undefined ? { note: p.note } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) });
+    const note = this.optString(p.note, 'note');
+    const injectionId = this.optString(p.injectionId, 'injectionId');
+    const r = this.delivery.ack(auth, { messageId: p.messageId, status: p.status, ...(note !== undefined ? { note } : {}), ...(injectionId !== undefined ? { injectionId } : {}) });
     this.reply(conn, 'ack_message_ack', r, frame.requestId);
   }
 
@@ -593,9 +611,11 @@ export class BrokerDaemon {
     if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires a messageId');
     if (typeof p.text !== 'string') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires text');
     if (p.outcome !== 'completed' && p.outcome !== 'failed' && p.outcome !== 'partial') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "reply requires outcome 'completed' | 'failed' | 'partial'");
+    const idempotencyKey = this.optString(p.idempotencyKey, 'idempotencyKey');
+    const replyInjectionId = this.optString(p.injectionId, 'injectionId');
     const r = this.delivery.reply(
       auth,
-      { messageId: p.messageId, text: p.text, outcome: p.outcome, ...(p.idempotencyKey !== undefined ? { idempotencyKey: p.idempotencyKey } : {}), ...(p.metadata !== undefined ? { metadata: p.metadata } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) },
+      { messageId: p.messageId, text: p.text, outcome: p.outcome, ...(idempotencyKey !== undefined ? { idempotencyKey } : {}), ...(p.metadata !== undefined ? { metadata: p.metadata } : {}), ...(replyInjectionId !== undefined ? { injectionId: replyInjectionId } : {}) },
       (recipientSessionId) => this.allocSequence(recipientSessionId),
     );
     this.reply(conn, 'reply_message_ack', r, frame.requestId);
@@ -605,6 +625,7 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number; markInjected?: boolean; checkpointId?: string };
     const limit = this.validatedLimit(p.limit);
+    const checkpointId = this.optString(p.checkpointId, 'checkpointId');
     if (p.markInjected === false) {
       // Peek: list without marking injected / issuing a receipt.
       const peek = this.delivery.pendingForSession(auth, limit !== undefined ? { limit } : {});
@@ -613,7 +634,7 @@ export class BrokerDaemon {
     }
     // §1: inbox VIEW — body included once (first injection), already-presented
     // entries return metadata + bodyIncluded:false (no model-visible duplicate).
-    const messages = this.delivery.inboxView(auth, p.checkpointId ?? this.ids.next(), limit ?? 50);
+    const messages = this.delivery.inboxView(auth, checkpointId ?? this.ids.next(), limit ?? 50);
     this.reply(conn, 'inbox_ack', { messages }, frame.requestId);
   }
 
