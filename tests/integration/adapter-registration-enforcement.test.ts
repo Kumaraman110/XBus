@@ -198,4 +198,26 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
     expect(rd.code).not.toBe('XBUS_DATABASE_ERROR');
     expect(rd.message ?? '').not.toMatch(/internal error/);
   });
+
+  it('R14: a non-numeric `limit` on checkpoint_pull / inbox is PROTOCOL_VIOLATION, not a SQL-bind internal error', async () => {
+    // `limit` flows into a SQL `LIMIT ?` bind; a non-number (boolean/string/object) threw a
+    // raw node:sqlite error mislabeled as DATABASE_ERROR "internal error". It must now be a
+    // clean PROTOCOL_VIOLATION — the last unguarded numeric-bind in the handler surface.
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r14-s', role: 'mcp' }));
+    for (const [frameType, payload] of [
+      ['checkpoint_pull', { limit: true }],
+      ['inbox', { limit: 'five' }],            // VIEW path (markInjected defaults true)
+      ['inbox', { markInjected: false, limit: {} }], // PEEK path
+    ] as Array<[string, Record<string, unknown>]>) {
+      const e = errOf(await c.request(frameType, payload as unknown as Record<string, unknown>));
+      expect(e.frameType, `${frameType} ${JSON.stringify(payload)} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} ${JSON.stringify(payload)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.code).not.toBe('XBUS_DATABASE_ERROR');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid numeric limit still works (no false positive).
+    const ok = await c.request('checkpoint_pull', { limit: 5 });
+    expect(ok.frameType).toBe('checkpoint_pull_ack');
+  });
 });

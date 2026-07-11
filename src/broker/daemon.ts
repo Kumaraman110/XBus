@@ -164,6 +164,22 @@ export class BrokerDaemon {
     this.reply(conn, 'error', xe.toWire(), reqId);
   }
 
+  /**
+   * Validate the untrusted, optional `limit` payload field on the read/pull handlers.
+   * `limit` flows into a SQL `LIMIT ?` bind; node:sqlite throws a raw
+   * TypeError/ERR_SQLITE_ERROR (mislabeled as DATABASE_ERROR "internal error") if it is a
+   * non-number (boolean/string/object/array) or a NaN. Reject a present-but-non-integer
+   * limit with a clean PROTOCOL_VIOLATION; `undefined` passes through to the caller's
+   * default. Returns the validated number | undefined.
+   */
+  private validatedLimit(raw: unknown): number | undefined {
+    if (raw === undefined) return undefined;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'limit must be a finite number');
+    }
+    return raw;
+  }
+
   private onConnClose(id: string): void {
     const auth = this.connAuth.get(id);
     if (auth) {
@@ -414,7 +430,8 @@ export class BrokerDaemon {
   private onCheckpointPull(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number };
-    const pending = this.delivery.pendingForSession(auth, p.limit !== undefined ? { limit: p.limit } : {});
+    const limit = this.validatedLimit(p.limit);
+    const pending = this.delivery.pendingForSession(auth, limit !== undefined ? { limit } : {});
     // Mark them injected (transport_written) — ack deadline starts now. markInjected
     // reports only NEWLY-injected ids; an already-injected message re-selected after
     // an ack-timeout requeue is re-armed but NOT reported, so its body is not
@@ -457,8 +474,9 @@ export class BrokerDaemon {
   private onCheckpointPullHook(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { checkpointId?: string; limit?: number };
+    const limit = this.validatedLimit(p.limit);
     const checkpointId = p.checkpointId ?? this.ids.next();
-    const messages = this.delivery.checkpointPull(auth, checkpointId, p.limit ?? 10);
+    const messages = this.delivery.checkpointPull(auth, checkpointId, limit ?? 10);
     if (messages.length > 0) {
       this.db.prepare(`UPDATE sessions SET last_checkpoint_at=?, last_seen_at=?, updated_at=? WHERE session_id=?`).run(this.clock.nowIso(), this.clock.nowIso(), this.clock.nowIso(), auth.sessionId);
     }
@@ -571,15 +589,16 @@ export class BrokerDaemon {
   private onInbox(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { limit?: number; markInjected?: boolean; checkpointId?: string };
+    const limit = this.validatedLimit(p.limit);
     if (p.markInjected === false) {
       // Peek: list without marking injected / issuing a receipt.
-      const peek = this.delivery.pendingForSession(auth, p.limit !== undefined ? { limit: p.limit } : {});
+      const peek = this.delivery.pendingForSession(auth, limit !== undefined ? { limit } : {});
       this.reply(conn, 'inbox_ack', { messages: peek }, frame.requestId);
       return;
     }
     // §1: inbox VIEW — body included once (first injection), already-presented
     // entries return metadata + bodyIncluded:false (no model-visible duplicate).
-    const messages = this.delivery.inboxView(auth, p.checkpointId ?? this.ids.next(), p.limit ?? 50);
+    const messages = this.delivery.inboxView(auth, p.checkpointId ?? this.ids.next(), limit ?? 50);
     this.reply(conn, 'inbox_ack', { messages }, frame.requestId);
   }
 
