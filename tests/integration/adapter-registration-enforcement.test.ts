@@ -276,4 +276,23 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
       expect(e.message ?? '').not.toMatch(/internal error/);
     }
   });
+
+  it('R16b: register_session with a non-array `capabilities` is PROTOCOL_VIOLATION (the one array field)', async () => {
+    // capabilities is JSON.stringify'd at register (never throws), then JSON.parse'd and
+    // .includes()'d by resolveReadiness on a later signal_readiness → a non-array throws a
+    // raw TypeError mislabeled DATABASE_ERROR. Must be rejected cleanly at register time.
+    for (const bad of [true, 5, {}]) {
+      const c = await conn('mcp');
+      const e = errOf(await c.request('register_session', baseReg({ sessionId: `r16b-${String(typeof bad)}-${JSON.stringify(bad).slice(0, 3)}`, role: 'mcp', capabilities: bad })));
+      expect(e.frameType, `capabilities=${JSON.stringify(bad)} should error cleanly`).toBe('error');
+      expect(e.code, `capabilities=${JSON.stringify(bad)} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid array (incl. empty) still registers + signals readiness with no error.
+    const c2 = await conn('mcp');
+    const ok = await c2.request('register_session', baseReg({ sessionId: 'r16b-ok', role: 'mcp', capabilities: ['ack', 'reply'] }));
+    expect(ok.frameType).toBe('register_session_ack');
+    const sr = await c2.request('signal_readiness', {}); // no ackAvailable hint → resolveReadiness reads capabilities.includes
+    expect(sr.frameType).toBe('signal_readiness_ack');
+  });
 });

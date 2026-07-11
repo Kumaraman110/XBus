@@ -353,6 +353,14 @@ export class BrokerDaemon {
         throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session ${field} must be a string when present`, { field });
       }
     }
+    // `capabilities` is the one ARRAY-typed untrusted field. It is JSON.stringify'd into
+    // capabilities_json at register (which never throws for a non-array), then JSON.parse'd
+    // and `.includes()`-ed by resolveReadiness on a later signal_readiness — where a
+    // non-array (boolean/number/object) throws a raw TypeError mislabeled as DATABASE_ERROR.
+    // Reject a present-but-non-array value here with a clean PROTOCOL_VIOLATION.
+    if (p.capabilities !== undefined && !Array.isArray(p.capabilities)) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session capabilities must be an array when present', { field: 'capabilities' });
+    }
     // The register frame's role is the connection's declared authority role. It is NOT a
     // privilege the broker grants: what a role can DO is enforced elsewhere (assertAllowed
     // per-operation), and for adapter-aware registrations evaluateRegistration cross-checks
