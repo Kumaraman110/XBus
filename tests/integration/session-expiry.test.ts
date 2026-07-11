@@ -262,6 +262,45 @@ describe('expiry preserves the non-ACK invariant (I3)', () => {
     expect(d.fc).toBe('recipient_inactive_15_days');
   });
 
+  it('final-review R7: an INJECTED reply-required/no-ack body is dead-lettered at expiry and NOT resurrected on resume', () => {
+    // The stranded-transport_written defect: a message sent requiresAck=false +
+    // requiresReply=true is injected (transport_written) but NOT completed
+    // (completeIfNoResponseRequired only finishes fire-and-forget) and carries NO ack
+    // lease, so no reaper pass used to terminate it. Left in transport_written it
+    // survived the 15-day expiry and was RESURRECTED when store.register() re-homes
+    // transport_written rows on an expired-resume — a stale-body re-presentation the
+    // ADR 0012 no-resurrection/at-most-once invariant forbids. The reaper now
+    // dead-letters transport_written rows for the tombstoned recipient too.
+    const sender = ready('r7-snd');
+    const rcv = ready('r7-rcv');
+    const { messageId } = store.send(sender, { to: 'r7-rcv', text: 'reply-required-body', kind: 'request', requiresAck: false, requiresReply: true });
+    // Inject it → transport_written. Because reply is required (and no ack), it is
+    // NOT completed and holds no lease: it stays transport_written.
+    const injected = delivery.checkpointPull({ ...rcv, role: 'hook' as never }, 'cp-r7', 10);
+    expect(injected.find((m) => m.messageId === messageId)).toBeDefined();
+    expect((db.prepare('SELECT state, lease_expires_at AS lea FROM deliveries WHERE message_id=?').get(messageId) as { state: string; lea: string | null }).state).toBe('transport_written');
+    expect((db.prepare('SELECT lease_expires_at AS lea FROM deliveries WHERE message_id=?').get(messageId) as { lea: string | null }).lea).toBeNull();
+    // 15-day idle expiry of the recipient.
+    clock.advance(15 * DAY + 1000);
+    reaper.sweep();
+    expect(sessRow(rcv.sessionId).expired_at).not.toBeNull();
+    // The stranded injected body MUST now be terminal (dead-lettered by expiry), NOT
+    // left dangling in transport_written.
+    const afterExpiry = db.prepare('SELECT state, failure_category AS fc FROM deliveries WHERE message_id=?').get(messageId) as { state: string; fc: string };
+    expect(afterExpiry.state).toBe('dead_letter');
+    expect(afterExpiry.fc).toBe('recipient_inactive_15_days');
+    // Same-session resume (normal reconnect): re-home must be a genuine no-op — the old
+    // body must NOT reappear as queued and must NOT be re-injected into the fresh epoch.
+    const resumed = store.register({ sessionId: rcv.sessionId, instanceId: 'i2', connectionId: 'c-r7-2', processId: 7, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'r7-rcv' });
+    store.signalReadiness(resumed, { ackAvailable: true, versionOk: true });
+    expect(resumed.epoch).toBeGreaterThan(rcv.epoch);
+    // Still dead_letter (not re-queued by the resume re-home).
+    expect((db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(messageId) as { state: string }).state).toBe('dead_letter');
+    // And not re-presented at the new epoch's checkpoint.
+    const got = delivery.checkpointPull({ ...resumed, role: 'hook' as never }, 'cp-r7-new', 10);
+    expect(got.find((m) => m.messageId === messageId)).toBeUndefined();
+  });
+
   it('reply() to an EXPIRED original-sender is rejected (no orphan), symmetric with send()', () => {
     // A sends a request to B; A then goes idle >15d and is expired; B replies. The
     // reply's recipient is A (expired) — it must be rejected, not queued into a dead

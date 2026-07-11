@@ -104,11 +104,20 @@ export class Reaper {
    *   1. CAS expired_at (guards idempotence) + reason + readiness='disconnected'
    *      + release the name (session_name_state -> 'retired').
    *   2. Retire any live alias rows the session held (name returns to the pool).
-   *   3. Dead-letter the recipient's pending deliveries (queued/retry_wait ONLY)
-   *      with failure_category='recipient_inactive_15_days'. This NEVER touches the
-   *      ack-timeout path or transport_written rows — the non-ACK invariant (I3) is
-   *      preserved by construction (non-ack messages are already terminal-completed
-   *      at injection; we only sweep not-yet-injected deliveries).
+   *   3. Dead-letter EVERY non-terminal delivery to this now-tombstoned recipient —
+   *      queued, retry_wait, AND transport_written — with
+   *      failure_category='recipient_inactive_15_days'. Including transport_written is
+   *      REQUIRED for correctness: a message sent requiresAck=false + requiresReply=true
+   *      is injected (transport_written) but NOT completed (completeIfNoResponseRequired
+   *      only completes fire-and-forget), and carries no ack lease, so NO other reaper
+   *      pass terminates it (reapAckTimeouts requires requires_ack=1 + a lease). Left in
+   *      transport_written it would survive the 15-day expiry and then be RESURRECTED
+   *      when store.register() re-homes transport_written rows on an expired-resume —
+   *      violating the ADR 0012 no-resurrection / at-most-once invariant. Ack-required
+   *      rows hold a lease and ack-time-out to retry_wait within minutes, so at 15-day
+   *      expiry the transport_written rows are exactly the stranded reply-required
+   *      bodies; dead-lettering them (and clearing any lease) completes the tombstone
+   *      and makes the expired-resume re-home a genuine no-op.
    * The expired sessions row itself is the body-free tombstone (no separate table,
    * no tombstone message) — it durably carries name, id, last activity, expiry
    * time, and reason. session_id is NOT deleted (audit trail).
@@ -127,10 +136,16 @@ export class Reaper {
       if (res.changes === 0) continue; // already expired by a concurrent/earlier pass
       // Release any live alias rows (name returns to the pool for reuse).
       this.db.prepare(`UPDATE aliases SET active=0, retired_at=? WHERE session_id=? AND active=1`).run(now, s.session_id);
-      // Dead-letter ONLY not-yet-injected deliveries; never the ack-timeout path.
+      // Dead-letter EVERY non-terminal delivery to this tombstoned recipient —
+      // queued, retry_wait AND transport_written (see the transport_written rationale
+      // in the doc-comment). Clearing lease_expires_at makes the terminal rows
+      // reaper-inert; the terminal states (completed/dead_letter/rejected/expired) are
+      // untouched (this only advances non-terminal rows to dead_letter).
       this.db.prepare(
-        `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_inactive_15_days', next_attempt_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')`,
+        `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_inactive_15_days', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}')`,
       ).run(now, s.session_id);
+      // Release any held leases for this recipient's now-dead-lettered deliveries.
+      this.db.prepare(`UPDATE delivery_leases SET state='expired', released_at=? WHERE state='held' AND message_id IN (SELECT message_id FROM deliveries WHERE recipient_session_id=? AND state='${DeliveryState.DEAD_LETTER}' AND failure_category='recipient_inactive_15_days')`).run(now, s.session_id);
       this.audit('SESSION_EXPIRED', null, { sessionId: s.session_id, reason: 'recipient_inactive_15_days' });
       sessionsExpired++;
     }
