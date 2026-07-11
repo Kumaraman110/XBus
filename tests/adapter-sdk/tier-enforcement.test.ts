@@ -52,6 +52,33 @@ describe('PR2 §1-§2 — trusted evidence is broker-owned, never from the frame
   });
 });
 
+describe('final-review R12 — malformed untrusted declaredCapabilities fails PROTOCOL_VIOLATION (not a raw TypeError)', () => {
+  // The adapterRegistration frame is UNTRUSTED and cast unchecked at the daemon boundary.
+  // A malformed declaredCapabilities must be rejected with a clean PROTOCOL_VIOLATION
+  // BEFORE confirmCapabilities/toVerified dereference it — never a raw TypeError surfaced
+  // as a mislabeled internal error. Role still matches authority so we reach the shape check.
+  const bad = (declaredCapabilities: unknown): AdapterRegistrationDeclaration =>
+    ({ adapterId: 'shape', adapterVersion: '1', role: ComponentRole.HOOK, declaredCapabilities } as unknown as AdapterRegistrationDeclaration);
+  const call = (declaredCapabilities: unknown): unknown =>
+    evaluateRegistration({ receiveMode: 'poll_only', declaration: bad(declaredCapabilities), authority: HOOK_AUTH, trustedEvidence: undefined });
+
+  it('omitted declaredCapabilities throws PROTOCOL_VIOLATION (not TypeError)', () => {
+    expect(() => call(undefined)).toThrow(XBusError);
+    try { call(undefined); } catch (e) { expect((e as XBusError).code).toBe('XBUS_PROTOCOL_VIOLATION'); }
+  });
+  it('empty-object declaredCapabilities (missing groups) throws PROTOCOL_VIOLATION', () => {
+    expect(() => call({})).toThrow(/declaredCapabilities\.receive/);
+  });
+  it('a group present but a leaf not a CapabilityState throws PROTOCOL_VIOLATION', () => {
+    const caps = emptyCapabilities() as unknown as Record<string, Record<string, unknown>>;
+    caps.receive.manualPull = 'bogus-state';
+    expect(() => call(caps)).toThrow(/manualPull is not a valid CapabilityState/);
+  });
+  it('a well-formed emptyCapabilities() declaration is accepted (no false positive)', () => {
+    expect(() => call(emptyCapabilities())).not.toThrow();
+  });
+});
+
 describe('PR2 §3 — fail closed when broker evidence is absent', () => {
   it('an adapter-aware registration WITHOUT broker evidence awards nothing & rejects advanced modes', () => {
     // requests hook_checkpoint, declares it verified, but broker has NO evidence

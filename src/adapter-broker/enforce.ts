@@ -18,7 +18,7 @@
  */
 
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
-import { confirmCapabilities, toVerified, type AgentCapabilities } from '../adapter/capabilities.js';
+import { confirmCapabilities, toVerified, isCapabilityState, type AgentCapabilities } from '../adapter/capabilities.js';
 import { calculateMaximumTier, type ValidationEvidence } from '../adapter/tier.js';
 import {
   computeAwardedSupport, buildValidationEvidence, type AwardedSupport, type EvidenceSource,
@@ -63,6 +63,38 @@ export interface EvaluateArgs {
   /** BROKER-OWNED evidence (already resolved from the registry by exact identity), or
    *  undefined when the broker has none for this adapter. NEVER from the adapter frame. */
   trustedEvidence: BrokerTrustedEvidence | undefined;
+}
+
+/**
+ * Validate the shape of the UNTRUSTED, adapter-supplied `declaredCapabilities` before
+ * it is dereferenced. The frame is cast unchecked at the daemon boundary, and
+ * confirmCapabilities()/toVerified() blindly read `.receive.manualPull`,
+ * `.messaging.acknowledgements`, etc. — so a malformed declaration (omitted, or missing
+ * the `receive`/`messaging` groups, or a leaf that is not a CapabilityState) would throw
+ * a raw TypeError, surfaced to the peer as a mislabeled generic internal error. Since
+ * declarations are UNTRUSTED (trust-boundary invariant), validate the structure here and
+ * fail with a clean PROTOCOL_VIOLATION. Only the groups/leaves the tier computation reads
+ * are required; extra fields are ignored (forward-compatible).
+ */
+function assertDeclaredCapabilitiesShape(caps: unknown): asserts caps is AgentCapabilities {
+  if (!caps || typeof caps !== 'object') {
+    throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'adapter declaredCapabilities is missing or not an object');
+  }
+  const required: Record<'receive' | 'messaging', readonly string[]> = {
+    receive: ['manualPull', 'lifecycleCheckpoint', 'livePush', 'backgroundWake', 'idleWake'],
+    messaging: ['acknowledgements', 'correlatedReplies', 'progressEvents', 'cancellation', 'streaming', 'structuredPayloads', 'attachments'],
+  };
+  for (const group of ['receive', 'messaging'] as const) {
+    const g = (caps as Record<string, unknown>)[group];
+    if (!g || typeof g !== 'object') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `adapter declaredCapabilities.${group} is missing or not an object`, { group });
+    }
+    for (const leaf of required[group]) {
+      if (!isCapabilityState((g as Record<string, unknown>)[leaf])) {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `adapter declaredCapabilities.${group}.${leaf} is not a valid CapabilityState`, { group, leaf });
+      }
+    }
+  }
 }
 
 /** Map a receive mode to the verified capability it REQUIRES (if any). */
@@ -150,6 +182,11 @@ export function evaluateRegistration(args: EvaluateArgs): EnforcementResult | nu
       { authenticated: authority.role, declared: declaration.role },
     );
   }
+
+  // (a.2) The declaration is UNTRUSTED — validate declaredCapabilities' STRUCTURE (not just
+  //       its role) before anything dereferences it, so malformed input fails with a clean
+  //       PROTOCOL_VIOLATION instead of a raw TypeError mislabeled as an internal error.
+  assertDeclaredCapabilitiesShape(declaration.declaredCapabilities);
 
   // (b) Resolve broker-owned evidence (already identity-checked by the registry). When
   //     absent, evidence is the empty/'none' baseline ⇒ nothing is verified.
