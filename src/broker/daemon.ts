@@ -296,7 +296,18 @@ export class BrokerDaemon {
     // award can never survive a re-registration (adapter-aware → legacy, high → low,
     // success → failed, identity change). A new award is set only on full success.
     this.connAwarded.delete(conn.id);
-    const p = frame.payload as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
+    const p = (frame.payload ?? {}) as RegisterPayload & { role?: string; supersede?: boolean; adapterRegistration?: AdapterRegistrationDeclaration };
+    // Validate the required untrusted identity fields → clean PROTOCOL_VIOLATION. Without
+    // this, an omitted field (e.g. a null/empty payload) reaches a SQL bind inside
+    // store.register and throws a raw error mislabeled as DATABASE_ERROR "internal error".
+    for (const field of ['sessionId', 'instanceId', 'projectId', 'cwd', 'receiveMode'] as const) {
+      if (typeof p[field] !== 'string' || !p[field]) {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session requires a non-empty ${field}`, { field });
+      }
+    }
+    if (typeof p.processId !== 'number') {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session requires a numeric processId');
+    }
     // The register frame's role is the connection's declared authority role. It is NOT a
     // privilege the broker grants: what a role can DO is enforced elsewhere (assertAllowed
     // per-operation), and for adapter-aware registrations evaluateRegistration cross-checks
@@ -370,15 +381,15 @@ export class BrokerDaemon {
     // launched from the same project picked the same suggested name). mcp-role only;
     // SESSION_NAME_TAKEN / INVALID_SESSION_NAME surface to the model so it can retry.
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { name: string };
-    const r = this.store.renameSession(auth, p.name);
+    const p = (frame.payload ?? {}) as { name?: string };
+    const r = this.store.renameSession(auth, p.name as string);
     this.reply(conn, 'rename_session_ack', { name: r.name, sessionNameState: r.state }, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { alias: string };
-    const r = this.store.registerAlias(auth, p.alias);
+    const p = (frame.payload ?? {}) as { alias?: string };
+    const r = this.store.registerAlias(auth, p.alias as string);
     this.reply(conn, 'register_alias_ack', r, frame.requestId);
   }
 
@@ -529,14 +540,23 @@ export class BrokerDaemon {
 
   private onAck(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { messageId: string; status: 'accepted' | 'rejected'; note?: string; injectionId?: string };
+    const p = (frame.payload ?? {}) as { messageId?: string; status?: 'accepted' | 'rejected'; note?: string; injectionId?: string };
+    // Validate required untrusted fields → clean PROTOCOL_VIOLATION (an undefined messageId
+    // would otherwise reach a SQL bind and throw a raw error mislabeled as DATABASE_ERROR).
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'ack requires a messageId');
+    if (p.status !== 'accepted' && p.status !== 'rejected') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "ack requires status 'accepted' or 'rejected'");
     const r = this.delivery.ack(auth, { messageId: p.messageId, status: p.status, ...(p.note !== undefined ? { note: p.note } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) });
     this.reply(conn, 'ack_message_ack', r, frame.requestId);
   }
 
   private onReply(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
-    const p = frame.payload as { messageId: string; text: string; outcome: 'completed' | 'failed' | 'partial'; idempotencyKey?: string; metadata?: Record<string, string>; injectionId?: string };
+    const p = (frame.payload ?? {}) as { messageId?: string; text?: string; outcome?: 'completed' | 'failed' | 'partial'; idempotencyKey?: string; metadata?: Record<string, string>; injectionId?: string };
+    // Validate required untrusted fields → clean PROTOCOL_VIOLATION (an undefined messageId
+    // would otherwise reach a SQL bind and throw a raw error mislabeled as DATABASE_ERROR).
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires a messageId');
+    if (typeof p.text !== 'string') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'reply requires text');
+    if (p.outcome !== 'completed' && p.outcome !== 'failed' && p.outcome !== 'partial') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "reply requires outcome 'completed' | 'failed' | 'partial'");
     const r = this.delivery.reply(
       auth,
       { messageId: p.messageId, text: p.text, outcome: p.outcome, ...(p.idempotencyKey !== undefined ? { idempotencyKey: p.idempotencyKey } : {}), ...(p.metadata !== undefined ? { metadata: p.metadata } : {}), ...(p.injectionId !== undefined ? { injectionId: p.injectionId } : {}) },

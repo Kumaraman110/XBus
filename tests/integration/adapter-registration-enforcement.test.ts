@@ -142,3 +142,43 @@ describe('adapter registration enforcement (real broker path)', () => {
     expect((a3.payload as { awardedSupport?: unknown }).awardedSupport).toBeUndefined();
   });
 });
+
+describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE_ERROR "internal error" (final-review R12/R13)', () => {
+  const errOf = (ack: { frameType: string; payload: unknown }) => ({ frameType: ack.frameType, ...(ack.payload as { code?: string; message?: string }) });
+
+  it('R12: adapter-aware register with malformed declaredCapabilities is PROTOCOL_VIOLATION', async () => {
+    const c = await conn('hook');
+    // declaredCapabilities present but missing the required groups (an untrusted-frame shape).
+    const ack = await c.request('register_session', baseReg({
+      sessionId: 'mal-caps', role: 'hook',
+      adapterRegistration: { adapterId: 'x', adapterVersion: '1', role: 'hook', declaredCapabilities: {} },
+    }));
+    const e = errOf(ack);
+    expect(e.frameType).toBe('error');
+    expect(e.code).toBe('XBUS_PROTOCOL_VIOLATION');
+    expect(e.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(e.message).not.toMatch(/internal error/);
+  });
+
+  it('R13: null/omitted top-level payload on register/ack/reply/rename/register_alias is NOT a mislabeled internal error', async () => {
+    // Each handler previously cast frame.payload unchecked → a null payload threw a raw
+    // TypeError surfaced as XBUS_DATABASE_ERROR "internal error". After the guard it must be
+    // a clean, client-facing validation/protocol error code instead.
+    const c = await conn('mcp');
+    // Must be registered first so ack/reply/rename/register_alias reach their handler bodies.
+    await c.request('register_session', baseReg({ sessionId: 'r13-s', role: 'mcp' }));
+    for (const frameType of ['ack_message', 'reply_message', 'rename_session', 'register_alias']) {
+      const ack = await c.request(frameType, null as unknown as Record<string, unknown>);
+      const e = errOf(ack);
+      expect(e.frameType, `${frameType} should error cleanly`).toBe('error');
+      expect(e.code, `${frameType} must not be mislabeled DATABASE_ERROR`).not.toBe('XBUS_DATABASE_ERROR');
+      expect(e.message ?? '', `${frameType} must not surface "internal error"`).not.toMatch(/internal error/);
+    }
+    // A fresh connection: register itself with a null payload → clean error, not internal error.
+    const c2 = await conn('mcp');
+    const regAck = errOf(await c2.request('register_session', null as unknown as Record<string, unknown>));
+    expect(regAck.frameType).toBe('error');
+    expect(regAck.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(regAck.message ?? '').not.toMatch(/internal error/);
+  });
+});
