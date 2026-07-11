@@ -181,4 +181,21 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
     expect(regAck.code).not.toBe('XBUS_DATABASE_ERROR');
     expect(regAck.message ?? '').not.toMatch(/internal error/);
   });
+
+  it('R13b: WRONG-TYPED untrusted fields (numeric alias on block_peer, numeric reason on redeliver) are not mislabeled internal errors', async () => {
+    const c = await conn('mcp');
+    await c.request('register_session', baseReg({ sessionId: 'r13b-s', role: 'mcp' }));
+    // block_peer with a numeric alias: the guard must reject on TYPE, not just falsiness —
+    // a numeric alias previously reached ControlsStore .toLowerCase() → raw TypeError.
+    const bp = errOf(await c.request('block_peer', { alias: 123 } as unknown as Record<string, unknown>));
+    expect(bp.frameType).toBe('error');
+    expect(bp.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(bp.message ?? '').not.toMatch(/internal error/);
+    // redeliver with a numeric reason on an unknown message: must surface MESSAGE_NOT_FOUND
+    // (reason is coerced to the default), never a TypeError-mislabeled DATABASE_ERROR.
+    const rd = errOf(await c.request('redeliver', { messageId: 'no-such-msg', reason: 123 } as unknown as Record<string, unknown>));
+    expect(rd.frameType).toBe('error');
+    expect(rd.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(rd.message ?? '').not.toMatch(/internal error/);
+  });
 });

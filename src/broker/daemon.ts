@@ -532,7 +532,10 @@ export class BrokerDaemon {
   private onBlockPeer(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { alias?: string; unblock?: boolean };
-    if (!p.alias) throw new XBusError(XBusErrorCode.INVALID_ALIAS, 'alias required');
+    // Reject a non-string (or empty) alias here: the guard must check the TYPE, not just
+    // falsiness — a numeric alias would otherwise reach ControlsStore.blockedAliasCi
+    // .toLowerCase() and throw a raw TypeError mislabeled as DATABASE_ERROR "internal error".
+    if (typeof p.alias !== 'string' || !p.alias) throw new XBusError(XBusErrorCode.INVALID_ALIAS, 'alias required');
     if (p.unblock) this.controls.unblockPeer(auth.sessionId, p.alias);
     else this.controls.blockPeer(auth.sessionId, p.alias, () => this.ids.next());
     this.reply(conn, 'block_peer_ack', { alias: p.alias, blocked: !p.unblock }, frame.requestId);
@@ -583,8 +586,12 @@ export class BrokerDaemon {
   private onRedeliver(conn: ServerConn, frame: Frame): void {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { messageId?: string; reason?: string };
-    if (!p.messageId) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'messageId required');
-    const entry = this.delivery.redeliver(auth, p.messageId, p.reason ?? 'explicit');
+    if (typeof p.messageId !== 'string' || !p.messageId) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'messageId required');
+    // `reason` is untrusted + optional: only honor a string (it is later .slice()'d for the
+    // audit record); a non-string falls back to the default rather than throwing a raw
+    // TypeError mislabeled as DATABASE_ERROR.
+    const reason = typeof p.reason === 'string' ? p.reason : 'explicit';
+    const entry = this.delivery.redeliver(auth, p.messageId, reason);
     if (!entry) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such message for this session');
     this.reply(conn, 'redeliver_ack', { entry, warning: 'the receiving model may process this request twice' }, frame.requestId);
   }
