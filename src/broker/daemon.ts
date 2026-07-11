@@ -550,7 +550,9 @@ export class BrokerDaemon {
     assertAllowed(auth.role, Operation.DEAD_LETTER);
     const p = (frame.payload ?? {}) as { action?: string; messageId?: string };
     if (p.action === 'inspect') {
-      if (!p.messageId) { this.reply(conn, 'error', { code: XBusErrorCode.PROTOCOL_VIOLATION, message: 'inspect requires messageId' }, frame.requestId); return; }
+      // messageId must be a non-empty STRING (a boolean would throw ERR_INVALID_ARG_TYPE at
+      // the SQL bind in deadLetters.inspect; check the type, not just falsiness).
+      if (typeof p.messageId !== 'string' || !p.messageId) { this.reply(conn, 'error', { code: XBusErrorCode.PROTOCOL_VIOLATION, message: 'inspect requires messageId' }, frame.requestId); return; }
       const record = this.deadLetters.inspect(p.messageId);
       this.reply(conn, 'dead_letter_ack', { record }, frame.requestId);
       return;

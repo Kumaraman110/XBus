@@ -197,6 +197,12 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
     expect(rd.frameType).toBe('error');
     expect(rd.code).not.toBe('XBUS_DATABASE_ERROR');
     expect(rd.message ?? '').not.toMatch(/internal error/);
+    // dead_letter inspect with a boolean messageId (truthy, so a falsiness-only guard would
+    // pass it to the SQL bind → ERR_INVALID_ARG_TYPE). Must be a clean PROTOCOL_VIOLATION.
+    const dl = errOf(await c.request('dead_letter', { action: 'inspect', messageId: true } as unknown as Record<string, unknown>));
+    expect(dl.frameType).toBe('error');
+    expect(dl.code).not.toBe('XBUS_DATABASE_ERROR');
+    expect(dl.message ?? '').not.toMatch(/internal error/);
   });
 
   it('R14: a non-numeric `limit` on checkpoint_pull / inbox is PROTOCOL_VIOLATION, not a SQL-bind internal error', async () => {
