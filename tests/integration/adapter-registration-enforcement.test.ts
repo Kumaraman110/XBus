@@ -209,6 +209,9 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
       ['checkpoint_pull', { limit: true }],
       ['inbox', { limit: 'five' }],            // VIEW path (markInjected defaults true)
       ['inbox', { markInjected: false, limit: {} }], // PEEK path
+      ['checkpoint_pull', { limit: 2.5 }],     // R15: finite NON-integer still fails the bind
+      ['inbox', { limit: 1e21 }],              // R15: out-of-range finite value
+      ['checkpoint_pull', { limit: -3 }],      // R15: negative
     ] as Array<[string, Record<string, unknown>]>) {
       const e = errOf(await c.request(frameType, payload as unknown as Record<string, unknown>));
       expect(e.frameType, `${frameType} ${JSON.stringify(payload)} should error cleanly`).toBe('error');
@@ -219,5 +222,23 @@ describe('malformed untrusted input → clean PROTOCOL_VIOLATION, never DATABASE
     // A valid numeric limit still works (no false positive).
     const ok = await c.request('checkpoint_pull', { limit: 5 });
     expect(ok.frameType).toBe('checkpoint_pull_ack');
+  });
+
+  it('R15: register with a boolean optional string field is PROTOCOL_VIOLATION, not a SQL-bind internal error', async () => {
+    // repositoryRoot / claudeCodeVersion / agentType are forwarded into TEXT columns; a
+    // boolean throws ERR_INVALID_ARG_TYPE at the bind (mislabeled DATABASE_ERROR). Must be
+    // a clean PROTOCOL_VIOLATION. Each needs a FRESH sessionId (first-registration branch).
+    let seq = 0;
+    for (const field of ['repositoryRoot', 'claudeCodeVersion', 'agentType']) {
+      const c = await conn('mcp');
+      const e = errOf(await c.request('register_session', baseReg({ sessionId: `r15-${++seq}`, role: 'mcp', [field]: true })));
+      expect(e.frameType, `${field} should error cleanly`).toBe('error');
+      expect(e.code, `${field} must be PROTOCOL_VIOLATION`).toBe('XBUS_PROTOCOL_VIOLATION');
+      expect(e.message ?? '').not.toMatch(/internal error/);
+    }
+    // A valid string optional field still registers fine (no false positive).
+    const c2 = await conn('mcp');
+    const ok = await c2.request('register_session', baseReg({ sessionId: 'r15-ok', role: 'mcp', agentType: 'claude', repositoryRoot: '/repo', claudeCodeVersion: '2.1.0' }));
+    expect(ok.frameType).toBe('register_session_ack');
   });
 });

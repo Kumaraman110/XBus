@@ -168,14 +168,18 @@ export class BrokerDaemon {
    * Validate the untrusted, optional `limit` payload field on the read/pull handlers.
    * `limit` flows into a SQL `LIMIT ?` bind; node:sqlite throws a raw
    * TypeError/ERR_SQLITE_ERROR (mislabeled as DATABASE_ERROR "internal error") if it is a
-   * non-number (boolean/string/object/array) or a NaN. Reject a present-but-non-integer
-   * limit with a clean PROTOCOL_VIOLATION; `undefined` passes through to the caller's
-   * default. Returns the validated number | undefined.
+   * non-number (boolean/string/object/array), a NaN/Infinity, a non-integer (2.5), or an
+   * out-of-range value (1e21). Reject anything but a non-negative safe integer with a clean
+   * PROTOCOL_VIOLATION; `undefined` passes through to the caller's default. Returns the
+   * validated number | undefined.
    */
   private validatedLimit(raw: unknown): number | undefined {
     if (raw === undefined) return undefined;
-    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
-      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'limit must be a finite number');
+    // Must be a NON-NEGATIVE SAFE INTEGER. A finite NON-integer (2.5) or an out-of-range
+    // value (1e21) still fails the `LIMIT ?` bind with a raw node:sqlite "datatype mismatch"
+    // that would be mislabeled DATABASE_ERROR — so reject anything but a clean integer here.
+    if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw > Number.MAX_SAFE_INTEGER) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'limit must be a non-negative integer');
     }
     return raw;
   }
@@ -323,6 +327,15 @@ export class BrokerDaemon {
     }
     if (typeof p.processId !== 'number') {
       throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session requires a numeric processId');
+    }
+    // Optional string fields are forwarded verbatim into the sessions INSERT (TEXT columns).
+    // A boolean value throws ERR_INVALID_ARG_TYPE at the bind (mislabeled DATABASE_ERROR), so
+    // reject a present-but-non-string here. (requestedSessionName is exempt: it routes
+    // through validateSessionName, which type-checks and fails soft to pending.)
+    for (const field of ['repositoryRoot', 'claudeCodeVersion', 'agentType'] as const) {
+      if (p[field] !== undefined && typeof p[field] !== 'string') {
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session ${field} must be a string when present`, { field });
+      }
     }
     // The register frame's role is the connection's declared authority role. It is NOT a
     // privilege the broker grants: what a role can DO is enforced elsewhere (assertAllowed
