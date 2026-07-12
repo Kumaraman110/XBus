@@ -13,7 +13,7 @@ export const PROTOCOL_VERSION = 1 as const;
 export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;
 
 /** XBus product version (kept in sync with package.json at build time). */
-export const XBUS_VERSION = '0.1.0-beta.5' as const;
+export const XBUS_VERSION = '0.1.0-beta.4.1' as const;
 
 /**
  * Decide whether a peer's advertised protocol version is acceptable.

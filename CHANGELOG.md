@@ -6,11 +6,13 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
-## [0.1.0-beta.5] — session-registration robustness fix
+## [0.1.0-beta.4.1] — session-registration robustness patch
 
-A correctness hotfix for the beta.4 named-session registration path. **No protocol,
+A correctness patch for the beta.4 named-session registration path. **No protocol,
 XBUS-STP, schema, or compatibility change** — `compatibilityId` remains
-`xbus-p1-stp1-s6` and schema remains `6`.
+`xbus-p1-stp1-s6` and schema remains `6`. This is a beta.4 patch release; the beta.5
+version is reserved for the localhost control-plane / lifecycle / audit-ledger /
+threaded-messaging phase.
 
 ### Fixed
 - **Automatic-alias prefix collision no longer fails registration.** The broker-minted
