@@ -6,6 +6,23 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] — session-registration robustness fix
+
+A correctness hotfix for the beta.4 named-session registration path. **No protocol,
+XBUS-STP, schema, or compatibility change** — `compatibilityId` remains
+`xbus-p1-stp1-s6` and schema remains `6`.
+
+### Fixed
+- **Automatic-alias prefix collision no longer fails registration.** The broker-minted
+  fallback alias (`session-<8hex>`) is derived from only the first 8 hex characters of
+  the `CLAUDE_CODE_SESSION_ID`. Two distinct sessions sharing that prefix mapped to the
+  same alias, and the second registration hit a raw `UNIQUE constraint failed` that was
+  surfaced to the peer as a mislabeled `DATABASE_ERROR "internal error"` — failing the
+  whole registration. The fallback alias is now claimed collision-safely: the colliding
+  session registers cleanly (still fully routable by its exact session id) and simply
+  does not hold the shared convenience alias. Applied at all three fallback-alias sites
+  (first registration, expired-resume, and rename-resume reactivation).
+
 ## [0.1.0-beta.4] — zero-friction launch, named sessions, and 15-day retention
 
 The zero-friction adoption milestone (ADR 0012). **The compatibility tuple moves
