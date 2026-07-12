@@ -4,6 +4,65 @@ All notable changes to XBus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project is in
 pre-1.0 Developer Preview, so the public surface may still change.
 
+## [Unreleased]
+
+## [0.1.0-beta.4] — zero-friction launch, named sessions, and 15-day retention
+
+The zero-friction adoption milestone (ADR 0012). **The compatibility tuple moves
+`xbus-p1-stp1-s5 → xbus-p1-stp1-s6`**: the application protocol and XBUS-STP wire
+format/crypto are unchanged (both still `1`), only the database schema integer
+advances `5 → 6` — a deliberate fail-closed bump so older code refuses a
+v6-migrated database. This is a product-version + provenance reconciliation of the
+functional integration merged for beta.4; there is no protocol, XBUS-STP, or crypto
+change beyond the schema component of the tuple.
+
+### Added
+- **Zero-friction launch (ADR 0012 D7).** `ensureBroker()` composes the existing
+  connect-or-start primitives into one race-safe entry and never force-restarts an
+  incompatible broker.
+- **Required human-readable session names (ADR 0012 D2/D3/D4).** A session name is a
+  new lifecycle column, orthogonal to connection state and readiness:
+  global-within-broker, case-insensitive, enforced by a partial unique index. A
+  `pending_name` session is unroutable; activation and rename are atomic.
+- **15-day activity retention (ADR 0012 D5/D6).** Inactive sessions expire after 15
+  days of no meaningful activity (a closed activity list) via one new pass in the
+  existing reaper transaction; retention reuses `expires_at`.
+- **User-scope config manager (ADR 0012 D8).** Transactional, ownership-tagged
+  install/uninstall of the Claude MCP entry + hooks, with the runtime broker op kept
+  separate from `ensureBroker()`.
+- **Model-visible duplicate prevention (§1).** `xbus_inbox` classifies each
+  pending entry (`queued_not_injected` / `context_injected_unacknowledged` /
+  `application_accepted` / `application_completed`) and includes the request body
+  exactly once; a recovery pull returns metadata with `bodyIncluded:false`.
+  Explicit `xbus_redeliver` is the only (audited, warned) way to re-show a body.
+- **Explicit session readiness (§2).** Readiness (`initializing`,
+  `ready_checkpoint`, `ready_live`, `degraded_*`, `incompatible`, `disconnected`)
+  is tracked and reported separately from connection state and receive mode; a
+  session is not injected a request it cannot yet acknowledge.
+- **Reliability reaper (§4).** Periodic + on-demand sweep reclaims ack-timeouts
+  (→ retry/dead-letter), acceptance-TTL expiries, and abandoned leases, with a
+  per-session fairness cap.
+- **Secure resource-pressure hardening (§3).** Handshake-completion timeout
+  (slow-loris bound) plus a pressure test suite over XBUS-STP.
+- **Performance benchmark (§5)** over the encrypted transport + a regression guard.
+- **Isolated Windows packaging (§7).** Self-contained staging, checksums, SBOM,
+  pinned runtime, and a content scanner — no build toolchain needed after install.
+- **Public documentation layer (§9).** README, architecture, delivery semantics,
+  security, privacy, providers, troubleshooting, compatibility, roadmap, and the
+  standard community files.
+
+### Security
+- XBUS-STP custom secure transport integrated into every broker/client path
+  (mutual auth, per-frame AES-256-GCM, replay/reorder rejection); internally
+  reviewed, not independently audited.
+- Migration downgrade guard: old code refuses a DB with a newer schema version.
+
+### Notes
+- Delivery is **at-most-once effective context injection**, **not** exactly-once
+  execution. See [docs/delivery-semantics.md](docs/delivery-semantics.md).
+- Windows-first; macOS/Linux implemented but not yet runtime-validated.
+- On Bedrock, delivery is checkpoint-based; idle-wake is unsupported.
+
 ## [0.1.0-beta.3] — Windows and delivery-correctness hotfix
 
 A release-correctness update for the Windows first-user experience and checkpoint
@@ -80,39 +139,3 @@ runtime-validated) · same-machine, same-user only · Bedrock = deferred checkpo
 delivery (no idle wake) · at-most-once context presentation (no exactly-once
 execution) · cross-user Windows unvalidated · XBUS-STP internally reviewed, **not
 independently audited**.
-
-## [Unreleased]
-
-### Added
-- **Model-visible duplicate prevention (§1).** `xbus_inbox` classifies each
-  pending entry (`queued_not_injected` / `context_injected_unacknowledged` /
-  `application_accepted` / `application_completed`) and includes the request body
-  exactly once; a recovery pull returns metadata with `bodyIncluded:false`.
-  Explicit `xbus_redeliver` is the only (audited, warned) way to re-show a body.
-- **Explicit session readiness (§2).** Readiness (`initializing`,
-  `ready_checkpoint`, `ready_live`, `degraded_*`, `incompatible`, `disconnected`)
-  is tracked and reported separately from connection state and receive mode; a
-  session is not injected a request it cannot yet acknowledge.
-- **Reliability reaper (§4).** Periodic + on-demand sweep reclaims ack-timeouts
-  (→ retry/dead-letter), acceptance-TTL expiries, and abandoned leases, with a
-  per-session fairness cap.
-- **Secure resource-pressure hardening (§3).** Handshake-completion timeout
-  (slow-loris bound) plus a pressure test suite over XBUS-STP.
-- **Performance benchmark (§5)** over the encrypted transport + a regression guard.
-- **Isolated Windows packaging (§7).** Self-contained staging, checksums, SBOM,
-  pinned runtime, and a content scanner — no build toolchain needed after install.
-- **Public documentation layer (§9).** README, architecture, delivery semantics,
-  security, privacy, providers, troubleshooting, compatibility, roadmap, and the
-  standard community files.
-
-### Security
-- XBUS-STP custom secure transport integrated into every broker/client path
-  (mutual auth, per-frame AES-256-GCM, replay/reorder rejection); internally
-  reviewed, not independently audited.
-- Migration downgrade guard: old code refuses a DB with a newer schema version.
-
-### Notes
-- Delivery is **at-most-once effective context injection**, **not** exactly-once
-  execution. See [docs/delivery-semantics.md](docs/delivery-semantics.md).
-- Windows-first; macOS/Linux implemented but not yet runtime-validated.
-- On Bedrock, delivery is checkpoint-based; idle-wake is unsupported.
