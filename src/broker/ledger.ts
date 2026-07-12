@@ -56,9 +56,29 @@ function canonicalize(value: unknown, at: string): string {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
+    // Reject SPARSE arrays: a hole reads as `undefined` here but JSON.stringify emits
+    // `null`, so canonicalize(x) would differ from canonicalize(JSON.parse(stringify(x)))
+    // — a silent write-vs-verify hash divergence. Fail loud instead.
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value)) throw new LedgerCanonicalizationError(`sparse array hole at ${at}[${i}]`);
+    }
     return '[' + value.map((v, i) => canonicalize(v, `${at}[${i}]`)).join(',') + ']';
   }
   if (t === 'object') {
+    // ONLY plain objects (prototype Object.prototype or null) are canonicalized structurally.
+    // A Date / class instance / any object with a custom `toJSON` serializes via JSON.stringify
+    // to something OTHER than its own-enumerable-key view (e.g. `new Date()` → an ISO string,
+    // but Object.keys(date) === []), so canonicalize(live) would differ from
+    // canonicalize(JSON.parse(stringify(live))) — a permanent spurious chain break on verify.
+    // Reject them at WRITE time (fail loud) rather than silently corrupt the chain. Our safe
+    // payloads are flat ids/states/counts/hashes, so this never rejects a legitimate value.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new LedgerCanonicalizationError(`non-plain object (${(value as object).constructor?.name ?? 'unknown'}) at ${at}`);
+    }
+    if (typeof (value as { toJSON?: unknown }).toJSON === 'function') {
+      throw new LedgerCanonicalizationError(`object with custom toJSON at ${at}`);
+    }
     const obj = value as Record<string, unknown>;
     const parts: string[] = [];
     for (const k of Object.keys(obj).sort()) {
@@ -184,12 +204,26 @@ export function verifyLedger(db: SqliteDriver): LedgerVerifyResult {
   let expectedPrev = anchor ? anchor.anchorHash : LEDGER_GENESIS_HASH;
   let expectedSeq = anchor ? anchor.anchorSeq + 1 : 1;
   for (const r of rows) {
-    const canonical = canonicalLedgerPayload({
-      seq: r.seq, eventType: r.eventType, actor: r.actor,
-      subject: JSON.parse(r.subjectJson) as LedgerSubject,
-      payload: JSON.parse(r.payloadJson) as Record<string, unknown>,
-      createdAt: r.createdAt,
-    });
+    // A row whose subject/payload JSON was corrupted into non-parseable text (bit-rot, a
+    // direct file edit, a partial write) is EXACTLY what verify must localize — so a parse
+    // failure is a chain BREAK at this seq, never an uncaught throw out of verify. Same for
+    // a canonicalization failure (a value that can't be re-canonicalized). Report the first
+    // such break with a sentinel recomputed hash so the caller sees ok:false + the seq.
+    let canonical: string;
+    try {
+      canonical = canonicalLedgerPayload({
+        seq: r.seq, eventType: r.eventType, actor: r.actor,
+        subject: JSON.parse(r.subjectJson) as LedgerSubject,
+        payload: JSON.parse(r.payloadJson) as Record<string, unknown>,
+        createdAt: r.createdAt,
+      });
+    } catch {
+      return {
+        ok: false,
+        checked: r.seq - minSeq,
+        firstBreak: { seq: r.seq, expectedPrev, actualPrev: r.prevHash, recomputed: 'unparseable', stored: r.entryHash },
+      };
+    }
     const recomputed = computeEntryHash(r.prevHash, canonical);
     if (r.seq !== expectedSeq || r.prevHash !== expectedPrev || recomputed !== r.entryHash) {
       return {

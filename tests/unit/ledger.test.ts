@@ -186,4 +186,35 @@ describe('ledger hardening — the 7 invariants', () => {
     // Nothing was inserted (canonicalization threw before the INSERT).
     expect(rows()).toHaveLength(0);
   });
+
+  // Adversarial-review fix #2: canonicalize must REJECT non-plain objects (Date / toJSON /
+  // sparse arrays) at write time, since JSON.stringify(them) differs from their own-key view
+  // → a silent write-vs-verify hash divergence (permanent spurious chain break). Fail loud.
+  it('canonicalization rejects a Date / custom-toJSON object / sparse array (silent-divergence guard)', () => {
+    expect(() => canonicalLedgerPayload({ seq: 1, eventType: 'E', actor: 'b', subject: {}, payload: { at: new Date(0) }, createdAt: 't' })).toThrow(/non-plain object|toJSON/);
+    expect(() => canonicalLedgerPayload({ seq: 1, eventType: 'E', actor: 'b', subject: {}, payload: { j: { toJSON: () => 1 } as never }, createdAt: 't' })).toThrow(/toJSON|non-plain/);
+    const sparse: number[] = []; sparse[2] = 1; // hole at [0],[1]
+    expect(() => canonicalLedgerPayload({ seq: 1, eventType: 'E', actor: 'b', subject: {}, payload: { arr: sparse }, createdAt: 't' })).toThrow(/sparse/);
+    // A ledgerAppend of a Date payload aborts as AUDIT_PERSISTENCE_FAILED, nothing inserted.
+    let code: string | undefined;
+    try { ledgerAppend(db, ids, clock, 'E', 'broker', { sessionId: 's' }, { at: new Date(0) }); }
+    catch (e) { if (isXBusError(e)) code = e.code; }
+    expect(code).toBe(XBusErrorCode.AUDIT_PERSISTENCE_FAILED);
+    expect(rows()).toHaveLength(0);
+  });
+
+  // Adversarial-review fix #1: a row corrupted into NON-PARSEABLE JSON must be LOCALIZED as a
+  // break (verify's whole purpose), never throw a raw SyntaxError out of verifyLedger.
+  it('verifyLedger localizes a row corrupted into invalid JSON (does not throw)', () => {
+    for (let i = 0; i < 4; i++) append('E', { sessionId: 's' + i }, { n: i });
+    // Corrupt seq 2's payload_json into invalid JSON via an out-of-band edit (drop/restore
+    // the update trigger to simulate bit-rot / a direct file edit).
+    db.exec('DROP TRIGGER ledger_no_update');
+    db.prepare("UPDATE ledger_events SET payload_json='{not valid json' WHERE seq=2").run();
+    db.exec("CREATE TRIGGER ledger_no_update BEFORE UPDATE ON ledger_events BEGIN SELECT RAISE(ABORT,'ledger_events is append-only'); END");
+    let v: ReturnType<typeof verifyLedger> | undefined;
+    expect(() => { v = verifyLedger(db); }).not.toThrow(); // no raw SyntaxError escapes
+    expect(v!.ok).toBe(false);
+    expect(v!.firstBreak?.seq).toBe(2);
+  });
 });
