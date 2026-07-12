@@ -30,6 +30,10 @@ export const PLUGIN_PAYLOAD_FILES = [
   'dist/channel/server.js',       // MCP server (spawned by .mcp.json)
   'dist/channel/hook-entry.js',   // checkpoint hook entry (UserPromptSubmit + Stop)
   'dist/channel/session-start-hook.js', // beta.5 SessionStart lifecycle hook (visibility)
+  'dist/broker/dashboard/read-worker.js', // beta.5 off-loop read-only dashboard worker entry
+  'dist/broker/dashboard/static/index.html', // beta.5 dashboard UI (inert; no secrets/data)
+  'dist/broker/dashboard/static/app.js',
+  'dist/broker/dashboard/static/style.css',
   'package.json',                 // runtime manifest (bin + deps + engines)
   'provenance.json',              // exact build identity, read at runtime (see ADR 0011)
 ] as const;

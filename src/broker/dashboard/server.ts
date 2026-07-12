@@ -19,8 +19,21 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { DashboardAuth } from './auth.js';
 import type { ReadExecutor } from './read-worker.js';
+
+/**
+ * Resolve the packaged static UI dir (`<this-dir>/static`). Returns undefined if it isn't
+ * present (e.g. running before the static assets were copied into dist) so the server falls
+ * back to the inert built-in shell. Works from both dist (`.js`) and, in tests, source.
+ */
+export function defaultStaticDir(): string | undefined {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [path.join(here, 'static'), path.join(here.replace(/([\\/])src\1/, '$1dist$1'), 'static')];
+  for (const c of candidates) { try { if (fs.existsSync(path.join(c, 'index.html'))) return c; } catch { /* ignore */ } }
+  return undefined;
+}
 
 const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'",
@@ -80,7 +93,9 @@ export class DashboardServer {
   constructor(opts: DashboardServerOptions) {
     this.auth = opts.auth;
     this.reader = opts.reader;
-    this.staticDir = opts.staticDir;
+    // Default to the packaged static UI dir; if it isn't present the built-in inert shell
+    // is served instead (so the API is reachable even before the assets are copied).
+    this.staticDir = opts.staticDir ?? defaultStaticDir();
     this.host = opts.host ?? '127.0.0.1';
     this.wantPort = opts.port ?? 0;
     this.log = opts.log ?? (() => {});

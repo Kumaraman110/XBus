@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "postbuild": "node dist/tools/write-provenance.js",
+    "postbuild": "node dist/tools/copy-static.js && node dist/tools/write-provenance.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "lint": "eslint .",
