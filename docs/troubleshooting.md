@@ -5,7 +5,7 @@
 > from your checkout, or the installed plugin's `dist\cli\main.js` by absolute path. See
 > [installation.md](installation.md).
 >
-> **`XBus does not yet support Node.js 25.x`.** XBus supports Node `>=22.5` and `<25`.
+> **`XBus does not yet support Node.js 25.x`.** XBus supports Node `>=22.13` and `<25`.
 > Use **Node 22 LTS** or **Node 24**. (Maintainers validating a newer major can set
 > `XBUS_ALLOW_UNSUPPORTED_NODE=1`, which runs with a visible warning and does not change
 > the supported boundary.)

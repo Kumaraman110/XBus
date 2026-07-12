@@ -1,15 +1,22 @@
 /**
- * Node.js support boundary (§8). The published `engines` range is ">=22.5 <25".
+ * Node.js support boundary (§8). The published `engines` range is ">=22.13 <25".
  * Node 25 is NOT yet validated by the clean-machine acceptance suite, so it is
  * outside the supported boundary until that proof exists. This guard reports an
  * ACTIONABLE error EARLY (at CLI/broker entry) rather than failing deep inside
  * installation or a test.
+ *
+ * Beta.5 raised the floor 22.5 -> 22.13: the control-plane dashboard opens the
+ * SQLite database in a worker with `DatabaseSync({ readOnly: true })` (a physically
+ * read-only handle — the broker stays the single writer, ADR 0018/0020 Q5). The
+ * `readOnly` option landed in node:sqlite in Node 22.12/22.13; on an older 22.x it
+ * is silently ignored, which would give the dashboard a WRITABLE handle. Failing
+ * closed here (before install/migration) guarantees the read-only guarantee holds.
  */
 
 /** Inclusive lower / exclusive upper bound on the Node MAJOR version. */
 export const MIN_NODE_MAJOR = 22;
-export const MIN_NODE_MINOR_AT_MIN_MAJOR = 5; // >= 22.5
-export const MAX_NODE_MAJOR_EXCLUSIVE = 25;   // < 25 (Node 25 not yet validated)
+export const MIN_NODE_MINOR_AT_MIN_MAJOR = 13; // >= 22.13 (node:sqlite DatabaseSync readOnly)
+export const MAX_NODE_MAJOR_EXCLUSIVE = 25;    // < 25 (Node 25 not yet validated)
 
 export interface NodeSupport {
   ok: boolean;

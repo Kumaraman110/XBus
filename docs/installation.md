@@ -7,7 +7,7 @@
 
 ## Requirements
 
-- **Node.js `>=22.5` and `<25`.** XBus uses the `node:sqlite` built-in (no native
+- **Node.js `>=22.13` and `<25`.** XBus uses the `node:sqlite` built-in (no native
   addons, no C/C++ toolchain). **Node 25+ is not yet supported** — it has not passed
   the clean-machine acceptance suite; the CLI prints an actionable error on an
   unsupported Node. Use **Node 22 LTS** or **Node 24**.
