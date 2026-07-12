@@ -455,6 +455,9 @@ export class BrokerDaemon {
       ...(transcriptPath !== undefined ? { transcriptPath } : {}),
       ...(agentType !== undefined ? { agentType } : {}),
     });
+    // Beta.5: nudge any open dashboard streams that session state changed (best-effort,
+    // off-loop read; never throws into the handler). No-op if no dashboard is wired.
+    try { this.onSessionStateChanged?.(); } catch { /* dashboard notify is best-effort */ }
     this.reply(conn, 'announce_session_ack', {
       sessionId: auth.sessionId, managementState: r.managementState, source: r.source,
       lifecycleEvent: r.lifecycleEvent, epoch: r.epoch, appended: r.appended,
@@ -573,6 +576,10 @@ export class BrokerDaemon {
 
   /** Set by the host: performs graceful broker stop + state-file cleanup. */
   onShutdownRequested?: () => void | Promise<void>;
+
+  /** Beta.5: set by the host when a dashboard is running — called after a session-state
+   *  mutation (e.g. announce) so open dashboard streams get a fresh snapshot. Best-effort. */
+  onSessionStateChanged?: () => void;
 
   /** Set the CALLER's own receive control (pause/resume/dnd/manual). */
   private onSetControl(conn: ServerConn, frame: Frame): void {

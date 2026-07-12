@@ -17,6 +17,9 @@ import { readProvenance, resolveIdentity, provenancePathFromDist } from '../shar
 import { checkSingleton } from './singleton.js';
 import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
+import { DashboardServer } from './dashboard/server.js';
+import { DashboardAuth } from './dashboard/auth.js';
+import { WorkerReadExecutor } from './dashboard/read-worker.js';
 
 export interface BrokerHostOptions extends DaemonOptions {
   dataDir: string;
@@ -31,6 +34,11 @@ export interface BrokerHostOptions extends DaemonOptions {
   enforceSingleton?: boolean;
   /** Enable the XBUS-STP secure transport (default true). Tests may disable. */
   secureTransport?: boolean;
+  /** Beta.5 Phase 1: start the loopback read-only dashboard alongside the broker
+   *  (ADR 0015). Default false in Phase 1 (opt-in until the UI slice + `xbus dashboard`
+   *  verb land); when true the broker owns the single HTTP server on 127.0.0.1. A
+   *  dashboard start failure is best-effort and NEVER fails broker start (I5). */
+  dashboard?: boolean | { port?: number };
 }
 
 export interface RunningBroker {
@@ -40,6 +48,9 @@ export interface RunningBroker {
   brokerInstanceId: string;
   /** Present when the secure transport is enabled — clients need it to connect. */
   rootSecret?: Buffer;
+  /** Present when a dashboard was started (ADR 0015). */
+  dashboard?: DashboardServer;
+  dashboardUrl?: string;
   stop(): Promise<void>;
 }
 
@@ -100,12 +111,39 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     throw e;
   }
 
+  // Beta.5 Phase 1 (ADR 0015): start the loopback read-only dashboard alongside the
+  // broker, best-effort — a dashboard failure must NEVER fail broker start (I5). The
+  // broker owns the single HTTP server; the read path is an OFF-LOOP worker with its own
+  // readOnly:true handle (ADR 0020 Q5), so it cannot stall delivery or mutate the DB.
+  let dashboard: DashboardServer | undefined;
+  let dashboardUrl: string | undefined;
+  if (opts.dashboard) {
+    try {
+      const auth = new DashboardAuth(clock);
+      const reader = new WorkerReadExecutor(dbPath, { requestTimeoutMs: 5000 });
+      const wantPort = typeof opts.dashboard === 'object' && opts.dashboard.port !== undefined ? opts.dashboard.port : 0;
+      dashboard = new DashboardServer({ auth, reader, host: '127.0.0.1', port: wantPort, ...(opts.log ? { log: opts.log } : {}) });
+      await dashboard.start();
+      dashboardUrl = dashboard.url;
+      // Push live snapshots to open streams on every session-state mutation (off-loop read).
+      daemon.onSessionStateChanged = () => dashboard!.notifyChange();
+    } catch (e) {
+      opts.log?.(`dashboard start failed (continuing without it): ${(e as Error).message}`);
+      try { await dashboard?.stop(); } catch { /* ignore */ }
+      dashboard = undefined;
+      dashboardUrl = undefined;
+    }
+  }
+
   // Write the identity-rich state file (ADR 0007) so `xbus stop` can target this
   // broker safely. Atomic + user-only perms; written only if a dataDir is real.
   let stopped = false;
   const doStop = async () => {
     if (stopped) return;
     stopped = true;
+    // Stop the dashboard FIRST (its off-loop worker holds a read-only DB handle; close it
+    // before the writer's db.close()). Best-effort.
+    if (dashboard) { try { await dashboard.stop(); } catch { /* ignore */ } }
     await daemon.stop();
     removeStateFileIfOwned(opts.dataDir, brokerInstanceId);
     db.close();
@@ -128,6 +166,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
       sourceCommit: stateIdentity.sourceCommit,
       endpoint,
       ownerIdentityHash: ownerIdentityHash(),
+      ...(dashboard ? { dashboardPort: dashboard.port, dashboardUrl: dashboard.url } : {}),
     });
     // The authenticated IPC shutdown path triggers a graceful stop. The host
     // does NOT exit the process — the caller (CLI start loop) decides that via
@@ -141,6 +180,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     endpoint,
     brokerInstanceId,
     ...(rootSecret ? { rootSecret } : {}),
+    ...(dashboard && dashboardUrl ? { dashboard, dashboardUrl } : {}),
     stop: doStop,
   };
 }
