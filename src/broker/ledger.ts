@@ -72,9 +72,9 @@ function canonicalize(value: unknown, at: string): string {
     // canonicalize(JSON.parse(stringify(live))) — a permanent spurious chain break on verify.
     // Reject them at WRITE time (fail loud) rather than silently corrupt the chain. Our safe
     // payloads are flat ids/states/counts/hashes, so this never rejects a legitimate value.
-    const proto = Object.getPrototypeOf(value);
+    const proto: unknown = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) {
-      throw new LedgerCanonicalizationError(`non-plain object (${(value as object).constructor?.name ?? 'unknown'}) at ${at}`);
+      throw new LedgerCanonicalizationError(`non-plain object at ${at}`);
     }
     if (typeof (value as { toJSON?: unknown }).toJSON === 'function') {
       throw new LedgerCanonicalizationError(`object with custom toJSON at ${at}`);

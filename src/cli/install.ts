@@ -27,6 +27,7 @@ import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarke
 import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
 import { SCHEMA_VERSION } from '../protocol/handshake.js';
 import { snapshotDb, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
+import { openDatabase } from '../database/connection.js';
 
 /**
  * Read the on-disk DB schema version WITHOUT migrating (a plain read of MAX(version) from
@@ -38,8 +39,6 @@ import { snapshotDb, restoreDbSnapshot, discardSnapshot, type SnapshotManifest }
 function onDiskSchemaVersion(dbPath: string): number {
   if (!fs.existsSync(dbPath)) return 0;
   try {
-    // Local import to avoid a top-level node:sqlite dependency in this CLI module's graph.
-    const { openDatabase } = require('../database/connection.js') as typeof import('../database/connection.js');
     const db = openDatabase(dbPath, { readOnly: true });
     try {
       const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number | null } | undefined;

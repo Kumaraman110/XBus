@@ -14,6 +14,7 @@
  * banner ("N Claude session(s) may be running that started before XBus…"), never per-row
  * entries and never a transition to `active` without a real SessionStart signal.
  */
+import { execFileSync } from 'node:child_process';
 
 /** Pure aggregate — trivially unit-testable, no I/O. Clamped to >= 0. */
 export function computeUnmanagedBanner(input: { liveClaudeProcesses: number; managedOrDormantSessions: number }): { possibleUnmanaged: number } {
@@ -55,9 +56,6 @@ export function countLiveClaudeProcesses(
 }
 
 function defaultListProcesses(cmd: string, args: string[]): string {
-  // Lazy import so the pure functions above stay dependency-free + the module is safe to
-  // import in a worker/test without spawning anything.
-  const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
   try {
     return execFileSync(cmd, args, { encoding: 'utf8', timeout: 2000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch {

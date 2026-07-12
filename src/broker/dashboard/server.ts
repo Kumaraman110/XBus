@@ -146,14 +146,15 @@ export class DashboardServer {
       // The ONE mutating route — nonce→token exchange (writer side; ephemeral store only).
       if (p === '/auth/exchange') {
         if (method !== 'POST') return this.json(res, 405, { error: 'method_not_allowed' });
-        return void this.handleExchange(req, res);
+        return this.handleExchange(req, res);
       }
 
-      // Authenticated data API (every /api/* incl. reads + the stream).
+      // Authenticated data API (every /api/* incl. reads + the stream). AWAIT it so a read
+      // rejection is caught by this try/catch (handleApi also maps read failure to 503).
       if (p.startsWith('/api/')) {
         if (method !== 'GET' && method !== 'HEAD') return this.json(res, 405, { error: 'method_not_allowed' });
         if (!this.auth.validateToken(bearer(req))) return this.json(res, 401, { error: 'unauthorized' });
-        return void this.handleApi(p, u, res);
+        return await this.handleApi(p, u, res);
       }
 
       // Static assets — inert, unauthenticated (no secrets, no session data).
@@ -172,7 +173,7 @@ export class DashboardServer {
     const done = (status: number, obj: unknown): void => { if (responded) return; responded = true; this.json(res, status, obj); };
     req.on('data', (c: Buffer) => {
       if (responded) return;
-      body += c;
+      body += c.toString('utf8');
       // Bound the body: respond 413 ONCE and stop accumulating (do NOT destroy the socket —
       // that would surface to the client as a connection error instead of a clean 413). We
       // pause the request so we stop buffering further bytes; the response has been sent.
