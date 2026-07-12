@@ -137,18 +137,29 @@ metadata; we never parse or mutate transcript contents.
 
 A Claude session that was **already running before XBus installed** did NOT fire a
 post-install SessionStart, so XBus has **no hook signal** for it and cannot honestly
-claim to manage it. We will **NOT** fabricate retroactive registration. Instead:
+claim to manage it. We will **NOT** fabricate retroactive registration.
 
-- Surface such sessions as **`unmanaged`** in the dashboard when we can detect them
-  (e.g. a live `claude`/node process whose session id has no XBus registration and no
-  dormant import match), clearly labelled "started before XBus — not yet managed".
-- Show the **minimum action** to manage it: "resume or restart this session
-  (`/resume` or relaunch) so XBus can register it at SessionStart." No undocumented
-  Claude-internal poking.
-- Never move an unmanaged session to active without a real SessionStart signal.
+**Locked decision (review-directed 2026-07-12): a conservative AGGREGATE banner, NOT
+per-process identity mapping.** Reliably reading another process's
+`CLAUDE_CODE_SESSION_ID` on Windows would require invasive process introspection (env/
+memory of a foreign PID) — which is exactly the "undocumented poking" Q1 forbids and a
+security-smell we refuse. So Phase 1 does **not** try to map individual unmanaged
+sessions. Instead:
 
-Detection is best-effort and explicitly labelled as such; a session we cannot map is
-still shown as `unmanaged (unidentified)` rather than hidden.
+- Compute a **conservative aggregate signal**: "are there live `claude` processes with no
+  corresponding XBus-managed/dormant session?" Using only non-invasive facts (the count
+  of managed+dormant sessions vs. a coarse count of live `claude` processes) — never
+  reading another process's env/memory.
+- If that suggests one or more unmanaged sessions exist, show a **single dashboard banner**:
+  *"N Claude session(s) may be running that started before XBus and aren't managed yet —
+  resume or restart them (`/resume` or relaunch) so XBus registers them at SessionStart."*
+  No per-row unmanaged entries, no fabricated ids.
+- Never move anything to `active` without a real SessionStart signal.
+
+This is deliberately coarse: an honest "some unmanaged sessions may exist" banner, not a
+false-precision per-session list built from invasive introspection. (The `unmanaged`
+management_state value therefore denotes the *aggregate* condition in Phase 1; per-session
+unmanaged rows are explicitly out of scope.)
 
 ## Session state model (dashboard-visible)
 
@@ -161,9 +172,12 @@ the union; the broker/ledger is the source of truth for everything except `unman
 
 ## Impact analysis (frozen-invariant + subsystem)
 
-- **Reply semantics / beta.4 compat**: request/ACK/reply frames unchanged; threads
-  (ADR 0017) are additive columns + new frames, negotiated so a beta.4/beta.4.1 client
-  still works. Layer-3 injection-id invariant (I2) preserved.
+- **Reply semantics / compat**: request/ACK/reply frames are unchanged *within a version*.
+  There is **no mixed-version operation**: the s6→s7 schema move makes the handshake fail
+  closed (`upgrade_component`, `checkCompatibility` in `handshake.ts`), so beta.5 is a
+  whole-install upgrade, not a beta.4.1↔beta.5 coexistence (ADR 0019 Decision 4). Threads
+  (ADR 0017) are a **Phase-2** addition on the all-s7 fleet. Layer-3 injection-id
+  invariant (I2) preserved; Phase 1 adds no messaging semantics at all.
 - **Retention (ADR 0012)**: dormant/unmanaged do NOT count as meaningful activity;
   import does not reset the 15-day clock. SessionStart `resume` of an expired session
   uses the existing expired-resume path (no resurrection).

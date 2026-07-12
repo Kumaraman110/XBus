@@ -17,18 +17,63 @@ preserving the audit DB unless explicit purge.
    (never `0.0.0.0`/`::`); a startup assertion refuses any non-loopback bind. No remote
    access, no LAN exposure.
 
-2. **Local auth token + CSRF.** On first start the broker mints a random
-   **dashboard token** (32 bytes, CSPRNG), stored in the ACL-restricted data dir
-   alongside the root secret (same Windows owner-only ACL as `auth/`, ADR 0010). The
-   dashboard URL opened in the browser carries a one-time handoff; the SPA then holds
-   the token and sends it as a header on every request. **Every request requires the
-   token — reads included** (correction 2026-07-12: an earlier draft scoped the token to
-   *mutating* endpoints, but the Phase-1 dashboard is read-only and still exposes session
-   metadata + the audit ledger; since loopback is **shared across local OS users**, an
-   unauthenticated read endpoint would let another same-machine user read all of that.
-   So `GET`/SSE reads require the token too — see ADR 0020 Q5 #3). CSRF: the token travels
-   in a **custom header** (never a cookie), so a browser cross-site form/GET cannot forge
-   an authenticated request; no cookie auth, `SameSite` moot.
+2. **Browser auth bootstrap — complete flow (nonce → exchange → tab token).** The
+   problem: the broker must hand a freshly-opened browser tab an authenticator without
+   (a) putting a durable secret in the URL (URLs leak via history, `Referer`, shoulder-
+   surfing, server logs), (b) trusting loopback (shared across local OS users), or (c)
+   using cookies (ambient-authority/CSRF surface). The flow, end to end:
+
+   - **Server secrets.** On first start the broker mints, in the ACL-restricted data dir
+     (owner-only, same regime as `auth/`, ADR 0010): a long-lived **root dashboard key**
+     (never sent to the browser) and, per browser-open, a short-lived **one-time nonce**.
+   - **Static assets load unauthenticated.** The HTML/CSS/JS bundle contains **no secret
+     and no session data** — it's inert app code. Serving it without a token is safe and
+     lets the page boot to run the exchange. (Only *data/API* endpoints are gated.)
+   - **Nonce travels ONLY in the URL fragment.** The broker opens
+     `http://127.0.0.1:<port>/#n=<nonce>`. The **fragment (`#…`) is never sent to the
+     server, never in `Referer`, never in server logs** — it exists only in the tab's
+     `location.hash`. The nonce is **CSPRNG, single-use, short TTL** (e.g. 60 s), stored
+     server-side as `{nonce_hash, expires_at, consumed_at}`.
+   - **JS strips the fragment, then exchanges it.** On load the app reads
+     `location.hash`, immediately `history.replaceState`s the hash away (so a reload/
+     bookmark/back cannot replay it and it won't sit in the address bar), and calls
+     **`POST /auth/exchange` with `{nonce}` in the body** (not the URL). The server
+     **atomically consumes** the nonce (single `UPDATE … SET consumed_at=? WHERE
+     nonce_hash=? AND consumed_at IS NULL AND expires_at>now` — the affected-row count is
+     the CAS; a second attempt affects 0 rows → rejected), verifies TTL, and returns a
+     **short-lived tab token** (CSPRNG, e.g. 30-min TTL, bound to `127.0.0.1`), plus its
+     expiry.
+   - **Tab token lives in memory / `sessionStorage` only** — never `localStorage`
+     (survives tab close, broader XSS exposure), never a cookie (no ambient CSRF).
+   - **Every data/API request carries `Authorization: Bearer <tab-token>`** (a custom
+     header, so a cross-site form/GET cannot forge it — CSRF-safe by construction). Every
+     `/api/*` and the live-update stream (D2.stream below) requires a valid tab token →
+     else `401`. This is the "token on every data request incl. reads" rule from ADR 0020
+     Q5 (loopback ≠ trust; the read dashboard exposes session metadata + the ledger).
+   - **Live updates use fetch-streaming, NOT EventSource.** `EventSource` cannot send an
+     `Authorization` header (browser API limitation), which would force an
+     unauthenticated or query-string-token stream — both rejected. Instead the app opens a
+     **`fetch()` streaming response** (`GET /api/stream` with the `Authorization` header,
+     a `ReadableStream` of newline-delimited JSON events) and reads it incrementally. This
+     keeps the token in a header and off the URL.
+
+   **Lifecycle / abuse behavior (all specified + tested):**
+   - **Reload / back / bookmark:** the fragment was stripped, so no nonce remains; the
+     in-memory tab token is gone after a full reload → the app has no nonce to exchange →
+     it shows a "re-open from XBus" prompt and calls `xbus dashboard` (which mints a fresh
+     nonce + opens a tab). `sessionStorage` survives a *soft* reload within the same tab,
+     so a soft reload keeps working until the tab token expires.
+   - **Token expiry:** a `401` from any data request puts the app into a "session expired
+     — reopen" state; no silent refresh (Phase 1 keeps it simple + auditable).
+   - **Nonce replay:** the atomic consume makes a second exchange of the same nonce fail
+     (0 rows) → `401`; an expired nonce → `401`. Both are ledgered as
+     `DASHBOARD_AUTH_REJECTED`.
+   - **Browser reopen / multiple tabs:** each `xbus dashboard` open mints a **new** nonce
+     → a **new independent tab token**; tokens are per-tab, not shared. Opening a second
+     tab does not invalidate the first (independent tokens). The single-instance rule
+     (ADR 0015) is about the *server*, not the number of tabs.
+   - **Token never logged:** neither nonce nor tab token appears in `ledger_events`,
+     stderr, or the URL bar after strip (verified by a redaction test).
 
 3. **Strict CSP + no-inline.** Responses set `Content-Security-Policy: default-src
    'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self';

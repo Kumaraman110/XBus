@@ -28,7 +28,7 @@ records which one produced the row, so the dashboard never presents a heuristic 
 | --- | --- | --- | --- | --- |
 | **Live SessionStart** | Hook stdin: `session_id`, `source`∈{startup,resume,clear,compact}, `cwd`, `transcript_path`, `agent_type?`, `session_title?` | **Fully documented** hook contract — Claude tells us directly | `signal` | `active` (or resumes a `dormant`/expired row) |
 | **Import (dormant)** | Enumerate `~/.claude/projects/<slug>/*.jsonl`; filename stem = session UUID; mtime = last-seen | **Relies on internal, undocumented layout** (dir location, one-uuid-jsonl-per-session, slug↔cwd encoding). Metadata-only: we `stat` filenames, **never open bodies** | `listing_only` | `dormant` |
-| **Unmanaged detection** | Best-effort: a live `claude`/node process with no matching XBus registration | **Heuristic.** Reliably obtaining another process's `CLAUDE_CODE_SESSION_ID` on Windows is not guaranteed and we do NOT poke process internals to force it | `unidentified` (or `listing_only` if we can only say "≥1 unmanaged present") | `unmanaged` |
+| **Unmanaged (AGGREGATE banner only)** | Non-invasive counts: (live `claude` processes) vs (managed+dormant sessions) — **never** reading a foreign process's env/memory | **Coarse, honest.** No per-session id mapping (that would need invasive introspection, which we refuse — ADR 0013 D6 locked decision) | `unidentified` | `unmanaged` (an **aggregate** "N may exist" banner, not per-row entries) |
 
 - **Import is best-effort and explicitly non-authoritative.** The `listing_only`
   confidence + the `dormant` label tell the operator "known from on-disk history, not a
@@ -83,7 +83,7 @@ active rows, and a legacy `active`+`expired_at` row from the migration backfill 
 | # | management_state | state (conn) | readiness | expired_at | **Dashboard label** | Routable? |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | any | — | — | **set** | **expired** (tombstoned; ADR 0012) | no |
-| 2 | `unmanaged` | — | — | null | **unmanaged** (detected, no XBus signal) | no |
+| 2 | `unmanaged` | — | — | null | **unmanaged** (aggregate banner — "N may exist", no per-session identity; ADR 0013 D6) | no |
 | 3 | `dormant` | — | — | null | **dormant** (known from transcripts, not live) | no |
 | 4 | `active` | `disconnected` | any | null | **active — disconnected** (owner's link dropped this session) | queued |
 | 5 | `active` | `connected` | `ready_checkpoint`/`ready_live` | null | **active — ready** | yes |
@@ -147,23 +147,28 @@ doc — the earlier `lifecycle_state` mention there is corrected to `management_
 diverge from state (no transition unlogged, no logged transition that didn't happen).
 The current state is always recoverable from the mutable tables alone.
 
-**Coupling — stated precisely (review correction 2026-07-12).** Same-txn append means an
-`INSERT INTO ledger_events` failure aborts the whole op. This is **not** an
-audit-subsystem coupling that can independently take down delivery: both the state
-mutation and the ledger append are `INSERT`/`UPDATE`s into the **same SQLite file** in
-the **same transaction**, so the only realistic shared failure (disk-full, I/O error, DB
-corruption) fails the state write *anyway* — there is no scenario where routing state
-commits durably but only the ledger row can't. So we do **not** claim "the ledger can
-never affect the op"; we claim the accurate thing: **the ledger shares the op's fate,
-adding no *independent* failure mode** — a healthy DB that can persist the state change
-can persist its ledger row. A *chain that is already broken* (past tamper/bit-rot) is
-separate and never blocks new ops (it degrades auditability visibly — Q4). This keeps
-Q5's "dashboard/audit cannot destabilize delivery" intact: the *dashboard* is read-only
-and off-loop (Q5 #2); the *ledger write* isn't a separate subsystem that can fail on its
-own. **Rejected alternative:** best-effort/out-of-band ledger writes (decoupled) — that
-would let state and audit diverge silently, which is worse for an audit ledger than
-sharing the op's fate. We choose no-divergence over best-effort, and describe the
-coupling honestly rather than claim a non-existent independence.
+**Coupling — corrected (review-directed 2026-07-12; the earlier "no independent failure
+mode" wording is WITHDRAWN).** Same-txn append gives two properties, and we state both
+honestly:
+- **No divergence (guaranteed):** state never commits without its `ledger_events` row and
+  vice-versa — the transaction is all-or-nothing.
+- **An intentional availability tradeoff (acknowledged):** a **ledger-specific defect**
+  *can* abort an operation that the state tables alone could have completed — e.g. a
+  `ledger_events`/`ledger_anchors` constraint or append-only trigger firing (a `seq` or
+  hash-uniqueness violation from a chaining bug), or corruption localized to ledger
+  pages. In that case the whole op fails with the typed error **`AUDIT_PERSISTENCE_FAILED`**
+  rather than committing routing state whose audit record couldn't be written. This is a
+  **deliberate choice of no-divergence over availability** — correct for an *audit*
+  ledger — not a claim that the ledger cannot affect the op. (Contrast the earlier draft,
+  which wrongly asserted the ledger adds no independent failure mode; a ledger-only
+  constraint/corruption is exactly such a mode, and we now own it.)
+
+This does not weaken Q5's "dashboard cannot destabilize delivery": that guarantee is
+about the **read-only, off-loop dashboard** (a separate component with no write path),
+not the broker's own in-txn ledger append. **Rejected alternative:** best-effort/
+out-of-band ledger writes (decoupled) — that would trade the availability hit for
+*silent divergence* between state and audit, which is worse for an audit ledger. We keep
+the coupling, name the failure (`AUDIT_PERSISTENCE_FAILED`), and fault-test it (below).
 
 Why not make the ledger authoritative (event-sourced)? Rejected for Phase 1: it would
 duplicate the proven ADR 0003 receipt/epoch state machine, add replay complexity, and
@@ -204,13 +209,19 @@ CREATE TRIGGER ledger_no_update BEFORE UPDATE ON ledger_events
   BEGIN SELECT RAISE(ABORT, 'ledger_events is append-only'); END;
 CREATE TRIGGER ledger_no_delete BEFORE DELETE ON ledger_events
   BEGIN SELECT RAISE(ABORT, 'ledger_events is append-only'); END;
--- checkpoint anchors for compaction (see Growth/Retention)
+-- checkpoint anchors for compaction (see Growth/Retention) — ALSO append-only
 CREATE TABLE ledger_anchors (
   anchor_seq   INTEGER PRIMARY KEY,          -- seq of the anchored event
   anchor_hash  TEXT NOT NULL,                -- entry_hash at anchor_seq
   created_at   TEXT NOT NULL,
   reason       TEXT NOT NULL                 -- 'vacuum' | 'periodic'
 );
+-- append-only enforcement on anchors too (review-directed): an anchor is a trust root
+-- for the surviving prefix, so it must be as immutable as the events it anchors.
+CREATE TRIGGER anchors_no_update BEFORE UPDATE ON ledger_anchors
+  BEGIN SELECT RAISE(ABORT, 'ledger_anchors is append-only'); END;
+CREATE TRIGGER anchors_no_delete BEFORE DELETE ON ledger_anchors
+  BEGIN SELECT RAISE(ABORT, 'ledger_anchors is append-only'); END;
 ```
 
 `canonical(...)` = a fixed field order, JSON with sorted keys, UTF-8 — identical rules
@@ -219,21 +230,35 @@ on write and on verify (unit-tested against frozen vectors), so the hash is repr
 - **Growth:** append-only, so it grows with activity. Bounded write amplification via the
   existing WAL. Row is small (ids + safe metadata, no bodies). Dashboard queries are
   indexed by `seq` (paged). A size metric is exposed in `doctor`/dashboard.
-- **Retention / compaction (operator-initiated, never silent):** `xbus audit vacuum
-  --before <utc>` archives events `< N` to a JSONL export, writes a `ledger_anchors` row
-  `(anchor_seq=N-1, anchor_hash=entry_hash(N-1))`, then prunes the archived rows. The
-  append-only triggers cannot be "selectively bypassed" for one statement (SQLite has no
-  such feature), so the **concrete mechanism** is, inside a single transaction (SQLite DDL
-  is transactional — a crash rolls the whole thing back): `BEGIN IMMEDIATE` → verify the
-  full chain up to N-1 → write the anchor → `DROP TRIGGER ledger_no_delete` →
-  `DELETE FROM ledger_events WHERE seq < N` → `CREATE TRIGGER ledger_no_delete …` (recreate
-  identically) → append a `LEDGER_VACUUMED` event → `COMMIT`. The `no_update` trigger is
-  never dropped. A crash at any point leaves the pre-vacuum chain intact (transactional
-  DDL). Nothing auto-prunes; vacuum is an explicit, audited operator command.
+- **Retention / compaction — durable ordering (operator-initiated, never silent).**
+  `xbus audit vacuum --before <utc>` prunes events `< N`, and is ordered so that **any
+  failure before the DB step leaves the database completely unchanged** (archive-first,
+  DB-last):
+  1. **Verify** the full chain up to `N-1` (abort the whole vacuum on any break — never
+     prune an already-broken chain).
+  2. **Write the archive to a TEMP file** (`<export>.tmp`): the pruned events as sanitized
+     JSONL + a manifest (range, first `prev_hash`, `anchor_hash=entry_hash(N-1)`, digest).
+  3. **Flush + fsync** the temp file (durability barrier).
+  4. **Atomic rename** `<export>.tmp` → `<export>` (atomic on the same volume). *If any of
+     steps 2-4 fail, STOP — the DB has not been touched; the ledger is intact.*
+  5. **Reopen the finished archive and verify its digest** (independent read-back — prove
+     the archive is durable and correct *before* deleting anything from the DB).
+  6. **Only now, one DB transaction:** `BEGIN IMMEDIATE` → insert the `ledger_anchors` row
+     `(N-1, anchor_hash, 'vacuum')` → `DROP TRIGGER ledger_no_delete` →
+     `DELETE FROM ledger_events WHERE seq < N` → `CREATE TRIGGER ledger_no_delete …`
+     (recreate identically) → append a `LEDGER_VACUUMED` event → `COMMIT`.
+  The append-only triggers can't be "selectively bypassed" for one statement (no such
+  SQLite feature), so the delete is fenced by an in-txn DROP/recreate of *only*
+  `ledger_no_delete` (the `no_update` triggers and both `anchors_*` triggers are never
+  dropped; SQLite DDL is transactional, so a crash inside step 6 rolls the whole thing
+  back — the pre-vacuum chain survives). Because the archive is fully durable + verified
+  (steps 2-5) before step 6, a crash *after* the DB txn still leaves a valid archive; a
+  crash *before/within* it leaves the DB unpruned — either way, no data loss and no
+  half-pruned chain. Nothing auto-prunes.
   **Multi-anchor verify selection:** `ledger_anchors` may hold several rows; `verify`
-  starts from the **highest anchor whose `anchor_seq < MIN(remaining seq)`** (i.e. the
-  most recent pruned boundary), treats that anchor's `anchor_hash` as the genesis pointer
-  for the surviving prefix, and verifies forward. Anchors are themselves append-only.
+  starts from the **highest anchor whose `anchor_seq < MIN(remaining seq)`** (the most
+  recent pruned boundary), treats that anchor's `anchor_hash` as the genesis pointer for
+  the surviving prefix, and verifies forward. Anchors are append-only (triggers above).
 - **Export:** `xbus audit export [--from --to] --out <file>` → sanitized JSONL (already
   redacted; ids/hashes only) + a manifest with the range's first `prev_hash`, last
   `entry_hash`, and a recomputed range digest, so an export is independently
@@ -250,16 +275,27 @@ on write and on verify (unit-tested against frozen vectors), so the hash is repr
 | WAL torn write / crash mid-append | SQLite WAL replay on open | atomic: the half-written event is rolled back; state txn rolls back with it (single txn) → no divergence |
 | Chain break (tampered/dropped row) | `audit verify` on broker start + on demand | broker logs + a `LEDGER_CHAIN_BROKEN` diagnostic; **read-only audit still served with a prominent "chain broken at seq N" banner**; routing/delivery UNAFFECTED (ledger is a projection, Q3) |
 | DB newer schema than build | existing downgrade guard (ADR 0019) | fail closed; no partial serve |
-| Disk-full / I/O error at commit | insert error inside the shared txn | the **whole op** (state + ledger) fails atomically with a clean typed error — no partial/ghost state, no state-without-ledger. Not audit-specific: a full disk fails the state write too (Q3 coupling) |
+| Shared-substrate failure (disk-full / I/O error) at commit | insert error inside the shared txn | the **whole op** (state + ledger) fails atomically → no partial/ghost state. Not audit-specific: a full disk fails the state write too. |
+| **Ledger-SPECIFIC defect** (a `ledger_events`/`ledger_anchors` constraint or trigger fires — e.g. a `seq`/hash-uniqueness violation from a chaining bug, or corruption localized to a ledger page) | the append raises inside the shared txn | **the op aborts with `AUDIT_PERSISTENCE_FAILED`** — an *intentional availability tradeoff*: we would rather fail the lifecycle/message mutation than commit routing state whose audit event could not be persisted (no-divergence beats availability for an audit ledger). Fault-tested. |
 
-Two distinct cases, kept separate (this is the Q3/Q5 reconciliation):
-- A **ledger write cannot fail independently of the state write** — same file, same txn
-  (Q3). So there is no "audit subsystem" that can fall over and take routing with it; a
-  DB healthy enough to persist state persists its ledger row.
-- A **chain that is already broken** (past out-of-band tamper / bit-rot) **never blocks
-  new delivery** — new ops keep appending; `verify` flags the historical break. This is
-  the only sense in which "chain-broken doesn't block delivery" holds, and it is about
-  *reading/auditing* history, not *writing* new events.
+**Corrected reconciliation of Q3/Q5 (review-directed 2026-07-12) — the earlier "adds no
+independent failure mode" claim is WITHDRAWN:**
+- Same-txn writes guarantee **no divergence** (state never commits without its ledger
+  row, and vice-versa). That part stands.
+- But a **ledger-specific defect CAN abort the operation** — a constraint/trigger on
+  `ledger_events`/`ledger_anchors`, or corruption isolated to ledger rows, will raise
+  and roll back the *whole* op even though the state tables themselves were writable.
+  This is a **real, deliberate availability tradeoff**, surfaced as the typed error
+  **`AUDIT_PERSISTENCE_FAILED`**, not hidden behind "cannot fail independently." We accept
+  it because silent state-without-audit is unacceptable for an audit ledger; the operator
+  sees a clear, actionable error (and the broker logs it) rather than a corrupted history.
+- Distinct from the above: a **chain that is ALREADY broken** (past out-of-band tamper /
+  bit-rot in historical rows) **never blocks new delivery** — new ops keep appending and
+  `verify` flags the historical break. "Chain-broken doesn't block delivery" is only
+  about *reading/auditing history*, never about *writing* new events.
+- The Q5 "dashboard cannot destabilize delivery" guarantee is unaffected: that is about
+  the **read-only dashboard** (off-loop, no writes), which is a separate component from
+  the broker's in-txn ledger append.
 
 **Tamper-detection latency (stated honestly):** the append-only triggers stop SQL-layer
 UPDATE/DELETE, but a direct file edit or bit-rot bypasses SQL entirely. `verify` runs on
@@ -277,13 +313,19 @@ Enforced by **construction + assertions + tests**, not policy. (Review correctio
 the token requirement is tightened to *every* request, closing a same-machine
 read-exposure hole.)
 
-1. **Read-only (Phase 1):** the dashboard HTTP server exposes **only `GET`/`HEAD`**
-   endpoints (`/api/sessions`, `/api/ledger`, `/api/session/:id`, SSE `/api/stream`,
-   `/alive`). There are **no mutating routes in Phase 1** (rename/compose arrive in
-   Phase 2/3). A route-table test asserts every registered handler is `GET`/`HEAD`. The
-   dashboard opens the DB with **`SQLITE_OPEN_READONLY`** — no writer handle exists in the
-   dashboard component, so it physically cannot mutate the DB (I4: broker stays single
-   writer). A write attempt on that handle throws — asserted by test.
+1. **No product-state mutation routes (Phase 1).** The dashboard exposes read/data
+   endpoints (`GET /api/sessions`, `/api/ledger`, `/api/session/:id`; the authenticated
+   **fetch-streaming** `GET /api/stream`; `/alive`) **plus exactly one POST that mutates
+   NO product state: `POST /auth/exchange`** (the nonce→token exchange, ADR 0018 D2 — it
+   touches only the ephemeral nonce/token store, never sessions/messages/ledger). So the
+   precise invariant is **"no route mutates product state"** (not the earlier, too-narrow
+   "GET/HEAD only," which would have forbidden the auth exchange). A route-table test
+   asserts every handler is either a read (`GET`/`HEAD`) or on the allowlist of
+   non-product-state auth endpoints (`/auth/exchange`). The dashboard opens the DB with
+   **`SQLITE_OPEN_READONLY`** — no writer handle exists in the dashboard component, so it
+   physically cannot mutate the DB (I4: broker stays single writer); the nonce/token store
+   is a separate broker-owned structure, not written by the dashboard read component. A
+   write attempt on the read-only handle throws — asserted by test.
    **WAL caveat (must be validated, not assumed):** a read-only handle to a WAL database
    cannot create/recover `-wal`/`-shm` or checkpoint; it reads correctly while the broker
    (writer) is live and the files are owner-readable. Phase-1 acceptance includes an
@@ -297,24 +339,28 @@ read-exposure hole.)
    timeouts/response caps do NOT help there (they bound a slow socket, not a slow query).
    Therefore the dashboard's DB reads run in a **separate `worker_thread` (or child
    process)** with its own `SQLITE_OPEN_READONLY` connection; the broker loop only does a
-   cheap message-passing handoff. The SSE stream is a fan-out of already-committed state
-   (the worker polls / the broker posts change-notifications), never a write path and
-   never a synchronous query on the broker loop. This makes "cannot touch routing/epochs/
-   receipts/injection-ledger" true for reads as well as writes — structurally, not by
-   hope. **Test:** run a *pathological large-scan* read (full ledger + all sessions)
-   **concurrently** with the four-replica matrix → matrix still 12/12, broker instance
-   unchanged, p99 delivery latency within bound; plus a hung/slow client → dropped, loop
-   unaffected.
+   cheap message-passing handoff. The **live-update stream is `fetch()`-streaming, not
+   `EventSource`** (ADR 0018 D2: EventSource can't carry an `Authorization` header) — a
+   `GET /api/stream` `ReadableStream` of newline-delimited JSON, a fan-out of
+   already-committed state (the worker polls / the broker posts change-notifications),
+   never a write path and never a synchronous query on the broker loop. This makes
+   "cannot touch routing/epochs/receipts/injection-ledger" true for reads as well as
+   writes — structurally, not by hope. **Test:** run a *pathological large-scan* read
+   (full ledger + all sessions) **concurrently** with the four-replica matrix → matrix
+   still 12/12, broker instance unchanged, p99 delivery latency within bound; plus a
+   hung/slow stream client → dropped, loop unaffected.
 
-3. **Loopback-only + token on EVERY request:** binds `127.0.0.1` exclusively; a startup
-   assertion refuses any non-loopback address. Because loopback is **shared across local
-   OS users** (ADR 0018 threat model), the owner-ACL'd token is the real boundary and is
-   required on **every request — including all `GET` reads** (a read-only dashboard still
-   exposes session metadata + the audit ledger, which another same-machine user must not
-   read). This tightens ADR 0018 D2 ("token on mutating endpoints") → **token on all
-   requests** for Phase 1 (there are no mutating endpoints yet, so a reads-only token
-   requirement is the whole surface). Test: bind to `0.0.0.0` throws; any request
-   (incl. `GET`) without a valid token → 401; token is never logged/redacted in the ledger.
+3. **Loopback-only + token (via the ADR 0018 D2 bootstrap) on every data request:** binds
+   `127.0.0.1` exclusively; a startup assertion refuses any non-loopback address. Because
+   loopback is **shared across local OS users**, the tab token (obtained by the
+   nonce→`/auth/exchange` flow, ADR 0018 D2) is the real boundary and is required on
+   **every data/API request — including all `GET` reads and the `/api/stream`** (a
+   read-only dashboard still exposes session metadata + the audit ledger, which another
+   same-machine user must not read). Only the **inert static-asset requests** and
+   `POST /auth/exchange` itself are unauthenticated (the exchange authenticates *by
+   consuming the one-time nonce*). Test: bind to `0.0.0.0` throws; any `/api/*` request
+   (incl. `GET`/stream) without a valid tab token → 401; a replayed/expired nonce at
+   `/auth/exchange` → 401; neither nonce nor token is ever logged or written to the ledger.
 
 4. **Single-instance:** the **broker** owns the one HTTP server (broker is the machine
    singleton, ADR 0015). Port + URL recorded in `broker.state.json`. A second start finds
@@ -353,24 +399,42 @@ Existing rows default to `management_state='active'`, `identify_confidence='sign
   across every row of the decision table; disconnected-vs-dormant and dormant-vs-expired
   transitions via the store + reaper (FakeClock 15-day) ; a resume of an expired dormant
   session → fresh epoch, no resurrection.
-- **Authoritative-vs-projection (Q3):** property test — after N random lifecycle ops,
-  current state rebuilt from mutable tables == live state; and every transition has
-  exactly one ledger event in the same txn (kill-after-state-before-ledger is impossible
-  because it's one txn — assert by fault injection that a forced ledger-insert failure
-  rolls back the state change).
-- **Hash chain (Q4):** frozen canonical-hash vectors; `verify` passes on a good chain;
-  `verify` localizes a tampered row / dropped seq / bit-flip to the first bad seq;
-  vacuum+anchor preserves verifiability; export manifest is independently verifiable;
-  crash-mid-append (WAL) leaves a verifiable chain (no half-event); disk-full → clean
-  error, no ghost state.
-- **Dashboard safety (Q5):** route table is GET-only; read-only connection rejects
-  writes; non-loopback bind refused; missing/invalid token → 401; two ensure-dashboard →
-  one listener + ≤1 open; **concurrent dashboard load during the four-replica matrix →
-  matrix still 12/12, broker instance unchanged** (the "cannot destabilize delivery"
-  proof); uninstall stops broker + dashboard; audit DB preserved unless `--purge`.
-- **Migration/compat (ADR 0019):** beta.4.1→beta.5 upgrade migrates 6→7 additively;
-  downgrade guard refuses a v7 DB on an older build; a beta.4.1 client still does
-  request/ACK/reply against a beta.5 broker (interop).
+- **Authoritative-vs-projection + audit-persistence (Q3):** property test — after N random
+  lifecycle ops, current state rebuilt from mutable tables == live state; every transition
+  has exactly one ledger event in the same txn. **Fault tests (the availability tradeoff):**
+  inject a forced `ledger_events` insert failure during (a) a **session-lifecycle**
+  mutation and (b) a **message** mutation → the whole op rolls back and surfaces
+  **`AUDIT_PERSISTENCE_FAILED`** (state unchanged, no half-commit); and injection/ack/reply
+  outcomes are byte-identical with vs. without the ledger wired (I2/I3 unaffected).
+- **Hash chain (Q4):** frozen canonical-hash vectors; `verify` passes on a good chain and
+  localizes a tampered row / dropped `seq` / bit-flip to the first bad seq;
+  **`ledger_anchors` UPDATE/DELETE rejected** by its triggers; **durable vacuum**: archive
+  temp→fsync→atomic-rename→reopen-digest-verify happens before any DB change, and an
+  injected **archive failure at each of steps 2-5 leaves the DB byte-unchanged** (chain
+  intact); a crash inside the step-6 txn rolls back (pre-vacuum chain survives); post-vacuum
+  `verify` works from the anchor; export manifest independently verifiable; crash-mid-append
+  (WAL) leaves a verifiable chain.
+- **Dashboard safety + auth flow (Q5 / ADR 0018 D2):** route table has **no product-state
+  mutation route** (only reads + `/auth/exchange`); read-only handle rejects writes,
+  validated **while the broker is actively writing** (WAL read-only, from the separate
+  worker/process); non-loopback bind refused; **auth bootstrap tests** — nonce is
+  single-use (second `/auth/exchange` → 401 via atomic CAS), TTL-expired nonce → 401,
+  fragment is stripped from the URL after load (no nonce in `location`/history), tab token
+  only in memory/sessionStorage (never localStorage/cookie), any `/api/*` incl. `/api/stream`
+  without a valid token → 401, token/nonce never logged or ledgered; **lifecycle tests** —
+  reload/reopen/expiry/replay/multiple-tabs behave as specified (independent per-tab
+  tokens); `EventSource` is not used (stream carries `Authorization`); **`concurrent
+  dashboard large-scan load during the four-replica matrix → matrix still 12/12, broker
+  instance unchanged, p99 within bound`** (the "cannot destabilize delivery" proof);
+  uninstall stops broker + dashboard; audit DB preserved unless `--purge`.
+- **Migration / upgrade / compat (ADR 0019):** 6→7 forward migration is additive (on a
+  backed-up DB); **handshake fails closed both directions** — a table-driven test of
+  `checkCompatibility` asserts s6-client↔s7-broker → `upgrade_component` (ok:false) and
+  s7-client↔s6-broker → `restart_broker` (ok:false), and equal-schema → `compatible`
+  (there is **no** mixed-version message-exchange test — the handshake forbids it);
+  DB-open downgrade guard refuses a v7 DB on an s6 build; **whole-install upgrade**
+  (stop→backup→install→migrate→restart) end-to-end; **rollback test** — a forced migration
+  failure restores the s6 DB/config backup, leaving a working s6 install.
 - **Human visual gate:** launch real Claude sessions (startup + `--resume` + a fork) and
   visually confirm each appears in the dashboard with the correct state — the one thing
   that needs eyes (rendering), consistent with the ADR 0013 human-gate stance.

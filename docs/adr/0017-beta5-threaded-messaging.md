@@ -28,14 +28,19 @@ Layer-3 dedup keys on `(message_id, recipient_epoch, logical_injection_number)`.
    messages (so beta.4 correlation tooling still groups them); `parent_message_id`
    points at the specific turn being answered.
 
-2. **Beta.4 compatibility (additive + negotiated).** A beta.4 request/ACK/reply is
-   modeled as a **degenerate thread** created implicitly: the request opens a thread
-   (`thread_id` = request `message_id` = `correlation_id`, matching today), the reply is
-   turn 2. Existing frames are unchanged on the wire; `thread_id`/`thread_sequence` are
-   **additive optional fields** a beta.4 client ignores. New multi-turn frames
-   (`thread_send`, `thread_list`, `thread_read`) are gated behind a capability advertised
-   at register; a broker serving a beta.4 client simply doesn't offer them. **No frame
-   is removed or repurposed** → beta.4/beta.4.1 interop holds.
+2. **Continuity with beta.4.1 semantics (within the all-s7 fleet — NOT mixed-version).**
+   A classic request/ACK/reply is modeled as a **degenerate thread** created implicitly:
+   the request opens a thread (`thread_id` = request `message_id` = `correlation_id`,
+   matching today), the reply is turn 2. This preserves the *shape* of the existing
+   semantics so beta.4.1 correlation tooling and the existing tests still make sense —
+   **but note (correction 2026-07-12): this is NOT cross-version interop.** Threads ship
+   in **Phase 2**, on an all-beta.5/s7 fleet reached via the ADR 0019 whole-install
+   upgrade; the handshake fails closed on any s6↔s7 mismatch, so there is no beta.4.1
+   client exchanging messages with a beta.5 broker. New multi-turn frames
+   (`thread_send`, `thread_list`, `thread_read`) are additive on the s7 wire; existing
+   register/send/ack/reply frames are unchanged (so an all-s7 fleet's non-thread paths are
+   byte-identical to beta.4.1's). "No frame removed or repurposed" is about **forward
+   evolution of the s7 protocol**, not about running mixed s6/s7 components.
 
 3. **Author type = attribution.** Each message carries `author_type ∈ {claude,
    operator}`. Claude session messages are attributed to the real `sender_session_id`
@@ -68,10 +73,17 @@ Layer-3 dedup keys on `(message_id, recipient_epoch, logical_injection_number)`.
 
 ## Impact
 
-- Schema: new `threads` table + `thread_id`/`thread_sequence`/`author_type`/unread
-  columns on `messages`; migration + downgrade guard (ADR 0019). Existing single-reply
-  flow maps onto degenerate threads with no behavior change for beta.4 peers.
-- Protocol: **new optional frames + a capability**, no change to existing frames/STP.
+- Schema: new `threads` table + a `thread_participants` **join-table** (see below) +
+  `thread_id`/`thread_sequence`/`author_type`/unread columns on `messages`; migration +
+  downgrade guard (ADR 0019). Existing single-reply flow maps onto degenerate threads
+  with no behavior change **within the all-s7 fleet** (there is no mixed-version peer;
+  ADR 0019). This is a Phase-2 schema step (a later migration, e.g. 7→8), not Phase 1.
+- **Participant model (locked decision):** threads exhibit **two-party behavior** for now,
+  but are stored via an **extensible `thread_participants(thread_id, session_id, role,
+  joined_at)` join-table** (not two fixed `participant_a/_b` columns), so N-party is a
+  data-only extension later with no schema rewrite.
+- Protocol: **new optional frames + a capability** on the s7 wire, no change to existing
+  frames/STP.
   Compatibility tuple's schema component moves; protocol stays 1.
 - Retention/aliases/forks: threads belong to session identities; a fork starts fresh
   (no thread inheritance, ADR 0013 D4); expiry dead-letters a thread's pending turns

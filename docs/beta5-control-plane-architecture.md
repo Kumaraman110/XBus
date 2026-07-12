@@ -67,9 +67,12 @@ unless `--purge`.
 
 ## Compatibility (ADR 0019)
 
-`xbus-p1-stp1-s6 → -s7`; protocol/STP frozen at 1. Beta.4/beta.5 ⇄ beta.5 interop
-preserved (additive fields + capability-gated thread frames; existing frames byte-
-unchanged). beta.4/beta.4.1 tags/releases never moved.
+`xbus-p1-stp1-s6 → -s7`; protocol/STP frozen at 1. **No mixed-version operation:** the
+handshake requires equal schema (`checkCompatibility`, `handshake.ts`), so an s6
+component meeting an s7 broker fails closed with `upgrade_component`. Beta.5 is therefore
+a **single controlled whole-install upgrade** (stop old broker → back up DB/config →
+install plugin+hooks+broker → migrate 6→7 → restart), not a beta.4.1↔beta.5 coexistence.
+No compatibility-protocol redesign in Phase 1. beta.4/beta.4.1 tags/releases never moved.
 
 ## Dependency posture
 
@@ -96,15 +99,20 @@ messaging comes after.** Phase 1 is the next measurable milestone.
   writes, malformed input, replay, DB recovery, migrations, install/upgrade/uninstall,
   browser behavior, zero loss/dup/cross-routing).
 
-## Open questions for review
+## Decisions — LOCKED (2026-07-12, owner-directed; formerly open questions)
 
-1. **Unmanaged detection depth**: how hard to try mapping a pre-install running
-   `claude` process to a session id (heuristic + labelled) vs. just showing an
-   "unmanaged (unidentified) session present" banner? (ADR 0013 D6 leans conservative.)
-2. **Participants model**: threads as strictly 2-party (simplest, matches current
-   routing) vs. N-party from the start (more schema now). Recommendation: 2-party first,
-   schema left extensible.
-3. **UI build**: hand-written vanilla assets (zero toolchain, checked in) vs. a
-   pre-built framework bundle checked in. Recommendation: vanilla for Phase 1 read-only;
-   revisit if Phase 2 interactions need more.
-4. **`--purge` default**: confirm audit DB is preserved on normal uninstall (ADR 0016/0018).
+1. **Unmanaged detection = conservative AGGREGATE banner, no invasive process mapping.**
+   Phase 1 shows a single "N unmanaged session(s) may exist — resume/restart to manage"
+   banner from non-invasive counts; it does **not** read foreign process env/memory to map
+   individual session ids (ADR 0013 D6).
+2. **Threads = two-party behavior, on an extensible participant JOIN-TABLE.** Ships in
+   Phase 2 on the all-s7 fleet; stored via `thread_participants` so N-party is a later
+   data-only extension (ADR 0017).
+3. **UI = hand-written vanilla HTML/CSS/JS** for Phase 1 (no framework/bundler/build
+   step); framework/bundle explicitly out (ADR 0015).
+4. **Audit DB preserved by default; explicit `--purge` only** (ADR 0016/0018). A normal
+   uninstall stops broker + dashboard and keeps the audit history; only
+   `uninstall --purge`/`--remove-data` deletes it (logged as a final ledger event first).
+
+No open questions remain for a Phase-1 go/no-go; the three design blockers are closed in
+ADRs 0015/0016/0018/0019/0020 (see the PR #10 correction summary).

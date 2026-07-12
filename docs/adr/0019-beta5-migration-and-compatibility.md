@@ -6,10 +6,21 @@ Governed by the version-handshake + build-identity model (ADR 0004 / ADR 0011).
 ## Context
 
 Beta.5 adds tables/columns (lifecycle states, dormant/unmanaged, title-sync,
-`ledger_events`, `threads` + thread columns). Beta.4/beta.5 shipped
+`ledger_events`, `threads` + thread columns). Beta.4/beta.4.1 shipped
 `compatibilityId = xbus-p1-stp1-s6`, schema 6. We must add schema safely, keep the
-XBUS-STP wire frozen, keep beta.4/beta.4.1 request/ACK/reply interop, and fail closed on
-downgrade.
+XBUS-STP wire frozen, and **fail closed** on any version mismatch.
+
+**Correction (2026-07-12, review-directed): there is NO mixed-version interop.** The
+current handshake requires an **equal schema version** — `checkCompatibility` in
+`src/protocol/handshake.ts:99-120` returns `upgrade_component` (`ok:false`) when
+`client.schemaVersion < broker.schemaVersion` and `restart_broker`/`upgrade_broker`
+otherwise; only **equal** schema + overlapping protocol yields `compatible`. So a
+beta.4.1 (s6) component **cannot register or exchange messages** with a beta.5 (s7)
+broker — it is rejected at the handshake, before registration. An earlier draft of this
+ADR wrongly claimed s6↔s7 request/ACK/reply interop and capability-gated degradation;
+**those claims are removed.** Phase 1 does **not** redesign the compatibility protocol —
+it keeps the existing equal-schema fail-closed rule and treats the s6→s7 move as a
+**whole-install upgrade**, not a mixed-version coexistence.
 
 ## Decision
 
@@ -28,19 +39,34 @@ downgrade.
    degenerate thread, ADR 0017 §2). Runs inside the existing transactional migration
    runner; backup-before-migrate (existing install migration discipline) applies.
 
-3. **Downgrade guard (fail closed).** The existing guard — old code refuses a DB whose
-   schema is newer than the build (`migrations.ts`) — protects a beta.4/beta.4.1 binary
-   that meets a v7 DB: it exits with an actionable message rather than corrupting data.
-   The dashboard likewise refuses to serve a newer-than-build schema (ADR 0018 §6).
+3. **Downgrade guard (fail closed) — TWO layers.** (a) At **DB open**, old code refuses a
+   DB whose schema is newer than the build (`migrations.ts` max-version guard): a
+   beta.4.1 (s6) binary meeting a v7 DB exits with an actionable message rather than
+   corrupting data. (b) At the **handshake**, `checkCompatibility` rejects a schema
+   mismatch in EITHER direction with a typed verdict (`upgrade_component` /
+   `restart_broker`) — a component never registers against a broker of a different
+   schema. The dashboard likewise refuses to serve a newer-than-build schema (ADR 0018 §6).
 
-4. **Wire compatibility with beta.4/beta.4.1 peers.** Threads/lifecycle are additive
-   optional frame fields + new capability-gated frames (ADR 0017 §2); existing
-   register/send/ack/reply frames are byte-unchanged. A beta.4/beta.4.1 client talking to
-   a beta.5 broker: registers and does request/ACK/reply exactly as before (its frames
-   ignored-unknown-field tolerant); it simply doesn't use thread frames or the
-   dashboard. A beta.5 client talking to an older broker: detects the missing thread
-   capability and degrades to single-reply. The STP handshake key derivation is
-   version-independent (ADR 0011), so mixed builds still handshake.
+4. **No mixed-version operation — beta.5 upgrade is ONE controlled user-level operation.**
+   There is no s6-component-with-s7-broker mode. Because the handshake fails closed on a
+   schema mismatch (D3b), the only supported transition is a **whole-install upgrade**,
+   performed as a single atomic-as-possible sequence by `xbus install` (user scope):
+
+   1. **Stop the old broker** (graceful `xbus stop`; the running s6 broker must exit so
+      the s7 broker can bind the singleton — ADR 0013's "stop before upgrade").
+   2. **Back up** the data root (DB + WAL) and the user-scope config (`~/.claude.json`,
+      `~/.claude/settings.json`) — the existing install backup-before-migrate discipline,
+      extended to cover the DB (so a failed migration can be fully restored).
+   3. **Install** the beta.5 plugin + hooks + broker binary (ownership-tagged, user scope).
+   4. **Migrate 6→7** inside the transactional migration runner (D2), on the backed-up DB.
+   5. **Restart** the (now s7) broker; sessions re-register at their next SessionStart /
+      first tool call and handshake as s7↔s7.
+
+   **Older components fail closed with `upgrade_component`** until they are themselves the
+   upgraded s7 build — there is no partial/mixed fleet. If any step fails, the backup
+   (step 2) restores the prior s6 state (see ADR 0016 install/migration rollback + the
+   migration-rollback tests). This is deliberately NOT a protocol redesign: it reuses the
+   existing equal-schema handshake and the existing migration/backup machinery.
 
 5. **Product version = `0.1.0-beta.5`.** Bumped across the authoritative surfaces
    (XBUS_VERSION, package.json, plugin.json, package-lock, version-consistency test,
@@ -52,19 +78,29 @@ downgrade.
    The `v0.1.0-beta.4` and `v0.1.0-beta.4.1` tags/releases and their assets are never
    retagged, moved, or overwritten.
 
-## Compatibility matrix (summary)
+## Compatibility matrix (summary) — fail-closed, no mixed operation
 
-| Client | Broker | Result |
-| --- | --- | --- |
-| beta.4/beta.4.1 | beta.5 | registers + request/ACK/reply OK; no threads/dashboard use |
-| beta.5 | beta.4/beta.4.1 | degrades to single-reply (no thread capability) |
-| beta.5 | beta.5 | full threads + dashboard + ledger |
-| any | mismatched schema (newer on disk) | fail closed (downgrade guard) |
+| Component schema | Broker schema | `checkCompatibility` verdict | Result |
+| --- | --- | --- | --- |
+| s6 (beta.4.1) | s7 (beta.5) | **`upgrade_component` (ok:false)** | component **rejected at handshake**; must upgrade to beta.5 |
+| s7 (beta.5) | s6 (beta.4.1 still running) | **`restart_broker` (ok:false)** | stop+restart so the s7 broker runs migrations |
+| s7 | s7 | `compatible` | normal operation |
+| any | DB newer than build (on open) | fail closed | `migrations.ts` refuses to open; exit with guidance |
+
+There is **no row where different schema versions exchange messages**. The transition
+from an all-s6 install to an all-s7 install is the controlled upgrade (Decision 4), not a
+coexistence.
 
 ## Impact
 
-- One schema increment (6→7), forward-only, backup-before-migrate, downgrade-guarded.
-- Compatibility tuple `xbus-p1-stp1-s6 → xbus-p1-stp1-s7`; protocol/STP frozen.
-- Migration + interop covered by tests (beta.5→beta.5 upgrade, mixed-build handshake,
-  downgrade-refusal), mirroring the existing `beta3-to-beta4-upgrade` + build-identity
-  interop tests.
+- One schema increment (6→7), forward-only, backup-before-migrate, downgrade-guarded at
+  BOTH DB-open and handshake.
+- Compatibility tuple `xbus-p1-stp1-s6 → xbus-p1-stp1-s7`; protocol/STP frozen; **no
+  compatibility-protocol redesign in Phase 1.**
+- Tests: 6→7 forward migration (additive, on a backed-up DB); handshake fail-closed both
+  directions (`upgrade_component` for s6-client↔s7-broker, `restart_broker` for
+  s7-client↔s6-broker) — table-driven against `checkCompatibility`; DB-open downgrade
+  refusal; and the whole-install upgrade sequence (stop→backup→install→migrate→restart)
+  with a **rollback test** proving a failed migration restores the s6 backup. Mirrors the
+  existing `beta3-to-beta4-upgrade` + build-identity interop tests, minus any mixed-version
+  message-exchange case (which the handshake forbids).

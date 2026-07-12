@@ -64,7 +64,10 @@ via `IdGen`. Beta.5 extends this, it does not replace it.
 7. **Retention / growth**: the ledger is append-only, so it grows. Provide
    `xbus audit vacuum --before <ts>` (operator-initiated, logged) that archives+prunes
    old events while preserving chain continuity via a checkpointed `prev_hash` anchor.
-   Never auto-prune silently. Uninstall **preserves** the audit DB unless `--purge`.
+   Never auto-prune silently. **Locked decision:** uninstall **preserves the audit DB by
+   default**; only an explicit `xbus uninstall --purge` (a.k.a. `--remove-data`) deletes
+   it, and that deletion is recorded as a final `AUDIT_DB_PURGED` ledger event immediately
+   before removal.
 
 ## Impact
 

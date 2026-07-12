@@ -18,10 +18,14 @@ listener is the UDS/named-pipe IPC.
    port, recorded in `broker.state.json` (`dashboardUrl`, `dashboardPort`). Single
    broker ⇒ single dashboard server by construction (prevents "multiple brokers/UIs").
 
-2. **Transport split**: the browser talks HTTP/JSON + a read-only Server-Sent-Events
-   stream to the dashboard server; the dashboard server talks to the broker core over
-   the existing in-process store/IPC. The broker remains the **single writer** (I4):
-   dashboard mutations (rename, operator-send) are broker ops, not direct DB writes.
+2. **Transport split**: the browser talks HTTP/JSON + a **`fetch()`-streaming** read-only
+   live-update channel (`GET /api/stream`, newline-delimited JSON) — **not
+   `EventSource`**, which cannot carry the `Authorization` header the auth flow requires
+   (ADR 0018 D2). The dashboard's DB reads run **off the broker event loop** (a
+   `worker_thread`/child process with a `SQLITE_OPEN_READONLY` handle — ADR 0020 Q5 #2),
+   so a large read cannot stall delivery. The broker remains the **single writer** (I4);
+   in Phase 1 there are **no product-state mutation routes** at all (rename/operator-send
+   are Phase 2/3), so the dashboard issues no broker mutations yet.
 
 3. **Browser open is broker-side and debounced (no tab storm).** SessionStart asks the
    broker to "ensure dashboard". The broker:
@@ -53,9 +57,11 @@ expired / dead-lettered). Plus dormant + unmanaged sessions (ADR 0013 D5/D6). Ti
 
 - New dependency risk: to honor XBus's "pure-JS, uuid+zod only" bar (package-win
   FORBIDDEN_RUNTIME), the dashboard server uses **`node:http`** + a hand-rolled tiny
-  router and static-file serve — **no express/fastify**. The UI is static assets
-  (vanilla JS/HTML/CSS or a pre-built bundle checked in) served from the plugin dir; no
-  runtime bundler. This keeps the artifact toolchain-free (ADR 0011 / package-win).
+  router and static-file serve — **no express/fastify**. **Locked decision:** the UI is
+  **hand-written vanilla HTML/CSS/JS** (no framework, no runtime bundler, no build step)
+  checked in and served from the plugin dir — for Phase 1's read-only surface this keeps
+  the artifact fully toolchain-free (ADR 0011 / package-win). A framework/bundle is
+  explicitly **out** for Phase 1 (revisit only if a later phase's interactivity needs it).
 - New `broker.state.json` fields (`dashboardPort`, `dashboardUrl`, `dashboardOpenedAt`);
   loopback bind + auth token in ADR 0018.
 - Uninstall stops the HTTP server with the broker (ADR 0018).
