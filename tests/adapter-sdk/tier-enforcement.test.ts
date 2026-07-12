@@ -221,16 +221,19 @@ describe('PR2 §10 — compatibility invariants + legacy no-op', () => {
     expect(MIN_SUPPORTED_PROTOCOL_VERSION).toBe(1);
     expect(STP_VERSION).toBe(1);
   });
-  it('the live DB schema is at migration 6 / xbus-p1-stp1-s6 post-composition (beta.4 ADR 0012 §3)', () => {
-    // PR #4 itself made NO schema change (it was s5 on its own branch). Composing it
-    // with beta.4 — whose owner-approved migration v6 adds the additive session-name +
-    // 15-day-retention columns — advances the LIVE schema to 6 and the compatibility
-    // id to xbus-p1-stp1-s6 (proto+STP still 1). Fail-closed by design: a beta.3/PR#4
-    // s5 client is told to upgrade. The FROZEN adapter-SDK compat contract that must
-    // stay byte-pinned at schema 5 lives separately in tests/adapter-sdk/adapter-sdk.test.ts.
-    expect(SCHEMA_VERSION).toBe(6);
-    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(6);
-    expect(BUILD_ID).toBe('xbus-p1-stp1-s6');
+  it('the live DB schema tracks the highest migration; compatibility id is xbus-p1-stp1-s<schema> (proto+STP frozen at 1)', () => {
+    // The LIVE schema advances with each owner-approved migration: v6 (beta.4 named
+    // sessions + retention) then v7 (beta.5 Phase-1 control-plane visibility + audit
+    // ledger). The invariant is that SCHEMA_VERSION == the highest migration and the
+    // compatibility id is xbus-p1-stp1-s<schema> — proto + STP stay 1. Fail-closed by
+    // design: a lower-schema client is told to upgrade. The FROZEN adapter-SDK compat
+    // contract that must stay byte-pinned at schema 5 lives separately in
+    // tests/adapter-sdk/adapter-sdk.test.ts. We assert the relationship, not a pinned
+    // integer, so a future additive migration doesn't spuriously fail this invariant.
+    const maxMigration = MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0);
+    expect(SCHEMA_VERSION).toBe(maxMigration);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(7); // beta.5 Phase 1 is applied
+    expect(BUILD_ID).toBe(`xbus-p1-stp1-s${SCHEMA_VERSION}`);
   });
 });
 
