@@ -19,10 +19,11 @@ import fs from 'node:fs';
 import { openDatabase, type SqliteDriver } from '../../src/database/connection.js';
 import { runMigrations } from '../../src/database/migrations.js';
 import { BrokerStore } from '../../src/broker/store.js';
+import { Reaper } from '../../src/broker/reaper.js';
 import { FakeClock, SeqIdGen } from '../../src/shared/clock.js';
 import { XBusError, XBusErrorCode } from '../../src/protocol/errors.js';
 
-let dir: string; let db: SqliteDriver; let store: BrokerStore; let clock: FakeClock;
+let dir: string; let db: SqliteDriver; let store: BrokerStore; let clock: FakeClock; let reaper: Reaper;
 let n = 0;
 // Each session needs a DISTINCT first-8-hex prefix: automaticAlias() derives the
 // fallback alias from sessionId.slice(0,8), and that alias is globally unique.
@@ -34,6 +35,7 @@ beforeEach(() => {
   clock = new FakeClock();
   runMigrations(db, clock.nowIso());
   store = new BrokerStore(db, clock, new SeqIdGen('m'), 'b');
+  reaper = new Reaper(db, clock, new SeqIdGen('r'));
 });
 afterEach(() => { db.close(); try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
 
@@ -87,6 +89,82 @@ describe('register() with a session name', () => {
     const r = db.prepare('SELECT last_meaningful_activity_at AS a, expires_at AS e FROM sessions WHERE session_id=?').get(auth.sessionId) as { a: string | null; e: string | null };
     expect(r.a).toBe(clock.nowIso());
     expect(new Date(r.e!).getTime() - new Date(r.a!).getTime()).toBe(15 * 24 * 60 * 60_000);
+  });
+
+  // Regression (four-replica reliability audit, 2026-07-12): two DISTINCT sessions
+  // whose CLAUDE_CODE_SESSION_IDs happen to share the same first 8 hex chars derive
+  // the SAME automatic fallback alias (`session-<8hex>`, aliases.ts). The broker-minted
+  // automatic_alias row is inserted with a bare INSERT into the active-unique aliases
+  // index, so the SECOND such registration hit `UNIQUE constraint failed: aliases.alias_ci`
+  // — a raw node:sqlite error surfaced to the peer as the mislabeled generic
+  // `DATABASE_ERROR "internal error"`, and it FAILED the whole registration. Since the
+  // session remains fully routable by its exact sessionId (and the automatic_alias is a
+  // non-essential convenience fallback), an 8-hex prefix collision must NEVER fail
+  // registration nor leak an internal DB error: the second session registers cleanly and
+  // simply does not hold the shared fallback alias.
+  it('two sessions sharing the first-8-hex prefix both register cleanly (automatic_alias collision is not fatal)', () => {
+    const shared = 'abcd1234';
+    const s1 = `${shared}-0000-4000-8000-000000000001`;
+    const s2 = `${shared}-0000-4000-8000-000000000002`; // same first 8 hex → same session-<8hex> alias
+    const a1 = store.register({ sessionId: s1, instanceId: 'i1', connectionId: 'c1', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    expect(a1.epoch).toBeGreaterThanOrEqual(1);
+    // The SECOND registration must not throw a raw error, and if it throws at all it must
+    // be a clean typed XBusError — never a mislabeled DATABASE_ERROR / raw UNIQUE-constraint.
+    let a2: ReturnType<BrokerStore['register']> | undefined;
+    try {
+      a2 = store.register({ sessionId: s2, instanceId: 'i2', connectionId: 'c2', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    } catch (e) {
+      expect(e, 'automatic_alias collision must not surface a raw/DB error').toBeInstanceOf(XBusError);
+      expect((e as XBusError).code).not.toBe(XBusErrorCode.DATABASE_ERROR);
+      expect(String((e as Error).message)).not.toMatch(/UNIQUE constraint|internal error/i);
+      throw e; // if it's a clean typed error we still want to know; but the desired behavior is success
+    }
+    // Desired behavior: the second session registers successfully.
+    expect(a2!.epoch).toBeGreaterThanOrEqual(1);
+    expect(a2!.sessionId).toBe(s2);
+    // Both sessions exist and are individually routable by their exact sessionId.
+    const both = db.prepare(`SELECT session_id, automatic_alias FROM sessions WHERE session_id IN (?,?)`).all(s1, s2) as Array<{ session_id: string; automatic_alias: string }>;
+    expect(both.length).toBe(2);
+    // Exactly one ACTIVE aliases-table row holds the shared fallback alias (no duplicate,
+    // no crash); the other session simply doesn't hold that convenience alias.
+    const holders = db.prepare(`SELECT COUNT(*) AS n FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`).get(`session-${shared}`) as { n: number };
+    expect(holders.n).toBe(1);
+  });
+
+  // Regression (adversarial review of the collision fix): the RESUME paths must also be
+  // collision-safe. An EXPIRED session's alias rows are retired (active=0), NOT deleted;
+  // if a prefix-mate claims the shared automatic alias active while the first is expired,
+  // the first session's resume must NOT bare-`UPDATE active=1` its own retired row (that
+  // would collide with the mate's active row on ux_alias_global → raw UNIQUE constraint →
+  // mislabeled DATABASE_ERROR → failed registration). Resume must register cleanly and
+  // simply not (re)hold the shared alias.
+  it('expired-resume with a prefix-mate holding the fallback alias registers cleanly (no UNIQUE-constraint leak)', () => {
+    const shared = 'beef5678';
+    const sA = `${shared}-0000-4000-8000-00000000000a`;
+    const sB = `${shared}-0000-4000-8000-00000000000b`; // shares first-8-hex with A
+    // A registers first → holds active session-beef5678.
+    store.register({ sessionId: sA, instanceId: 'ia', connectionId: 'ca', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' });
+    // A expires (advance the meaningful-activity clock past the 15-day retention, then sweep).
+    clock.advance(16 * 24 * 60 * 60_000);
+    reaper.sweep();
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM aliases WHERE alias_ci=? AND active=1`).get(`session-${shared}`)).toMatchObject({ n: 0 }); // A's row retired
+    // B registers → claims the now-free active fallback alias.
+    store.register({ sessionId: sB, instanceId: 'ib', connectionId: 'cb', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' });
+    expect(db.prepare(`SELECT session_id FROM aliases WHERE alias_ci=? AND active=1`).get(`session-${shared}`)).toMatchObject({ session_id: sB });
+    // A RESUMES (expired-resume → freshLifecycle). Must NOT throw a raw/DB error.
+    let resumed: ReturnType<BrokerStore['register']> | undefined;
+    try {
+      resumed = store.register({ sessionId: sA, instanceId: 'ia2', connectionId: 'ca2', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp' });
+    } catch (e) {
+      expect((e as XBusError).code, 'resume collision must not be a DB error').not.toBe(XBusErrorCode.DATABASE_ERROR);
+      expect(String((e as Error).message)).not.toMatch(/UNIQUE constraint|internal error/i);
+      throw e;
+    }
+    expect(resumed!.sessionId).toBe(sA);
+    // Still exactly one active holder of the shared alias — B keeps it; A resumed routable by id.
+    const holders = db.prepare(`SELECT session_id FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`).all(`session-${shared}`) as Array<{ session_id: string }>;
+    expect(holders.length).toBe(1);
+    expect(holders[0]!.session_id).toBe(sB);
   });
 });
 

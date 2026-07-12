@@ -248,7 +248,7 @@ export class BrokerStore {
             XBUS_VERSION, JSON.stringify(input.capabilities), input.receiveMode, input.agentType ?? null, now, now, now, now,
           );
         this.db.prepare('INSERT OR IGNORE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, 1)').run(input.sessionId);
-        this.upsertAliasRow(auto, 'global', null, input.sessionId, now);
+        this.upsertAutomaticAliasSafe(auto, input.sessionId, now);
         this.db.prepare('INSERT INTO session_epochs (session_id, epoch, epoch_token_hash, started_at) VALUES (?,?,?,?)').run(input.sessionId, epoch, this.nextEpochToken(), now);
       } else if (freshLifecycle) {
         // Genuine takeover (supersede) OR an expired session resuming: advance the epoch.
@@ -274,9 +274,7 @@ export class BrokerStore {
           // that alias again (ADR 0012 / reaper.ts: 'still routable by its
           // automatic_alias'); reactivate it (re-upsert if the row was pruned). The
           // session's prior USER name stays released (re-claimed below if requested).
-          const auto = automaticAlias(input.sessionId);
-          const reactivated = this.db.prepare(`UPDATE aliases SET active=1, retired_at=NULL WHERE session_id=? AND alias_ci=? AND scope='global'`).run(input.sessionId, auto.ci);
-          if (reactivated.changes === 0) this.upsertAliasRow(auto, 'global', null, input.sessionId, now);
+          this.upsertAutomaticAliasSafe(automaticAlias(input.sessionId), input.sessionId, now);
           this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
         }
       } else {
@@ -403,6 +401,48 @@ export class BrokerStore {
       .run(this.ids.next(), alias.display, alias.ci, scope, projectId, sessionId, now);
   }
 
+  /**
+   * Claim the broker-minted automatic fallback alias (`session-<8hex>`) collision-safe —
+   * the SINGLE entry for acquiring the automatic alias on register/resume/rename.
+   *
+   * The automatic alias is derived from only the first 8 hex chars of the sessionId
+   * (aliases.ts), so two DISTINCT sessions whose CLAUDE_CODE_SESSION_IDs share that
+   * prefix would map to the SAME `alias_ci`. Any write that flips `active=1` on such a
+   * row — a bare INSERT (first register) OR a bare reactivation `UPDATE ... active=1`
+   * (expired-/rename-resume, where the sweep left this session's own row at active=0 but
+   * another prefix-mate has since claimed it active) — hits the active-unique
+   * `ux_alias_global` index and throws a raw `UNIQUE constraint failed`, which the daemon
+   * mislabels as `DATABASE_ERROR "internal error"` and FAILS the whole registration.
+   *
+   * The automatic alias is a NON-ESSENTIAL convenience address: a session is always
+   * routable by its exact sessionId (resolveRecipient session-kind) and its
+   * sessions.automatic_alias column is set regardless. So an 8-hex-prefix collision must
+   * NEVER fail registration nor leak an internal error — mirror registerAlias(): resolve
+   * the CURRENT active holder first, and:
+   *   - held by ANOTHER active session ⇒ skip (audited); the peer stays routable by id;
+   *   - held by THIS session already     ⇒ no-op (idempotent);
+   *   - held by no active session        ⇒ reactivate THIS session's retired row if it
+   *                                         has one (active=0 → active=1), else insert.
+   * All reads/writes here are inside the caller's register()/renameSession() transaction
+   * on synchronous single-threaded node:sqlite, so there is no TOCTOU window.
+   */
+  private upsertAutomaticAliasSafe(alias: NormalizedAlias, sessionId: string, now: string): void {
+    const clash = this.db
+      .prepare(`SELECT session_id FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`)
+      .get(alias.ci) as { session_id: string } | undefined;
+    if (clash) {
+      if (clash.session_id !== sessionId) {
+        this.audit('AUTOMATIC_ALIAS_COLLISION', { sessionId, alias: alias.display, heldBy: clash.session_id });
+      }
+      return; // already active (this session or another) — never a duplicate/constraint hit
+    }
+    // No active holder. Reactivate this session's own retired row if present, else insert.
+    const reactivated = this.db
+      .prepare(`UPDATE aliases SET active=1, retired_at=NULL WHERE session_id=? AND alias_ci=? AND scope='global'`)
+      .run(sessionId, alias.ci);
+    if (reactivated.changes === 0) this.upsertAliasRow(alias, 'global', null, sessionId, now);
+  }
+
   /** Register a user alias for the authenticated session (global scope for slice). */
   registerAlias(auth: SessionAuthority, rawAlias: string): { alias: string } {
     const alias = validateUserAlias(rawAlias);
@@ -478,9 +518,7 @@ export class BrokerStore {
         // resurrected session must be routable by that alias again, exactly as the
         // register-based expired-resume path reactivates it (see register()). Reactivate
         // the row (re-upsert if it was pruned). Any user name is set above.
-        const auto = automaticAlias(auth.sessionId);
-        const reactivated = this.db.prepare(`UPDATE aliases SET active=1, retired_at=NULL WHERE session_id=? AND alias_ci=? AND scope='global'`).run(auth.sessionId, auto.ci);
-        if (reactivated.changes === 0) this.upsertAliasRow(auto, 'global', null, auth.sessionId, now);
+        this.upsertAutomaticAliasSafe(automaticAlias(auth.sessionId), auth.sessionId, now);
       }
       this.refreshMeaningfulActivity(auth.sessionId, now); // now applies (expired_at cleared above)
       this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });

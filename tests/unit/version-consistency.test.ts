@@ -21,7 +21,7 @@ const readJson = (p: string) => JSON.parse(fs.readFileSync(path.join(REPO, p), '
 // (beta.N) is a deliberate, reviewed act: change this literal and every surface
 // below must move with it. Compatibility + schema are INDEPENDENT of the product
 // version and must NOT move just because the prerelease label did.
-const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.4';
+const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.4.1';
 const EXPECTED_COMPATIBILITY_ID = 'xbus-p1-stp1-s6';
 const EXPECTED_SCHEMA_VERSION = 6;
 

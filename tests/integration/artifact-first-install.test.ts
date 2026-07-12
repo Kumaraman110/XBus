@@ -220,7 +220,7 @@ describe('artifact-first — install lifecycle (tests 5-11)', () => {
       });
     } catch (e) { out = (e as { stdout?: string }).stdout ?? ''; }
     expect(out).toContain('"name":"xbus"');
-    expect(out).toContain('"version":"0.1.0-beta.4"');
+    expect(out).toContain('"version":"0.1.0-beta.4.1"');
   });
 
   it('12+13: installed UserPromptSubmit and Stop hooks execute from the INSTALLED path', () => {
