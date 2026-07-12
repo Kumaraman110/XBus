@@ -387,6 +387,28 @@ Existing rows default to `management_state='active'`, `identify_confidence='sign
 (they were live pre-migration). Forward-only; downgrade-guarded; protocol/STP frozen;
 `xbus-p1-stp1-s6 → -s7`.
 
+## New code this design assumes (nothing exists yet — expected for a pre-impl ADR)
+
+To keep the design honest about what Phase-1 implementation must ADD (none of this is in
+the tree today; the design's concreteness rests on building it):
+- **`AUDIT_PERSISTENCE_FAILED`** must be added to `XBusErrorCode` (`src/protocol/errors.ts`
+  currently has only `DATABASE_ERROR`) — it is the typed error for the Q3/Q4 availability
+  tradeoff.
+- **`ledger_events` + `ledger_anchors` tables + their append-only triggers + the 6→7
+  migration** must be added (`migrations.ts` max version is 6 today); the `sessions`
+  column additions (Q2/schema-delta above) likewise.
+- **The DB-snapshot upgrade/rollback path** (ADR 0019 D4 rollback) is NEW: today
+  `cli/install.ts` snapshots the DB only on a legacy-relocation migration, and `rollback()`
+  restores only the plugin — Phase 1 must snapshot the DB on any schema increase and
+  restore it on rollback.
+- **The off-loop dashboard worker + `SQLITE_OPEN_READONLY` reads + `/auth/exchange` on the
+  writer + fetch-streaming** are all new (no HTTP server exists today; only the UDS/pipe
+  IPC in `ipc/server.ts`).
+- **Handshake note:** `daemon.ts` defaults a hello that OMITS `schemaVersion` to the
+  broker's own version (→ `compatible`); real components always send it (`ipc/hello.ts`),
+  so a genuine s6 client sends 6 → `upgrade_component`. Phase 1 should additionally treat a
+  schema-less hello as incompatible (defense-in-depth), backed by the DB-open guard.
+
 ---
 
 ## Test matrix (Phase 1 gate — all automated unless marked human)

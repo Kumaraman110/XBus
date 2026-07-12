@@ -37,12 +37,16 @@ preserving the audit DB unless explicit purge.
    - **JS strips the fragment, then exchanges it.** On load the app reads
      `location.hash`, immediately `history.replaceState`s the hash away (so a reload/
      bookmark/back cannot replay it and it won't sit in the address bar), and calls
-     **`POST /auth/exchange` with `{nonce}` in the body** (not the URL). The server
-     **atomically consumes** the nonce (single `UPDATE … SET consumed_at=? WHERE
-     nonce_hash=? AND consumed_at IS NULL AND expires_at>now` — the affected-row count is
-     the CAS; a second attempt affects 0 rows → rejected), verifies TTL, and returns a
-     **short-lived tab token** (CSPRNG, e.g. 30-min TTL, bound to `127.0.0.1`), plus its
-     expiry.
+     **`POST /auth/exchange` with `{nonce}` in the body** (not the URL). `/auth/exchange`
+     is the **one write endpoint** and therefore **executes on the broker/writer side**
+     (the nonce/token store is broker-owned) — NOT in the read-only off-loop worker that
+     serves `/api/*` (ADR 0020 Q5 #2). It **atomically consumes** the nonce (single
+     `UPDATE … SET consumed_at=? WHERE nonce_hash=? AND consumed_at IS NULL AND
+     expires_at>now` — the affected-row count is the CAS; a second attempt affects 0 rows →
+     rejected), verifies TTL, and returns a **short-lived tab token** (CSPRNG, e.g. 30-min
+     TTL, bound to `127.0.0.1`), plus its expiry. It mutates only the ephemeral nonce/token
+     store — **no product state** — so "no product-state mutation routes" (ADR 0020 Q5 #1)
+     holds.
    - **Tab token lives in memory / `sessionStorage` only** — never `localStorage`
      (survives tab close, broader XSS exposure), never a cookie (no ambient CSRF).
    - **Every data/API request carries `Authorization: Bearer <tab-token>`** (a custom

@@ -37,7 +37,21 @@ it keeps the existing equal-schema fail-closed rule and treats the s6→s7 move 
    get sensible defaults (e.g. `author_type='claude'`, `title_sync_state='none'`,
    `thread_id`/`thread_sequence` backfilled for existing messages by treating each as a
    degenerate thread, ADR 0017 §2). Runs inside the existing transactional migration
-   runner; backup-before-migrate (existing install migration discipline) applies.
+   runner (`migrations.ts` per-migration `BEGIN`/`COMMIT`), so a *cleanly-failing* 6→7
+   statement rolls back and leaves the DB at s6 on its own.
+
+   **Correction (2026-07-12, review-directed): a DB snapshot is REQUIRED and is NEW work —
+   the "existing install migration discipline" does NOT cover it on the in-place upgrade.**
+   Today `cli/install.ts` only backs up the **DB file** on a legacy-root **relocation**
+   (`plan.migration.kind==='migrate'` → `migrateDataRoot`, `data-migration.ts`); a normal
+   beta.4.1→beta.5 upgrade with an unchanged data dir is `kind:'no_migration'`, which backs
+   up only the **plugin dir**, not the DB. And the 6→7 migration currently runs via the
+   pre-commit health check (`startBrokerHost`→`runMigrations`) against the **live** DB. So
+   without new work, a non-transactional failure (crash mid-commit / corruption / a commit
+   of wrong-but-valid state) could leave a migrated s7 DB while `rollback()` restores only
+   the s6 plugin → an s7 DB under an s6 plugin (the DB-open guard then refuses it: safe, but
+   NOT "a working s6 install"). Phase 1 therefore ADDS (see Decision 4): a DB snapshot on
+   **any schema increase**, snapshot-*before*-migrate, and a rollback that restores the DB.
 
 3. **Downgrade guard (fail closed) — TWO layers.** (a) At **DB open**, old code refuses a
    DB whose schema is newer than the build (`migrations.ts` max-version guard): a
@@ -49,18 +63,38 @@ it keeps the existing equal-schema fail-closed rule and treats the s6→s7 move 
 
 4. **No mixed-version operation — beta.5 upgrade is ONE controlled user-level operation.**
    There is no s6-component-with-s7-broker mode. Because the handshake fails closed on a
-   schema mismatch (D3b), the only supported transition is a **whole-install upgrade**,
-   performed as a single atomic-as-possible sequence by `xbus install` (user scope):
+   schema mismatch (D3b), the only supported transition is a **whole-install upgrade**. The
+   sequence + who performs each step is pinned precisely (correcting an earlier draft that
+   implied `xbus install` does all of it):
 
-   1. **Stop the old broker** (graceful `xbus stop`; the running s6 broker must exit so
-      the s7 broker can bind the singleton — ADR 0013's "stop before upgrade").
-   2. **Back up** the data root (DB + WAL) and the user-scope config (`~/.claude.json`,
-      `~/.claude/settings.json`) — the existing install backup-before-migrate discipline,
-      extended to cover the DB (so a failed migration can be fully restored).
-   3. **Install** the beta.5 plugin + hooks + broker binary (ownership-tagged, user scope).
-   4. **Migrate 6→7** inside the transactional migration runner (D2), on the backed-up DB.
+   1. **Stop the old broker — explicit prerequisite, NOT encapsulated by `xbus install`.**
+      Today `cli/install.ts` does not call `xbus stop`; if an s6 broker is live, install's
+      health check hits `checkSingleton`→`already_running` and fails. Phase 1 makes this a
+      documented, enforced prerequisite: either the operator runs `xbus stop` first
+      (per ADR 0013 "stop before upgrade"), or the upgrade command **adds** an explicit
+      stop step before install. Either way it is called out, not assumed.
+   2. **Snapshot the DB — NEW work, on ANY schema increase (not just legacy relocation).**
+      Copy `xbus.sqlite` + `-wal` + `-shm` (fd-level `fsync`) and the user-scope config to
+      a backup location, BEFORE any migration touches the live DB. This is new because the
+      current in-place (`no_migration`) path backs up only the plugin dir (D2). The
+      snapshot is the rollback source.
+   3. **Install** the beta.5 plugin + hooks + broker binary (ownership-tagged, user scope);
+      the existing plugin-dir backup/rollback continues to apply to plugin files.
+   4. **Migrate 6→7** in the transactional migration runner (D2) — and **not against the
+      live DB before the snapshot exists**: the pre-commit health check must NOT be what
+      first migrates the real dataDir. Either snapshot in step 2 strictly precedes any
+      `runMigrations` on the real DB, or the migration runs on a copy that is atomically
+      swapped in on success. (Implementation note; the design requires snapshot-before-
+      migrate ordering.)
    5. **Restart** the (now s7) broker; sessions re-register at their next SessionStart /
       first tool call and handshake as s7↔s7.
+
+   **Rollback (NEW): a failed upgrade restores the DB snapshot, not just the plugin.**
+   `rollback()` must restore the step-2 DB+config snapshot in addition to the plugin
+   backup, so a failure leaves a **working s6 install** (not an s7 DB stranded under an s6
+   plugin). A cleanly-failing migration statement still rolls back via the transactional
+   runner (D2); the snapshot covers the non-transactional cases (crash mid-commit,
+   corruption, wrong-but-valid commit) and the cross-step ordering.
 
    **Older components fail closed with `upgrade_component`** until they are themselves the
    upgraded s7 build — there is no partial/mixed fleet. If any step fails, the backup

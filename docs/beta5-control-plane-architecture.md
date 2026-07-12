@@ -24,12 +24,15 @@ the XBUS-STP wire and beta.4/beta.4.1 request/ACK/reply semantics stay frozen.
    ▼                              │ XBUS-STP over named pipe (frozen)
  ┌──────────────────────────────────────────────────────────────────────┐
  │ BROKER (machine singleton, single writer)                              │
- │  • routing/delivery (existing) + threads (new)                         │
+ │  • routing/delivery (existing) + threads (Phase 2)                     │
  │  • SessionStore + LedgerStore (SQLite, WAL, FKs, hash chain)           │
- │  • Dashboard HTTP server (127.0.0.1, token-auth, CSP) ◀─ SSE/JSON ─┐   │
- └────────────────────────────────────────────────────────────────────┼──┘
-                                                                        │
-                                        default browser ◀─ open/focus ──┘
+ │  • /auth/exchange (nonce→tab-token; broker/WRITER side)                │
+ │  • Dashboard HTTP server (127.0.0.1, token-auth, CSP)                  │
+ │      – reads run OFF-LOOP: worker_thread, SQLITE_OPEN_READONLY          │
+ │      – live updates via fetch-STREAM/JSON (NOT SSE) ◀── Authorization ─┐│
+ └─────────────────────────────────────────────────────────────────────┼─┘
+                                                                         │
+                                        default browser ◀─ open/focus ───┘
                                         (debounced; no tab storm)
 ```
 
