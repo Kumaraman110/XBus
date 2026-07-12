@@ -24,11 +24,12 @@ import { readProvenance } from './build-identity.js';
 export const PLUGIN_PAYLOAD_FILES = [
   '.claude-plugin/plugin.json',   // plugin manifest (the --plugin-dir entry)
   '.mcp.json',                    // MCP server registration
-  'hooks/hooks.json',             // UserPromptSubmit + Stop hooks
+  'hooks/hooks.json',             // SessionStart + UserPromptSubmit + Stop hooks
   'dist/cli/main.js',             // xbus CLI entry
   'dist/launcher/xclaude.js',     // xclaude launcher entry
   'dist/channel/server.js',       // MCP server (spawned by .mcp.json)
-  'dist/channel/hook-entry.js',   // hook entry (spawned by hooks.json)
+  'dist/channel/hook-entry.js',   // checkpoint hook entry (UserPromptSubmit + Stop)
+  'dist/channel/session-start-hook.js', // beta.5 SessionStart lifecycle hook (visibility)
   'package.json',                 // runtime manifest (bin + deps + engines)
   'provenance.json',              // exact build identity, read at runtime (see ADR 0011)
 ] as const;
@@ -174,13 +175,14 @@ export function validateArtifact(root: string, opts: { expectedVersion?: string;
     }
   }
 
-  // 5) hooks.json — every hook command resolves to a packaged file; UPS + Stop present.
+  // 5) hooks.json — every hook command resolves to a packaged file; SessionStart (beta.5
+  //    visibility) + UserPromptSubmit + Stop (checkpoint delivery) present.
   const hooksPath = path.join(root, 'hooks', 'hooks.json');
   if (fs.existsSync(hooksPath)) {
     type HooksJson = { hooks?: Record<string, Array<{ hooks?: Array<{ command?: string }> }>> };
     let hooks: HooksJson | null = null;
     try { hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8')) as HooksJson; } catch (e) { add('malformed-metadata', `hooks.json: ${(e as Error).message}`); }
-    for (const event of ['UserPromptSubmit', 'Stop']) {
+    for (const event of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
       if (!hooks?.hooks?.[event]) add('hook-event-missing', event);
     }
     for (const [event, groups] of Object.entries(hooks?.hooks ?? {})) {

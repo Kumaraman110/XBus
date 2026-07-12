@@ -52,18 +52,24 @@ function insertLegacySession(db: SqliteDriver, sessionId: string, nowIso: string
 }
 
 describe('migration v6 — schema/version bump', () => {
-  it('SCHEMA_VERSION is 6 and the wire compatibility id is xbus-p1-stp1-s6', () => {
-    expect(SCHEMA_VERSION).toBe(6);
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s6');
-    // The highest migration in the array is 6.
-    expect(MIGRATIONS.reduce((m, x) => Math.max(m, x.version), 0)).toBe(6);
+  it('migration v6 exists and moves the schema to exactly 6 at its boundary', () => {
+    // v6 is the beta.4 boundary. The GLOBAL current schema/wire tuple has since moved
+    // forward (owned by version-consistency.test.ts + migration-v7.test.ts); this file
+    // stays scoped to the v6 migration itself, so it asserts the 6-boundary via a
+    // bounded apply — not the global SCHEMA_VERSION (which is now higher).
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(6);
+    expect(WIRE_COMPATIBILITY_ID).toMatch(/^xbus-p1-stp1-s\d+$/);
+    expect(MIGRATIONS.some((m) => m.version === 6 && m.name === 'named_sessions_and_activity_retention')).toBe(true);
+    const { db } = freshDb();
+    applyUpTo(db, 6, '2026-01-01T00:00:00.000Z');
+    const cur = (db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v;
+    expect(cur).toBe(6);
+    db.close();
   });
 
-  it('runMigrations applies cleanly to a fresh DB and reports currentVersion 6', () => {
+  it('applying up to v6 on a fresh DB creates the v6 columns with safe defaults', () => {
     const { db } = freshDb();
-    const r = runMigrations(db, '2026-01-01T00:00:00.000Z');
-    expect(r.currentVersion).toBe(6);
-    expect(r.appliedNow).toContain(6);
+    applyUpTo(db, 6, '2026-01-01T00:00:00.000Z');
     const cols = sessionColumns(db);
     for (const c of COLS) expect(cols.has(c), `sessions.${c} missing`).toBe(true);
     db.close();

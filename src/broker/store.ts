@@ -23,10 +23,40 @@ import type { SendInput } from '../protocol/schemas.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
+import { ledgerAppend, type LedgerSubject } from './ledger.js';
 
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
+
+/**
+ * Beta.5 Phase 1 (ADR 0013 D2): SessionStart `source` → the ledger event type recorded
+ * for that lifecycle transition. `fork` is not a distinct SessionStart source — a fork
+ * fires `startup` with a NEW session_id (ADR 0013 D4), so it maps to the same
+ * SESSION_STARTED; the NEW-identity property is what makes it a fork, not a `source` value.
+ */
+type LifecycleSource = 'startup' | 'resume' | 'clear' | 'compact';
+const LIFECYCLE_EVENT_BY_SOURCE: Record<LifecycleSource, string> = {
+  startup: 'SESSION_STARTED',
+  resume: 'SESSION_RESUMED',
+  clear: 'SESSION_CLEARED',
+  compact: 'SESSION_COMPACTED',
+};
+
+/** Normalize an untrusted SessionStart `source` to a known lifecycle kind. Unknown /
+ *  `--continue` variants collapse to `resume` (the hook contract lists resume as covering
+ *  `--resume`/`--continue`/`/resume`); a genuinely unrecognized value degrades to `resume`
+ *  rather than throwing — the hook must never fail Claude startup over a new source name. */
+function normalizeLifecycleSource(raw: string): LifecycleSource {
+  switch (raw) {
+    case 'startup': return 'startup';
+    case 'clear': return 'clear';
+    case 'compact': return 'compact';
+    case 'resume':
+    case 'continue':
+    default: return 'resume';
+  }
+}
 
 export interface RegisterInput {
   sessionId: string;
@@ -118,6 +148,19 @@ export class BrokerStore {
         JSON.stringify(fields),
         this.clock.nowIso(),
       );
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0016/0020 Q3): append ONE hash-chained `ledger_events` row in
+   * the CALLER's transaction, so the audit projection shares the state mutation's fate
+   * (no divergence). `actor` is the authenticated session id (or 'broker'/'installer').
+   * `subject` carries ids only; `payload` carries SAFE metadata (states/counts/hashes),
+   * never bodies/secrets. A ledger-specific failure throws AUDIT_PERSISTENCE_FAILED,
+   * aborting the whole op — a deliberate availability tradeoff (Q3). MUST be called
+   * inside a `this.db.transaction(...)`.
+   */
+  private ledger(eventType: string, actor: string, subject: LedgerSubject, payload: Record<string, unknown>): void {
+    ledgerAppend(this.db, this.ids, this.clock, eventType, actor, subject, payload);
   }
 
   /**
@@ -457,6 +500,70 @@ export class BrokerStore {
       if (!clash) this.upsertAliasRow(alias, 'global', null, auth.sessionId, now);
       this.audit('ALIAS_REGISTERED', { sessionId: auth.sessionId, alias: alias.display });
       return { alias: alias.display };
+    });
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D2 / ADR 0020): record a SessionStart lifecycle signal
+   * for the AUTHENTICATED session and make it visible in the control plane. Runs in ONE
+   * transaction: an idempotent UPDATE of the visibility columns + exactly one hash-chained
+   * ledger event (or none, for a deduped duplicate birth) — never state without its audit
+   * row (Q3). Identity is the connection's authenticated `auth.sessionId`; nothing here is
+   * read from a caller-supplied session id.
+   *
+   * The session row already exists (the daemon enforces register_session BEFORE announce),
+   * and the epoch/expiry/fork mechanics are already settled by register(): an expired
+   * `resume` advanced the epoch + cleared the tombstone (fresh lifecycle, NO message
+   * resurrection); a fork arrived with a DISTINCT session_id → its own epoch-1 row. So
+   * announce is purely the visibility + audit layer on top.
+   *
+   * Idempotency (identity-level, tested): repeated announces converge the same columns,
+   * never create a second session row or inflate the epoch, and the session appears
+   * exactly once in the read model. A duplicate `startup` (a second "birth" of a session
+   * already seen) is absorbed — state re-stamped, NO duplicate STARTED ledger event. The
+   * genuinely-repeatable signals (`resume`/`clear`/`compact`) each append their own event,
+   * because that is exactly the lifecycle history an append-only audit ledger exists to keep.
+   */
+  announceSession(
+    auth: SessionAuthority,
+    input: { source: string; cwd?: string; transcriptPath?: string; agentType?: string },
+  ): { managementState: string; priorManagementState: string; source: string; lifecycleEvent: string; epoch: number; appended: boolean } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const row = this.db
+        .prepare('SELECT active_epoch AS epoch, management_state AS mgmt, first_seen_at AS firstSeen, agent_type AS agentType FROM sessions WHERE session_id=?')
+        .get(auth.sessionId) as { epoch: number; mgmt: string; firstSeen: string | null; agentType: string | null } | undefined;
+      if (!row) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
+
+      const source = normalizeLifecycleSource(input.source);
+      const lifecycleEvent = LIFECYCLE_EVENT_BY_SOURCE[source];
+      const priorManagementState = row.mgmt;
+      const isFirstAnnounce = row.firstSeen === null;
+
+      // Idempotent visibility update. management_state → 'active' (a live SessionStart
+      // signal is the highest-confidence identification); a dormant/unmanaged row is thus
+      // activated. transcript_path + agent_type are backfilled (COALESCE) so a later
+      // richer signal fills gaps without clobbering an existing value. first_seen_at is
+      // stamped once. identify_confidence is 'signal' (documented hook input, ADR 0020 Q1).
+      this.db
+        .prepare(
+          `UPDATE sessions SET management_state='active', source_last=?, identify_confidence='signal',
+             transcript_path=COALESCE(?, transcript_path), agent_type=COALESCE(agent_type, ?),
+             first_seen_at=COALESCE(first_seen_at, ?), last_seen_source_at=?, updated_at=? WHERE session_id=?`,
+        )
+        .run(source, input.transcriptPath ?? null, input.agentType ?? null, now, now, now, auth.sessionId);
+
+      this.audit('SESSION_ANNOUNCED', { sessionId: auth.sessionId, source, epoch: row.epoch, priorManagementState });
+
+      // Exactly one ledger event per genuine lifecycle signal. A repeated `startup` for an
+      // already-seen session is a meaningless second birth → deduped (state-only re-stamp).
+      const appended = !(source === 'startup' && !isFirstAnnounce);
+      if (appended) {
+        this.ledger(lifecycleEvent, auth.sessionId, { sessionId: auth.sessionId }, {
+          source, epoch: row.epoch, managementState: 'active', priorManagementState, confidence: 'signal',
+        });
+      }
+      return { managementState: 'active', priorManagementState, source, lifecycleEvent, epoch: row.epoch, appended };
     });
   }
 

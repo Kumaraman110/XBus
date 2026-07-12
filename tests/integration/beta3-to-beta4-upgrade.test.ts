@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { openDatabase, type SqliteDriver } from '../../src/database/connection.js';
 import { MIGRATIONS, runMigrations } from '../../src/database/migrations.js';
+import { SCHEMA_VERSION } from '../../src/protocol/handshake.js';
 import { BrokerStore, type SessionAuthority } from '../../src/broker/store.js';
 import { DeliveryOps } from '../../src/broker/delivery.js';
 import { Reaper } from '../../src/broker/reaper.js';
@@ -76,11 +77,15 @@ describe('beta.3 -> beta.4 upgrade', () => {
     const beforeSessions = (db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n;
     db.close();
 
-    // Reopen + run ALL migrations (5 -> 6). This is what a beta.4 broker boot does.
+    // Reopen + run ALL pending migrations. This is what a broker boot does; on the
+    // current (beta.5/s7) code that applies v6 AND the additive v7 control-plane
+    // migration. The beta.3-row-survival assertions below hold regardless — v7 only
+    // ADDS columns/tables. We assert v6 was among those applied and the DB reached the
+    // current schema, rather than pinning a single version (future-bump-proof).
     db = openDatabase(dbPath, { applyPragmas: true });
     const r = runMigrations(db, t0);
-    expect(r.currentVersion).toBe(6);
-    expect(r.appliedNow).toEqual([6]); // only v6 was pending
+    expect(r.currentVersion).toBe(SCHEMA_VERSION);
+    expect(r.appliedNow).toContain(6); // the beta.4 migration was pending + applied
 
     // All rows survived.
     expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(beforeSessions);
@@ -147,19 +152,20 @@ describe('beta.3 -> beta.4 upgrade', () => {
     db.close();
   });
 
-  it('a v6 DB is REJECTED by beta.3 code (downgrade guard) — proves the fail-closed bump', () => {
+  it('a forward-migrated DB is REJECTED by beta.3 code (downgrade guard) — proves the fail-closed bump', () => {
     const t0 = clock.nowIso();
     let db = openDatabase(dbPath, { applyPragmas: true });
-    runMigrations(db, t0); // now at v6
+    runMigrations(db, t0); // migrates to the current schema (>= 6)
     db.close();
-    // Simulate beta.3 code (which only knows migrations 1..5) opening the v6 DB.
+    // Simulate beta.3 code (which only knows migrations 1..5) opening the migrated DB.
     db = openDatabase(dbPath, { applyPragmas: true });
     const beta3Migrations = [...MIGRATIONS].filter((m) => m.version <= 5);
     const codeMax = beta3Migrations.reduce((mx, m) => Math.max(mx, m.version), 0);
     const dbMax = (db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v;
     // The runMigrations downgrade guard throws when dbMax > codeMax. We assert the
-    // condition that triggers it (beta.3 code would refuse to run against this DB).
-    expect(dbMax).toBe(6);
+    // condition that triggers it (beta.3 code would refuse to run against this DB): the
+    // DB is at the current schema, which is strictly newer than beta.3's max (5).
+    expect(dbMax).toBe(SCHEMA_VERSION);
     expect(dbMax).toBeGreaterThan(codeMax);
     db.close();
   });

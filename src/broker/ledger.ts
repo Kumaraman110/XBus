@@ -29,10 +29,56 @@ export interface LedgerSubject {
   messageId?: string;
 }
 
+/** Thrown by the recursive canonicalizer when a value cannot be canonically encoded
+ *  (undefined, non-finite number, function, symbol, bigint). Callers convert it to
+ *  AUDIT_PERSISTENCE_FAILED on write, or treat it as a chain break on verify. */
+export class LedgerCanonicalizationError extends Error {}
+
 /**
- * Canonical serialization of the hashed fields: a fixed field order with
- * sorted-key JSON, UTF-8. Identical on write and on verify (a test pins frozen
- * vectors), so the chain is reproducible across builds/platforms.
+ * Recursively canonicalize a JSON-ish value to a deterministic string, UTF-8:
+ *  - object keys sorted at EVERY depth (not just the top level),
+ *  - arrays preserved in order,
+ *  - strings/finite-numbers/booleans/null encoded as standard JSON,
+ *  - UNSUPPORTED values REJECTED (throw) rather than silently coerced: `undefined`,
+ *    `NaN`/`±Infinity`, functions, symbols, bigints. (Plain `JSON.stringify` would drop
+ *    `undefined`, coerce non-finite numbers to `null`, and ignore functions — hiding a
+ *    bug in the hashed content. ADR 0020 Q4 requires the canonicalization to reject them.)
+ * For the flat, safe payloads we actually store (ids/states/counts/hashes) the output is
+ * byte-identical to sorted-key JSON, so frozen vectors stay stable across builds.
+ */
+function canonicalize(value: unknown, at: string): string {
+  if (value === null) return 'null';
+  const t = typeof value;
+  if (t === 'string') return JSON.stringify(value);
+  if (t === 'boolean') return value ? 'true' : 'false';
+  if (t === 'number') {
+    if (!Number.isFinite(value)) throw new LedgerCanonicalizationError(`non-finite number at ${at}`);
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return '[' + value.map((v, i) => canonicalize(v, `${at}[${i}]`)).join(',') + ']';
+  }
+  if (t === 'object') {
+    const obj = value as Record<string, unknown>;
+    const parts: string[] = [];
+    for (const k of Object.keys(obj).sort()) {
+      const v = obj[k];
+      // A present key whose value is `undefined` is ambiguous (JSON.stringify would drop
+      // the whole key) — reject it so the hashed content is unambiguous.
+      if (v === undefined) throw new LedgerCanonicalizationError(`undefined value at ${at}.${k}`);
+      parts.push(JSON.stringify(k) + ':' + canonicalize(v, `${at}.${k}`));
+    }
+    return '{' + parts.join(',') + '}';
+  }
+  // undefined / function / symbol / bigint
+  throw new LedgerCanonicalizationError(`unsupported ${t} at ${at}`);
+}
+
+/**
+ * Canonical serialization of the hashed fields: sorted-key JSON at every depth, UTF-8.
+ * Identical on write and on verify (a test pins frozen vectors), so the chain is
+ * reproducible across builds/platforms. Throws LedgerCanonicalizationError on an
+ * un-encodable value (see canonicalize).
  */
 export function canonicalLedgerPayload(row: {
   seq: number;
@@ -42,18 +88,7 @@ export function canonicalLedgerPayload(row: {
   payload: Record<string, unknown>;
   createdAt: string;
 }): string {
-  // Sort object keys deterministically (one level deep is sufficient for our safe,
-  // flat payloads; nested objects are stringified with sorted keys too via replacer).
-  const sortKeys = (_k: string, v: unknown): unknown => {
-    if (v && typeof v === 'object' && !Array.isArray(v)) {
-      return Object.keys(v as Record<string, unknown>).sort().reduce((acc, k) => {
-        acc[k] = (v as Record<string, unknown>)[k];
-        return acc;
-      }, {} as Record<string, unknown>);
-    }
-    return v;
-  };
-  return JSON.stringify(
+  return canonicalize(
     {
       seq: row.seq,
       eventType: row.eventType,
@@ -62,7 +97,7 @@ export function canonicalLedgerPayload(row: {
       payload: row.payload,
       createdAt: row.createdAt,
     },
-    sortKeys,
+    '$',
   );
 }
 

@@ -10,7 +10,7 @@
 import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import { IpcServer, type ServerConn, type ServerOptions } from '../ipc/server.js';
-import { makeFrame, type Frame, type FrameType, type RegisterPayload } from '../protocol/commands.js';
+import { makeFrame, type Frame, type FrameType, type RegisterPayload, type AnnouncePayload } from '../protocol/commands.js';
 import { BrokerStore, type SessionAuthority } from './store.js';
 import { DeliveryOps, INJECTION_METADATA_KEY } from './delivery.js';
 import { Reaper, type SweepResult } from './reaper.js';
@@ -238,6 +238,8 @@ export class BrokerDaemon {
           return this.onHello(conn, frame);
         case 'register_session':
           return this.onRegister(conn, frame);
+        case 'announce_session':
+          return this.onAnnounceSession(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
         case 'rename_session':
@@ -426,6 +428,37 @@ export class BrokerDaemon {
       ackPayload.awardedSupport = enforcement.awarded;
     }
     this.reply(conn, 'register_session_ack', ackPayload, frame.requestId);
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D2 / ADR 0020): the SessionStart lifecycle signal. The
+   * connection MUST have completed register_session (requireAuth) — identity is the
+   * authenticated `auth.sessionId`, NEVER a payload sessionId (a caller cannot announce
+   * for another session). The store records visibility + exactly one ledger event in one
+   * transaction. Any role may announce (the hook registers as `hook`); this mutates only
+   * visibility + audit, no routing state, so it is not gated by the send/name matrix.
+   */
+  private onAnnounceSession(conn: ServerConn, frame: Frame): void {
+    const auth = this.requireAuth(conn);
+    const p = (frame.payload ?? {}) as Partial<AnnouncePayload>;
+    if (typeof p.source !== 'string' || !p.source) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'announce_session requires a non-empty source');
+    }
+    // Optional string fields flow into TEXT columns; reject a present-but-non-string value
+    // with a clean PROTOCOL_VIOLATION (a boolean/object would throw a raw bind error).
+    const cwd = this.optString(p.cwd, 'cwd');
+    const transcriptPath = this.optString(p.transcriptPath, 'transcriptPath');
+    const agentType = this.optString(p.agentType, 'agentType');
+    const r = this.store.announceSession(auth, {
+      source: p.source,
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+      ...(agentType !== undefined ? { agentType } : {}),
+    });
+    this.reply(conn, 'announce_session_ack', {
+      sessionId: auth.sessionId, managementState: r.managementState, source: r.source,
+      lifecycleEvent: r.lifecycleEvent, epoch: r.epoch, appended: r.appended,
+    }, frame.requestId);
   }
 
   private onRenameSession(conn: ServerConn, frame: Frame): void {

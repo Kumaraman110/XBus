@@ -9,6 +9,7 @@ import { PROTOCOL_VERSION } from './version.js';
 export type FrameType =
   | 'hello' | 'hello_ack'
   | 'register_session' | 'register_session_ack'
+  | 'announce_session' | 'announce_session_ack'   // beta.5 Phase 1: proactive SessionStart lifecycle signal (visibility) — NOT a routing binding
   | 'register_alias' | 'register_alias_ack'
   | 'rename_session' | 'rename_session_ack'   // beta.4: choose/change the human-readable session name (resolves pending_name)
   | 'heartbeat' | 'heartbeat_ack'
@@ -67,5 +68,25 @@ export interface RegisterPayload {
    *  the two feature sets compose without colliding (ADR 0012 §5). */
   requestedSessionName?: string;
   /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
+  agentType?: string;
+}
+
+/**
+ * Beta.5 Phase 1 (ADR 0013 D2 / ADR 0020): the SessionStart lifecycle signal.
+ * Announced by the SessionStart hook on the connection AFTER register_session, so
+ * identity is derived from the authenticated connection — `sessionId` is NEVER read
+ * from this payload (the daemon ignores any sessionId here). It carries only the
+ * documented SessionStart inputs so the broker can mark the session visible +
+ * append exactly one lifecycle ledger event.
+ */
+export interface AnnouncePayload {
+  /** SessionStart `source`: startup | resume | clear | compact (the lifecycle kind).
+   *  `resume` also covers `--continue`/`/resume` per the hook contract. */
+  source: string;
+  /** Working directory reported by the hook (documented input). */
+  cwd?: string;
+  /** Path to the session transcript .jsonl (documented input). */
+  transcriptPath?: string;
+  /** Optional agent type (present when launched with `--agent`). */
   agentType?: string;
 }

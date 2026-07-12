@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import { openDatabase, type SqliteDriver } from '../../src/database/connection.js';
 import { runMigrations } from '../../src/database/migrations.js';
 import { SeqIdGen, FakeClock } from '../../src/shared/clock.js';
-import { ledgerAppend, verifyLedger, canonicalLedgerPayload, computeEntryHash, LEDGER_GENESIS_HASH } from '../../src/broker/ledger.js';
+import { ledgerAppend, verifyLedger, canonicalLedgerPayload, computeEntryHash, LEDGER_GENESIS_HASH, LedgerCanonicalizationError } from '../../src/broker/ledger.js';
 import { XBusErrorCode, isXBusError } from '../../src/protocol/errors.js';
 
 let dir: string; let db: SqliteDriver; let ids: SeqIdGen; let clock: FakeClock;
@@ -80,5 +80,110 @@ describe('ledger append + hash chain', () => {
     expect(code).toBe(XBusErrorCode.AUDIT_PERSISTENCE_FAILED);
     // reopen so afterEach close() doesn't throw
     db = openDatabase(path.join(dir, 'x.sqlite'), { applyPragmas: true });
+  });
+});
+
+describe('ledger hardening — the 7 invariants', () => {
+  it('seq allocation + prev-hash selection + insert are ONE transaction (rollback creates NO gap)', () => {
+    // Append 3 good rows, then a 4th append that throws AFTER seq alloc but the whole
+    // op must roll back atomically, leaving seq dense 1..3 (no phantom seq=4 hole).
+    append('E', { sessionId: 's1' });
+    append('E', { sessionId: 's2' });
+    append('E', { sessionId: 's3' });
+    // Wrap an append in a transaction that then throws → the ledger insert must roll back
+    // with it (ledgerAppend shares the caller's txn), so seq 4 is never consumed.
+    expect(() => db.transaction(() => {
+      append('E', { sessionId: 's4' }); // computes seq=4, inserts
+      throw new Error('caller aborts after the ledger append');
+    })).toThrow(/caller aborts/);
+    const r = rows();
+    expect(r.map((x) => x.seq)).toEqual([1, 2, 3]); // NO gap — seq 4 rolled back
+    // The NEXT append reuses seq=4 (dense, no permanent hole).
+    append('E', { sessionId: 's5' });
+    expect(rows().map((x) => x.seq)).toEqual([1, 2, 3, 4]);
+    expect(verifyLedger(db).ok).toBe(true);
+  });
+
+  it('re-entrant appends in one txn cannot duplicate seq (each reads the prior in-txn tip)', () => {
+    // node:sqlite is synchronous single-threaded, so "concurrent" = re-entrant within one
+    // transaction. Two appends in the same txn must pick distinct, dense seqs (2,3 after 1).
+    append('E', { sessionId: 's1' });
+    db.transaction(() => {
+      append('E', { sessionId: 's2' });
+      append('E', { sessionId: 's3' });
+    });
+    const seqs = rows().map((x) => x.seq);
+    expect(seqs).toEqual([1, 2, 3]);
+    expect(new Set(seqs).size).toBe(3); // no duplicate seq
+    expect(verifyLedger(db).ok).toBe(true);
+  });
+
+  it('post-vacuum append chains from the anchor (not genesis), and verify starts at the anchor', () => {
+    for (let i = 0; i < 6; i++) append('E', { sessionId: 's' + i }, { n: i });
+    // Simulate the ADR 0020 Q4 durable-vacuum DB step: anchor at seq 3, prune seq<4.
+    const anchor = db.prepare('SELECT seq, entry_hash AS h FROM ledger_events WHERE seq=3').get() as { seq: number; h: string };
+    db.transaction(() => {
+      db.prepare('INSERT INTO ledger_anchors (anchor_seq, anchor_hash, created_at, reason) VALUES (?,?,?,?)').run(anchor.seq, anchor.h, clock.nowIso(), 'vacuum');
+      db.exec('DROP TRIGGER ledger_no_delete');
+      db.prepare('DELETE FROM ledger_events WHERE seq < 4').run();
+      db.exec("CREATE TRIGGER ledger_no_delete BEFORE DELETE ON ledger_events BEGIN SELECT RAISE(ABORT,'ledger_events is append-only'); END");
+    });
+    // Surviving prefix is seq 4,5,6; verify must chain from the anchor (seq 3) and pass.
+    expect(rows().map((x) => x.seq)).toEqual([4, 5, 6]);
+    const v = verifyLedger(db);
+    expect(v.ok).toBe(true);
+    expect(v.checked).toBe(3);
+    // A NEW append continues at seq=7, chained on seq=6's entry_hash (the live tip).
+    append('E', { sessionId: 's6' });
+    const after = rows();
+    expect(after.map((x) => x.seq)).toEqual([4, 5, 6, 7]);
+    expect(after[3]!.prevHash).toBe(after[2]!.entryHash);
+    expect(verifyLedger(db).ok).toBe(true);
+  });
+
+  it('an append below the anchor boundary would break verify (anchor is the trust root)', () => {
+    for (let i = 0; i < 4; i++) append('E', { sessionId: 's' + i });
+    const anchor = db.prepare('SELECT seq, entry_hash AS h FROM ledger_events WHERE seq=2').get() as { seq: number; h: string };
+    db.transaction(() => {
+      db.prepare('INSERT INTO ledger_anchors (anchor_seq, anchor_hash, created_at, reason) VALUES (?,?,?,?)').run(anchor.seq, anchor.h, clock.nowIso(), 'vacuum');
+      db.exec('DROP TRIGGER ledger_no_delete');
+      db.prepare('DELETE FROM ledger_events WHERE seq < 3').run();
+      db.exec("CREATE TRIGGER ledger_no_delete BEFORE DELETE ON ledger_events BEGIN SELECT RAISE(ABORT,'ledger_events is append-only'); END");
+    });
+    // Chain 3,4 verifies from anchor seq=2.
+    expect(verifyLedger(db).ok).toBe(true);
+  });
+
+  it('canonicalization: frozen vector + recursive key-sort at every depth', () => {
+    // Frozen vector: this exact string must never drift (it is the hashed content).
+    const c = canonicalLedgerPayload({
+      seq: 1, eventType: 'SESSION_STARTED', actor: 'broker',
+      subject: { sessionId: 's1' }, payload: { source: 'startup', epoch: 1 },
+      createdAt: '1970-01-01T00:00:00.000Z',
+    });
+    expect(c).toBe('{"actor":"broker","createdAt":"1970-01-01T00:00:00.000Z","eventType":"SESSION_STARTED","payload":{"epoch":1,"source":"startup"},"seq":1,"subject":{"sessionId":"s1"}}');
+    // Nested-object key order does not change the canonical form (sorted at every depth).
+    const a = canonicalLedgerPayload({ seq: 2, eventType: 'X', actor: 'b', subject: {}, payload: { z: { b: 1, a: 2 }, y: 3 }, createdAt: 't' });
+    const b = canonicalLedgerPayload({ seq: 2, eventType: 'X', actor: 'b', subject: {}, payload: { y: 3, z: { a: 2, b: 1 } }, createdAt: 't' });
+    expect(a).toBe(b);
+  });
+
+  it('canonicalization REJECTS unsupported values (undefined / NaN / Infinity / function)', () => {
+    const base = { seq: 1, eventType: 'X', actor: 'b', subject: {}, createdAt: 't' };
+    expect(() => canonicalLedgerPayload({ ...base, payload: { x: undefined } as never })).toThrow(LedgerCanonicalizationError);
+    expect(() => canonicalLedgerPayload({ ...base, payload: { x: NaN } })).toThrow(LedgerCanonicalizationError);
+    expect(() => canonicalLedgerPayload({ ...base, payload: { x: Infinity } })).toThrow(LedgerCanonicalizationError);
+    expect(() => canonicalLedgerPayload({ ...base, payload: { x: (() => 1) as never } })).toThrow(LedgerCanonicalizationError);
+    // A finite number / string / boolean / null / nested is fine.
+    expect(() => canonicalLedgerPayload({ ...base, payload: { a: 1, b: 's', c: true, d: null, e: { f: [1, 2] } } })).not.toThrow();
+  });
+
+  it('a payload with an un-canonicalizable value fails the append as AUDIT_PERSISTENCE_FAILED', () => {
+    let code: string | undefined;
+    try { ledgerAppend(db, ids, clock, 'E', 'broker', { sessionId: 's' }, { bad: NaN }); }
+    catch (e) { if (isXBusError(e)) code = e.code; }
+    expect(code).toBe(XBusErrorCode.AUDIT_PERSISTENCE_FAILED);
+    // Nothing was inserted (canonicalization threw before the INSERT).
+    expect(rows()).toHaveLength(0);
   });
 });
