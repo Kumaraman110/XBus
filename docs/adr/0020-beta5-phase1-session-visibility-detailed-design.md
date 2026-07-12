@@ -15,66 +15,94 @@ the official SessionStart hook contract (`session_id`, `transcript_path`, `cwd`,
 
 ## Q1 — Can every new/resumed/forked session be identified WITHOUT undocumented files?
 
-**Yes. Identity comes only from documented SessionStart inputs; import reads only the
-documented transcript *directory listing* (never transcript internals).**
+**Every session that fires SessionStart is identified from documented inputs alone
+(authoritative). Sessions that never fire one (pre-existing/pre-install) are surfaced
+honestly as lower-confidence `dormant`/`unmanaged` — with the reliance on internal
+layout labelled as such, never claimed as "documented".** (Review correction 2026-07-12:
+the earlier draft over-claimed the import path as "documented"; corrected below.)
 
-Three identification paths, in decreasing trust:
+Three identification paths, in decreasing trust — the `identify_confidence` column
+records which one produced the row, so the dashboard never presents a heuristic as fact:
 
-| Path | Source (all documented) | Trust | Produces |
-| --- | --- | --- | --- |
-| **Live SessionStart** | Hook stdin: `session_id`, `source`∈{startup,resume,clear,compact}, `cwd`, `transcript_path`, `agent_type?`, `session_title?` | Authoritative — Claude tells us | `active` (or resumes a `dormant`/expired row) |
-| **Import (dormant)** | Directory listing of `~/.claude/projects/<slug>/*.jsonl`; each filename stem **is** the session UUID; `cwd` recovered from the `<slug>` and file mtime = last-seen | Documented layout; metadata-only | `dormant` |
-| **Unmanaged detection** | OS process table: a live `claude`/node process with a session id we have **no** SessionStart signal for | Heuristic — labelled as such | `unmanaged` (never fabricated as managed) |
+| Path | Source | What's documented vs. relied-upon | `identify_confidence` | Produces |
+| --- | --- | --- | --- | --- |
+| **Live SessionStart** | Hook stdin: `session_id`, `source`∈{startup,resume,clear,compact}, `cwd`, `transcript_path`, `agent_type?`, `session_title?` | **Fully documented** hook contract — Claude tells us directly | `signal` | `active` (or resumes a `dormant`/expired row) |
+| **Import (dormant)** | Enumerate `~/.claude/projects/<slug>/*.jsonl`; filename stem = session UUID; mtime = last-seen | **Relies on internal, undocumented layout** (dir location, one-uuid-jsonl-per-session, slug↔cwd encoding). Metadata-only: we `stat` filenames, **never open bodies** | `listing_only` | `dormant` |
+| **Unmanaged detection** | Best-effort: a live `claude`/node process with no matching XBus registration | **Heuristic.** Reliably obtaining another process's `CLAUDE_CODE_SESSION_ID` on Windows is not guaranteed and we do NOT poke process internals to force it | `unidentified` (or `listing_only` if we can only say "≥1 unmanaged present") | `unmanaged` |
 
-- **Forks:** a fork fires SessionStart `startup` with a **new** `session_id` → registered
-  as a new session (new automatic_alias via the beta.4.1-safe path). If the hook input
-  carries a documented parent linkage field, it is stored as `forked_from` (diagnostic
-  only); if not, the fork is simply a new identity with no inheritance. **We never infer
-  fork parentage by reading transcript contents.**
-- **What we NEVER do:** parse/modify `*.jsonl` transcript bodies, read Claude's internal
-  config/state beyond the documented `~/.claude.json` + `~/.claude/settings.json` we
-  already own (ADR 0018), or claim retroactive registration for a session that never
-  fired a post-install SessionStart (ADR 0013 D6).
-
-Import is explicitly **best-effort + read-only**: a session we can list but not fully
-attribute is recorded as `dormant` with `identify_confidence='listing_only'`; a live
-process we can't map is `unmanaged` with `identify_confidence='unidentified'`.
+- **Import is best-effort and explicitly non-authoritative.** The `listing_only`
+  confidence + the `dormant` label tell the operator "known from on-disk history, not a
+  live managed session." Because the directory layout and slug↔cwd encoding are Claude
+  internals, import is a **convenience/history view**, not a correctness-bearing path:
+  if the layout changes, import degrades to empty/`unidentified` — it never blocks the
+  broker and never misroutes (dormant/unmanaged are unroutable). We do **not** claim the
+  layout is documented.
+- **Forks: new identity, no inheritance — `forked_from` is best-effort.** A fork fires
+  SessionStart `startup` with a **new** `session_id` → a brand-new session (epoch 1,
+  beta.4.1-safe automatic_alias), no thread/alias inheritance. The researched
+  SessionStart input list contains **no parent/fork field**, so `forked_from` is
+  populated **only if** a future documented linkage field appears; today it stays NULL
+  and the fork story is simply "distinct id = distinct owner" (matches the ADR 0003/0008
+  split-brain model). The column is a forward-compat placeholder, documented as
+  normally-NULL — not a load-bearing claim.
+- **What we NEVER do:** parse/modify `*.jsonl` transcript bodies; read Claude internal
+  state beyond the `~/.claude.json` + `~/.claude/settings.json` we already own (ADR 0018);
+  poke another process's memory/env to force an id; or claim retroactive registration for
+  a session that never fired a post-install SessionStart (ADR 0013 D6).
 
 ---
 
 ## Q2 — How are dormant / unmanaged / disconnected / expired distinguished?
 
-These are **two orthogonal axes**, not one enum — conflating them is the trap. We store
-both and derive the dashboard label from the pair.
+The label is derived from **FOUR real fields**, not one enum — conflating them is the
+trap. Three are existing columns in the live `sessions` table; one is new. (Review
+correction 2026-07-12: an earlier draft folded connection-drop into the `readiness`
+enum, but in the actual code the connection state and readiness are **separate
+columns** — see below.)
 
-- **Axis A — `management_state`** (does XBus manage this session, and how was it learned?):
+- **Field 1 — `management_state`** *(NEW column; does XBus manage this, and how learned?)*:
   `unmanaged` → `dormant` → `active`.
-- **Axis B — `readiness`/connection** (the existing ADR 0012 `readiness.ts` model, only
-  meaningful when `management_state='active'`): `initializing`, `ready_checkpoint`,
-  `ready_live`, `degraded_*`, `disconnected`.
-- Plus the existing **retention tombstone** `expired_at` (ADR 0012 D6) and name lifecycle.
+- **Field 2 — `state`** *(EXISTING column, `sessions.state ∈ {connected, disconnected}`)*:
+  the IPC connection state. **`daemon.onConnClose` sets `state='disconnected'`** when a
+  live owner's link drops (`daemon.ts` onConnClose); reconnect restores `connected`,
+  same epoch. Meaningful only when `management_state='active'`.
+- **Field 3 — `readiness`** *(EXISTING column, the `readiness.ts` enum)*: `initializing`,
+  `ready_checkpoint`, `ready_live`, `degraded_*`. **Note:** `resolveReadiness()` never
+  returns `disconnected`; the enum's `disconnected` value is written **only by the expiry
+  reaper** alongside `expired_at`, so it is an expiry artifact, NOT the connection-drop
+  signal (that is Field 2). The derive-label function therefore reads Field 2 for
+  connection-drop and treats a `readiness='disconnected'` row as part of the expired case.
+- **Field 4 — `expired_at`** *(EXISTING tombstone, ADR 0012 D6)*: non-null ⇒ expired.
 
 ### Decision table (authoritative — implemented as a pure function, unit-tested)
 
-| management_state | connection/readiness | expired_at | last activity | **Dashboard label** | Routable? |
-| --- | --- | --- | --- | --- | --- |
-| `active` | `ready_checkpoint`/`ready_live` | null | recent | **active — ready** | yes |
-| `active` | `initializing`/`degraded_*` | null | recent | **active — starting/degraded** | no (yet) |
-| `active` | `disconnected` | null | recent | **active — disconnected** (owner went away this session) | queued |
-| `dormant` | — | null | from transcript mtime | **dormant** (known, not live) | no |
-| `dormant`/active | — | **set** | >15d | **expired** (tombstoned; ADR 0012) | no |
-| `unmanaged` | — | — | — | **unmanaged** (detected, no XBus signal) | no |
+Evaluated **top-down; first match wins** (so `expired_at` set is caught before the
+active rows, and a legacy `active`+`expired_at` row from the migration backfill lands on
+`expired`, not `active — *`):
 
-Key distinctions made explicit:
-- **disconnected ≠ dormant:** `disconnected` = an *active-this-session* owner whose IPC
-  link dropped (rejoins on reconnect, keeps epoch); `dormant` = a session from a *prior*
-  run, imported from transcripts, never connected this broker lifetime.
-- **dormant ≠ expired:** `dormant` is pre-15-day and can activate on `resume`; `expired`
-  is the retention tombstone (`expired_at` set) — resume routes through the existing
-  expired-resume path (fresh epoch, no resurrection).
-- **unmanaged ≠ everything else:** the only label NOT sourced from the broker/ledger —
-  it's a live-process heuristic, always rendered with an explicit "detected; not managed"
-  qualifier, and can never transition to `active` without a real SessionStart signal.
+| # | management_state | state (conn) | readiness | expired_at | **Dashboard label** | Routable? |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | any | — | — | **set** | **expired** (tombstoned; ADR 0012) | no |
+| 2 | `unmanaged` | — | — | null | **unmanaged** (detected, no XBus signal) | no |
+| 3 | `dormant` | — | — | null | **dormant** (known from transcripts, not live) | no |
+| 4 | `active` | `disconnected` | any | null | **active — disconnected** (owner's link dropped this session) | queued |
+| 5 | `active` | `connected` | `ready_checkpoint`/`ready_live` | null | **active — ready** | yes |
+| 6 | `active` | `connected` | `initializing`/`degraded_*` | null | **active — starting/degraded** | no (yet) |
+
+Key distinctions made explicit (each covered by a table row + a unit test):
+- **disconnected ≠ dormant (row 4 vs 3):** `disconnected` = `management_state='active'` +
+  `state='disconnected'` — an owner that connected *this* broker lifetime and dropped
+  (rejoins on reconnect, keeps epoch, `store.ts` reconnect path); `dormant` = imported
+  from a *prior* run, never connected this lifetime.
+- **dormant ≠ expired (row 3 vs 1):** `dormant` is pre-15-day (`expired_at` null) and
+  activates on `resume`; `expired` has the tombstone set — resume routes through the
+  existing expired-resume path (fresh epoch, no resurrection).
+- **unmanaged ≠ everything else (row 2):** the only label NOT sourced from the
+  broker/ledger — a live-process heuristic, always rendered "detected; not managed",
+  never transitions to `active` without a real SessionStart signal.
+
+(Field naming: the new column is `management_state` everywhere, incl. the architecture
+doc — the earlier `lifecycle_state` mention there is corrected to `management_state`.)
 
 ### Lifecycle diagram
 
@@ -117,13 +145,40 @@ Key distinctions made explicit:
 **Invariant (tested):** every mutation of authoritative session/delivery state and its
 `ledger_events` append happen in **one broker transaction** — so the ledger can never
 diverge from state (no transition unlogged, no logged transition that didn't happen).
-The current state is always recoverable from the mutable tables alone; the ledger adds
-auditability, not correctness of routing.
+The current state is always recoverable from the mutable tables alone.
+
+**Coupling — stated precisely (review correction 2026-07-12).** Same-txn append means an
+`INSERT INTO ledger_events` failure aborts the whole op. This is **not** an
+audit-subsystem coupling that can independently take down delivery: both the state
+mutation and the ledger append are `INSERT`/`UPDATE`s into the **same SQLite file** in
+the **same transaction**, so the only realistic shared failure (disk-full, I/O error, DB
+corruption) fails the state write *anyway* — there is no scenario where routing state
+commits durably but only the ledger row can't. So we do **not** claim "the ledger can
+never affect the op"; we claim the accurate thing: **the ledger shares the op's fate,
+adding no *independent* failure mode** — a healthy DB that can persist the state change
+can persist its ledger row. A *chain that is already broken* (past tamper/bit-rot) is
+separate and never blocks new ops (it degrades auditability visibly — Q4). This keeps
+Q5's "dashboard/audit cannot destabilize delivery" intact: the *dashboard* is read-only
+and off-loop (Q5 #2); the *ledger write* isn't a separate subsystem that can fail on its
+own. **Rejected alternative:** best-effort/out-of-band ledger writes (decoupled) — that
+would let state and audit diverge silently, which is worse for an audit ledger than
+sharing the op's fate. We choose no-divergence over best-effort, and describe the
+coupling honestly rather than claim a non-existent independence.
 
 Why not make the ledger authoritative (event-sourced)? Rejected for Phase 1: it would
 duplicate the proven ADR 0003 receipt/epoch state machine, add replay complexity, and
 risk the Layer-3 injection invariants. The mutable tables stay the single source of
-truth; the ledger is the audit lens over them.
+truth; the ledger is the append-only audit lens over them, sharing their transaction.
+
+**`audit_events` coexistence (implementation gap closed):** the existing `audit_events`
+table (written in-txn today by `store.ts`/`delivery.ts`) is **kept** for beta.4-parity
+diagnostics; `ledger_events` is the **new hash-chained** record. Phase 1 adds the
+`ledger_events` append at the same in-txn sites that already call `audit()` — and, per
+I2/I3, the append is pure metadata (ids/states/hashes) that **cannot** perturb the
+Layer-3 `issue()`-returns-null idempotency or the non-ACK path: it is an extra INSERT
+after the state decision is made, never a branch on delivery logic. A test asserts a
+forced `ledger_events` insert-failure rolls back the state change (all-or-nothing) and
+that injection/ack/reply outcomes are byte-identical with vs. without the ledger wired.
 
 ---
 
@@ -165,11 +220,20 @@ on write and on verify (unit-tested against frozen vectors), so the hash is repr
   existing WAL. Row is small (ids + safe metadata, no bodies). Dashboard queries are
   indexed by `seq` (paged). A size metric is exposed in `doctor`/dashboard.
 - **Retention / compaction (operator-initiated, never silent):** `xbus audit vacuum
-  --before <utc>` archives events `< N` to a JSONL export file, writes a `ledger_anchors`
-  row `(anchor_seq=N-1, anchor_hash=…)`, then deletes the archived rows **inside one
-  transaction** (the triggers are bypassed only by this audited maintenance path, gated
-  behind an explicit flag + a ledger event recording the vacuum). Post-vacuum the chain
-  verifies from the anchor forward (genesis pointer = the anchor). Nothing auto-prunes.
+  --before <utc>` archives events `< N` to a JSONL export, writes a `ledger_anchors` row
+  `(anchor_seq=N-1, anchor_hash=entry_hash(N-1))`, then prunes the archived rows. The
+  append-only triggers cannot be "selectively bypassed" for one statement (SQLite has no
+  such feature), so the **concrete mechanism** is, inside a single transaction (SQLite DDL
+  is transactional — a crash rolls the whole thing back): `BEGIN IMMEDIATE` → verify the
+  full chain up to N-1 → write the anchor → `DROP TRIGGER ledger_no_delete` →
+  `DELETE FROM ledger_events WHERE seq < N` → `CREATE TRIGGER ledger_no_delete …` (recreate
+  identically) → append a `LEDGER_VACUUMED` event → `COMMIT`. The `no_update` trigger is
+  never dropped. A crash at any point leaves the pre-vacuum chain intact (transactional
+  DDL). Nothing auto-prunes; vacuum is an explicit, audited operator command.
+  **Multi-anchor verify selection:** `ledger_anchors` may hold several rows; `verify`
+  starts from the **highest anchor whose `anchor_seq < MIN(remaining seq)`** (i.e. the
+  most recent pruned boundary), treats that anchor's `anchor_hash` as the genesis pointer
+  for the surviving prefix, and verifies forward. Anchors are themselves append-only.
 - **Export:** `xbus audit export [--from --to] --out <file>` → sanitized JSONL (already
   redacted; ids/hashes only) + a manifest with the range's first `prev_hash`, last
   `entry_hash`, and a recomputed range digest, so an export is independently
@@ -185,43 +249,78 @@ on write and on verify (unit-tested against frozen vectors), so the hash is repr
 | --- | --- | --- |
 | WAL torn write / crash mid-append | SQLite WAL replay on open | atomic: the half-written event is rolled back; state txn rolls back with it (single txn) → no divergence |
 | Chain break (tampered/dropped row) | `audit verify` on broker start + on demand | broker logs + a `LEDGER_CHAIN_BROKEN` diagnostic; **read-only audit still served with a prominent "chain broken at seq N" banner**; routing/delivery UNAFFECTED (ledger is a projection, Q3) |
-| Ledger write fails but state txn must proceed | txn aborts as a unit | the whole broker op fails cleanly (typed error) rather than committing state without its audit event — state+ledger are all-or-nothing |
 | DB newer schema than build | existing downgrade guard (ADR 0019) | fail closed; no partial serve |
-| Ledger disk-full | insert error inside txn | op fails with a clean typed error; no partial/ghost state |
+| Disk-full / I/O error at commit | insert error inside the shared txn | the **whole op** (state + ledger) fails atomically with a clean typed error — no partial/ghost state, no state-without-ledger. Not audit-specific: a full disk fails the state write too (Q3 coupling) |
 
-Chain-broken never blocks message delivery (Q3 separation) — it degrades **auditability**
-visibly, not correctness.
+Two distinct cases, kept separate (this is the Q3/Q5 reconciliation):
+- A **ledger write cannot fail independently of the state write** — same file, same txn
+  (Q3). So there is no "audit subsystem" that can fall over and take routing with it; a
+  DB healthy enough to persist state persists its ledger row.
+- A **chain that is already broken** (past out-of-band tamper / bit-rot) **never blocks
+  new delivery** — new ops keep appending; `verify` flags the historical break. This is
+  the only sense in which "chain-broken doesn't block delivery" holds, and it is about
+  *reading/auditing* history, not *writing* new events.
+
+**Tamper-detection latency (stated honestly):** the append-only triggers stop SQL-layer
+UPDATE/DELETE, but a direct file edit or bit-rot bypasses SQL entirely. `verify` runs on
+broker start **and** on a periodic timer (default hourly) **and** on demand — so an
+out-of-band tamper is caught within at most one verify interval (bounded, not "next
+restart"). The dashboard shows a "chain verified at &lt;ts&gt;" freshness stamp so staleness
+is visible.
 
 ---
 
 ## Q5 — Dashboard: read-only, loopback-only, single-instance, cannot destabilize delivery
 
-Enforced by **construction + assertions + tests**, not policy:
+Enforced by **construction + assertions + tests**, not policy. (Review correction
+2026-07-12: the dashboard read path is moved OUT of the broker event loop — see #4 — and
+the token requirement is tightened to *every* request, closing a same-machine
+read-exposure hole.)
 
-1. **Read-only (Phase 1):** the dashboard HTTP server exposes **only `GET`** endpoints
-   (`/api/sessions`, `/api/ledger`, `/api/session/:id`, SSE `/api/stream`, `/alive`).
-   There are **no mutating routes in Phase 1** (rename/compose arrive in Phase 2/3). A
-   route-table test asserts every registered handler is `GET`/`HEAD`. Reads use a
-   **read-only SQLite connection** (`readOnly:true`), so the dashboard process physically
-   cannot write the DB (I4: broker remains single writer). A write attempt on that
-   connection throws — asserted by test.
-2. **Loopback-only:** binds `127.0.0.1` exclusively; a startup assertion refuses any
-   non-loopback address (ADR 0018). Token required on every request (owner-ACL'd);
-   loopback is not treated as trust. Test: a bind to `0.0.0.0` throws; a request without
-   the token gets 401.
-3. **Single-instance:** the **broker** owns the one HTTP server (broker is the machine
+1. **Read-only (Phase 1):** the dashboard HTTP server exposes **only `GET`/`HEAD`**
+   endpoints (`/api/sessions`, `/api/ledger`, `/api/session/:id`, SSE `/api/stream`,
+   `/alive`). There are **no mutating routes in Phase 1** (rename/compose arrive in
+   Phase 2/3). A route-table test asserts every registered handler is `GET`/`HEAD`. The
+   dashboard opens the DB with **`SQLITE_OPEN_READONLY`** — no writer handle exists in the
+   dashboard component, so it physically cannot mutate the DB (I4: broker stays single
+   writer). A write attempt on that handle throws — asserted by test.
+   **WAL caveat (must be validated, not assumed):** a read-only handle to a WAL database
+   cannot create/recover `-wal`/`-shm` or checkpoint; it reads correctly while the broker
+   (writer) is live and the files are owner-readable. Phase-1 acceptance includes an
+   explicit end-to-end test that the read-only handle returns correct, current rows
+   **while the broker is actively writing** (and, per #4, from a separate process).
+
+2. **Cannot destabilize delivery — the read path runs OFF the broker event loop.**
+   `node:sqlite` `DatabaseSync` is **synchronous**, and the broker is a single Node
+   process/loop running IPC + the reaper. An in-process synchronous read (e.g. a large
+   `/api/ledger` scan) would execute *on the broker's loop and stall delivery* — request
+   timeouts/response caps do NOT help there (they bound a slow socket, not a slow query).
+   Therefore the dashboard's DB reads run in a **separate `worker_thread` (or child
+   process)** with its own `SQLITE_OPEN_READONLY` connection; the broker loop only does a
+   cheap message-passing handoff. The SSE stream is a fan-out of already-committed state
+   (the worker polls / the broker posts change-notifications), never a write path and
+   never a synchronous query on the broker loop. This makes "cannot touch routing/epochs/
+   receipts/injection-ledger" true for reads as well as writes — structurally, not by
+   hope. **Test:** run a *pathological large-scan* read (full ledger + all sessions)
+   **concurrently** with the four-replica matrix → matrix still 12/12, broker instance
+   unchanged, p99 delivery latency within bound; plus a hung/slow client → dropped, loop
+   unaffected.
+
+3. **Loopback-only + token on EVERY request:** binds `127.0.0.1` exclusively; a startup
+   assertion refuses any non-loopback address. Because loopback is **shared across local
+   OS users** (ADR 0018 threat model), the owner-ACL'd token is the real boundary and is
+   required on **every request — including all `GET` reads** (a read-only dashboard still
+   exposes session metadata + the audit ledger, which another same-machine user must not
+   read). This tightens ADR 0018 D2 ("token on mutating endpoints") → **token on all
+   requests** for Phase 1 (there are no mutating endpoints yet, so a reads-only token
+   requirement is the whole surface). Test: bind to `0.0.0.0` throws; any request
+   (incl. `GET`) without a valid token → 401; token is never logged/redacted in the ledger.
+
+4. **Single-instance:** the **broker** owns the one HTTP server (broker is the machine
    singleton, ADR 0015). Port + URL recorded in `broker.state.json`. A second start finds
    the running dashboard and does not open another (debounced browser-open + `/alive`
    heartbeat → no tab storm). Test: two `ensure-dashboard` calls → one listener, ≤1
    browser open.
-4. **Cannot destabilize delivery:** the dashboard runs **read-only against a separate
-   connection** and issues **no broker mutations** in Phase 1, so it cannot touch routing,
-   epochs, receipts, or the injection ledger. The SSE stream is a fan-out of already-
-   committed state (poll/notify), never a write path. Even a hung/abusive dashboard
-   client cannot block the broker's IPC event loop: the HTTP server has its own request
-   timeouts + a bounded response size, and a slow client is dropped. Test: hammer the
-   dashboard with concurrent reads while the four-replica matrix runs → matrix still
-   12/12, broker instance unchanged, zero delivery impact.
 
 ---
 

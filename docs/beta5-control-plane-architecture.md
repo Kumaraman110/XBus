@@ -35,7 +35,8 @@ the XBUS-STP wire and beta.4/beta.4.1 request/ACK/reply semantics stay frozen.
 
 ## Data model (new + changed; details in ADR 0016/0017/0014)
 
-- **`sessions`** (+cols): `lifecycle_state` (unmanaged/dormant/active…), `source_last`
+- **`sessions`** (+cols): `management_state` (unmanaged/dormant/active — see ADR 0020 Q2;
+  connection `state` + `readiness` remain SEPARATE existing columns), `source_last`
   (startup/resume/clear/compact/fork/import), `desired_session_title`,
   `observed_session_title`, `title_sync_state`, `forked_from` (diagnostic).
 - **`threads`** (new): `thread_id`, `created_by`, `subject`, participants, `state`,

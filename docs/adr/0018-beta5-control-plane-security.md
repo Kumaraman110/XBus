@@ -21,10 +21,14 @@ preserving the audit DB unless explicit purge.
    **dashboard token** (32 bytes, CSPRNG), stored in the ACL-restricted data dir
    alongside the root secret (same Windows owner-only ACL as `auth/`, ADR 0010). The
    dashboard URL opened in the browser carries a one-time handoff; the SPA then holds
-   the token and sends it as a header on every request. **All mutating endpoints
-   require the token** (loopback alone is not trusted — other local processes/users
-   share loopback). CSRF: mutations require the token in a custom header (not a cookie),
-   so a browser cross-site form/GET cannot forge them; `SameSite`/no-cookie-auth.
+   the token and sends it as a header on every request. **Every request requires the
+   token — reads included** (correction 2026-07-12: an earlier draft scoped the token to
+   *mutating* endpoints, but the Phase-1 dashboard is read-only and still exposes session
+   metadata + the audit ledger; since loopback is **shared across local OS users**, an
+   unauthenticated read endpoint would let another same-machine user read all of that.
+   So `GET`/SSE reads require the token too — see ADR 0020 Q5 #3). CSRF: the token travels
+   in a **custom header** (never a cookie), so a browser cross-site form/GET cannot forge
+   an authenticated request; no cookie auth, `SameSite` moot.
 
 3. **Strict CSP + no-inline.** Responses set `Content-Security-Policy: default-src
    'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self';

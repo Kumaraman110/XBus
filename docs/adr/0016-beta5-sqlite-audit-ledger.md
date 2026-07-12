@@ -1,6 +1,13 @@
-# ADR 0016 — Beta.5: SQLite as authoritative, append-only, hash-chained audit ledger
+# ADR 0016 — Beta.5: SQLite as the authoritative AUDIT record — an append-only, hash-chained event ledger
 
-**Status:** Proposed · **Date:** 2026-07-12 · beta.5. Companion to ADR 0013.
+**Status:** Proposed · **Date:** 2026-07-12 · beta.5. Companion to ADR 0013 / ADR 0020.
+
+> **Terminology (aligned with ADR 0020 Q3):** the ledger is authoritative *as the audit
+> record* — the tamper-evident history of transitions. It is **not** the source of truth
+> for current routing state. Current state lives in the mutable relational tables
+> (`sessions`/`deliveries`/…); the ledger is an append-only projection written in the
+> **same transaction** as each state mutation. Every "authoritative" below means
+> "authoritative audit record," never "authoritative routing state."
 
 ## Context
 
