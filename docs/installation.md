@@ -149,6 +149,12 @@ node .\dist\cli\main.js uninstall          # removes only manifest-owned files +
 Remove-Item -Recurse -Force "$HOME\.claude\xbus-install\data"   # or your XBUS_DATA_DIR
 ```
 
+Run `stop` **before** `uninstall`: `uninstall` removes the plugin files and the
+user-scope registration, but it does **not** terminate a broker that is still
+running (a live broker keeps serving until it is stopped or idles out, even after
+its plugin files are gone). Exit your Claude sessions and run `node .\dist\cli\main.js
+stop` first, then uninstall.
+
 `uninstall` removes only the files the install manifest recorded; unrelated files in
 the install root are left untouched. There is **no PATH entry to remove** (install
 never created one). After the data dir is deleted, no XBus state remains.
