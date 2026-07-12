@@ -1,8 +1,8 @@
 # XBus beta.5 — control-plane architecture (design for review)
 
 **Status:** Proposed for review · **Date:** 2026-07-12 · version target `0.1.0-beta.5`.
-This ties together ADRs 0013–0019. No implementation has begun; this is the design
-artifact requested before build.
+This ties together ADRs 0013–0020 (0020 = the Phase-1 detailed design). No
+implementation has begun; this is the design artifact requested before build.
 
 ## One-paragraph summary
 
@@ -117,5 +117,6 @@ messaging comes after.** Phase 1 is the next measurable milestone.
    uninstall stops broker + dashboard and keeps the audit history; only
    `uninstall --purge`/`--remove-data` deletes it (logged as a final ledger event first).
 
-No open questions remain for a Phase-1 go/no-go; the three design blockers are closed in
-ADRs 0015/0016/0018/0019/0020 (see the PR #10 correction summary).
+No open questions remain for a Phase-1 go/no-go; the four design blockers (compatibility,
+dashboard-auth bootstrap, ledger availability/vacuum, and install/migration rollback) are
+closed in ADRs 0015/0016/0018/0019/0020 (see the PR #10 correction summary).

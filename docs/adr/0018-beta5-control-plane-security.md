@@ -62,11 +62,16 @@ preserving the audit DB unless explicit purge.
      keeps the token in a header and off the URL.
 
    **Lifecycle / abuse behavior (all specified + tested):**
-   - **Reload / back / bookmark:** the fragment was stripped, so no nonce remains; the
-     in-memory tab token is gone after a full reload → the app has no nonce to exchange →
-     it shows a "re-open from XBus" prompt and calls `xbus dashboard` (which mints a fresh
-     nonce + opens a tab). `sessionStorage` survives a *soft* reload within the same tab,
-     so a soft reload keeps working until the tab token expires.
+   - **Reload / back / bookmark (storage choice pinned):** the fragment is stripped, so no
+     nonce remains to replay. The tab token is held in **`sessionStorage`** (locked
+     choice), which — per the Web Storage API — **survives ANY reload within the same tab**
+     (soft F5 or hard reload alike) and is cleared **only on tab close**. So a reload keeps
+     working until the tab token's TTL expires; on **tab close / browser reopen** the token
+     is gone and the app (having no nonce) shows a "re-open from XBus" prompt → `xbus
+     dashboard` mints a fresh nonce + tab. (There is no soft-vs-hard-reload distinction in
+     the API; we do not rely on one. A pure in-memory variable was the alternative — it
+     would lose the token on *every* reload — but `sessionStorage` is chosen for a smoother
+     reload UX with identical security, since neither is URL/cookie/log-borne.)
    - **Token expiry:** a `401` from any data request puts the app into a "session expired
      — reopen" state; no silent refresh (Phase 1 keeps it simple + auditable).
    - **Nonce replay:** the atomic consume makes a second exchange of the same nonce fail
