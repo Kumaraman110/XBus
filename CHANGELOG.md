@@ -6,6 +6,54 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] — control plane, Phase 1: session visibility
+
+The control-plane milestone. Every new/resumed/continued/cleared/compacted/forked Claude
+Code session automatically appears in one **authenticated localhost dashboard**, backed by
+an **append-only, hash-chained SQLite audit ledger**. **The compatibility tuple moves
+`xbus-p1-stp1-s6 → xbus-p1-stp1-s7`**: the application protocol and XBUS-STP wire
+format/crypto are unchanged (both still `1`); only the database schema integer advances
+`6 → 7` — a deliberate fail-closed bump, so an s6 (beta.4.1) component meeting an s7 broker
+is rejected `upgrade_component` at the handshake. Beta.5 is a **whole-install upgrade**, not
+mixed-version operation. **No new messaging semantics** — beta.4.1 request/ACK/reply is
+unchanged. This is Phase 1 of the design merged in PR #10 (ADRs 0013–0020); threaded
+messaging, operator-send, and title-sync are deferred to later phases.
+
+### Added
+- **SessionStart auto-registration (ADR 0013 D2).** A new `SessionStart` hook announces
+  every lifecycle event (`startup`/`resume`/`clear`/`compact`, and forks as a `startup`
+  with a new id) to the broker via a new `announce_session` frame → one broker transaction
+  → authoritative visibility state + exactly one audit-ledger event. The hook is always
+  **non-blocking**: malformed input, an incompatible Node, or a broker failure/timeout
+  produces bounded stderr and exits 0 so Claude Code still starts.
+- **Append-only, hash-chained audit ledger (ADR 0016/0020).** `ledger_events` +
+  `ledger_anchors` with append-only triggers; each entry chains to the previous
+  (`sha256(prev_hash ‖ canonical(fields))`) with a dense, gap-free `seq`. Written in the
+  same transaction as each state mutation (no divergence); a ledger-specific failure aborts
+  the op with the typed `AUDIT_PERSISTENCE_FAILED` (a deliberate availability tradeoff). A
+  `verify` routine localizes any tamper/drop/bit-rot to the first bad seq.
+- **Read-only localhost dashboard (ADR 0015/0018).** A broker-owned `127.0.0.1` HTTP server
+  (loopback-only, refused otherwise) with a nonce→exchange→tab-token auth bootstrap
+  (one-time nonce in memory + URL fragment only; atomic single-use TTL-bound
+  `POST /auth/exchange`; short-lived bearer token never logged/persisted/in-URL/in-ledger),
+  strict CSP, and a vanilla UI that is a pure client of the API. DB reads run **off the
+  broker event loop** in a `worker_thread` with a physically read-only handle
+  (`DatabaseSync({ readOnly: true })`) — writes/DDL/write-pragmas are rejected, and a
+  pathological scan/hung client/worker crash cannot disrupt delivery.
+- **Metadata-only dormant import (ADR 0013 D5)** of prior sessions from the transcript
+  listing (never opens a transcript body), surfaced as unroutable `dormant` rows; and a
+  **conservative aggregate unmanaged banner (ADR 0013 D6)** computed from non-invasive
+  process counts (never reading a foreign process's env/memory).
+
+### Changed
+- **Runtime floor raised to Node `>=22.13 <25`** so the read-only dashboard worker can use
+  `DatabaseSync({ readOnly: true })`. Product install + broker entry remain fail-closed
+  below 22.13; the SessionStart hook stays fail-open (never blocks Claude).
+- **Install rollback now snapshots the DB (ADR 0019 D4).** On any schema increase the
+  installer takes a durable DB+WAL+SHM snapshot before the health check migrates the live
+  DB; a health-check failure restores the verified pre-upgrade DB, so a failed upgrade
+  leaves a working prior install rather than a forward-migrated DB with a rolled-back plugin.
+
 ## [0.1.0-beta.4.1] — session-registration robustness patch
 
 A correctness patch for the beta.4 named-session registration path. **No protocol,
