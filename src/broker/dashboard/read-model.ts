@@ -62,10 +62,14 @@ export interface DashboardSession {
 }
 
 export interface UnmanagedBanner {
-  /** Conservative aggregate count of possibly-unmanaged sessions (ADR 0013 D6). Phase 1
-   *  keeps this a broker-supplied hint; the read model surfaces whatever the broker stored
-   *  (0 by default — no invasive process introspection here). */
+  /** Conservative aggregate count of possibly-unmanaged sessions (ADR 0013 D6). Computed
+   *  broker-side from a NON-INVASIVE live-`claude`-process count minus the managed+dormant
+   *  sessions the read model reports; the read-only worker never spawns processes, so it
+   *  reports `managedOrDormant` and 0 for `possibleUnmanaged` unless the broker posts a
+   *  live-process count. Never per-session, never invasive (ADR 0013 D6). */
   possibleUnmanaged: number;
+  /** The count of managed+dormant sessions the read model knows (the subtrahend). */
+  managedOrDormant: number;
 }
 
 export interface LedgerPage {
@@ -139,12 +143,12 @@ export class DashboardReadModel {
     return { events, nextBeforeSeq };
   }
 
-  /** Aggregate banner data (ADR 0013 D6). Phase 1: reads a broker-maintained hint if any,
-   *  else 0 (no per-session unmanaged rows, no invasive introspection). */
+  /** Aggregate banner data (ADR 0013 D6). The read-only worker cannot spawn a process
+   *  listing, so it reports the managed+dormant count (the honest subtrahend); the broker
+   *  computes the final `possibleUnmanaged` from a non-invasive live-process count. */
   unmanagedBanner(): UnmanagedBanner {
-    // No dedicated table in Phase 1 — the unmanaged signal is an aggregate the broker may
-    // compute+post. The read model reports 0 unless a future control table exists.
-    return { possibleUnmanaged: 0 };
+    const managedOrDormant = (this.db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE management_state IN ('active','dormant') AND expired_at IS NULL`).get() as { n: number }).n;
+    return { possibleUnmanaged: 0, managedOrDormant };
   }
 }
 

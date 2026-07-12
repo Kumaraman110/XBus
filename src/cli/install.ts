@@ -25,6 +25,28 @@ import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, 
 import { validateArtifact } from '../shared/artifact-contract.js';
 import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
 import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
+import { SCHEMA_VERSION } from '../protocol/handshake.js';
+import { snapshotDb, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
+
+/**
+ * Read the on-disk DB schema version WITHOUT migrating (a plain read of MAX(version) from
+ * schema_migrations). Returns 0 if the DB or table is absent. Used to decide whether the
+ * post-install health check (which starts a broker and thus migrates the live DB) will
+ * apply a schema INCREASE — if so, we snapshot the DB first so a health-check failure can
+ * restore the pre-upgrade DB (ADR 0019 D4). Opens read-only so it never itself migrates.
+ */
+function onDiskSchemaVersion(dbPath: string): number {
+  if (!fs.existsSync(dbPath)) return 0;
+  try {
+    // Local import to avoid a top-level node:sqlite dependency in this CLI module's graph.
+    const { openDatabase } = require('../database/connection.js') as typeof import('../database/connection.js');
+    const db = openDatabase(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number | null } | undefined;
+      return row?.v ?? 0;
+    } finally { db.close(); }
+  } catch { return 0; } // no table / unreadable → treat as fresh (nothing to protect)
+}
 
 export interface InstallOptions {
   /** Source plugin root (the built repo, or a staged artifact). Default cwd. */
@@ -264,11 +286,38 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       const detail = installedContract.violations.map((x) => `${x.rule}:${x.detail}`).join('; ');
       return { ok: false, dryRun: false, plan, health: { ok: false, detail: `installed plugin contract: ${detail}` }, rolledBack: rb, error: `installed plugin failed contract validation` };
     }
+    // ADR 0019 D4 — DB snapshot BEFORE the health check migrates the live DB. The health
+    // check starts a broker, which runs migrations on the live data dir; on ANY schema
+    // INCREASE (e.g. 6→7) that migration is irreversible without a backup. So if the
+    // on-disk schema is BELOW this build's SCHEMA_VERSION, snapshot the DB (+WAL/SHM) first
+    // — the broker being installed is not yet running, so there is no live writer (the
+    // stop-before-upgrade prerequisite). A health-check failure then restores the
+    // pre-upgrade DB, so a failed upgrade leaves a WORKING prior install, not a
+    // forward-migrated DB with a rolled-back plugin.
+    const dbPath = path.join(dataDir, 'xbus.sqlite');
+    const onDisk = onDiskSchemaVersion(dbPath);
+    let dbSnapshot: { dir: string; manifest: SnapshotManifest | null } | null = null;
+    if (onDisk > 0 && onDisk < SCHEMA_VERSION) {
+      const snapDir = path.join(installRoot, `.db.snapshot-${now.replace(/[:.]/g, '-')}`);
+      const nowMs = opts.nowIso ? Date.parse(opts.nowIso) : Date.parse(now);
+      const manifest = snapshotDb(dbPath, snapDir, Number.isFinite(nowMs) ? nowMs : 0);
+      dbSnapshot = { dir: snapDir, manifest };
+    }
     const health = await healthCheck(dataDir);
     if (!health.ok) {
+      // Restore the pre-upgrade DB (verified) BEFORE the plugin rollback, so the DB is not
+      // left forward-migrated. A restore failure is surfaced in the error detail.
+      let dbRestore = '';
+      if (dbSnapshot?.manifest) {
+        const r = restoreDbSnapshot(dbSnapshot.dir);
+        dbRestore = r.ok ? ' (db restored to pre-upgrade snapshot)' : ` (db restore FAILED: ${r.detail})`;
+      }
+      if (dbSnapshot) discardSnapshot(dbSnapshot.dir);
       const rb = rollback(installRoot, manifest);
-      return { ok: false, dryRun: false, plan, health, rolledBack: rb, error: `health check failed: ${health.detail}` };
+      return { ok: false, dryRun: false, plan, health, rolledBack: rb, error: `health check failed: ${health.detail}${dbRestore}` };
     }
+    // Upgrade committed + verified — the pre-upgrade snapshot is no longer needed.
+    if (dbSnapshot) discardSnapshot(dbSnapshot.dir);
 
     // Beta.4 (ADR 0012 D8): register XBus into the user-scope Claude config so plain
     // `claude` discovers it. Transactional inside the manager; a failure here rolls

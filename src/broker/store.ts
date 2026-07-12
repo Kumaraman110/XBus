@@ -24,6 +24,7 @@ import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
 import { ledgerAppend, type LedgerSubject } from './ledger.js';
+import type { ImportedSessionMeta } from './session-import.js';
 
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
@@ -564,6 +565,46 @@ export class BrokerStore {
         });
       }
       return { managementState: 'active', priorManagementState, source, lifecycleEvent, epoch: row.epoch, appended };
+    });
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D5): import previously-existing sessions as DORMANT rows from
+   * transcript-listing metadata (session-import.ts — filenames + mtime ONLY, no bodies).
+   * Each becomes an UNROUTABLE `dormant` row with `identify_confidence='listing_only'`
+   * (honest: known from on-disk history, not a live managed session). One ledger event per
+   * newly-imported session (SESSION_IMPORTED). Idempotent + SAFE:
+   *   - a session_id that ALREADY exists is SKIPPED entirely — import must never downgrade
+   *     an active/dormant/expired row, overwrite its name/epoch, or reset activity;
+   *   - a re-run imports only genuinely-new ids (already-imported ones are skipped).
+   * Returns the count actually imported. All in one transaction.
+   */
+  importDormantSessions(metas: ImportedSessionMeta[]): { imported: number; skipped: number } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      let imported = 0; let skipped = 0;
+      for (const m of metas) {
+        const existing = this.db.prepare('SELECT session_id FROM sessions WHERE session_id=?').get(m.sessionId) as { session_id: string } | undefined;
+        if (existing) { skipped += 1; continue; } // never touch an already-known session
+        const auto = automaticAlias(m.sessionId);
+        const lastSeenIso = new Date(m.lastSeenMs).toISOString();
+        // Insert a minimal dormant row. It is NOT connected (state='disconnected'), NOT
+        // routable (dormant + no active name), NOT counted active, and its retention clock
+        // is NOT started (dormant is not meaningful activity — ADR 0013). project_id is the
+        // opaque slug (we did not open the transcript to learn the real cwd).
+        this.db.prepare(
+          `INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, receive_mode, state, last_seen_at, created_at, updated_at,
+             management_state, source_last, identify_confidence, transcript_path, first_seen_at, last_seen_source_at)
+           VALUES (?,?,?,?,?,?, 'disconnected', 'disconnected', ?,?,?, 'dormant', 'import', 'listing_only', ?,?,?)`,
+        ).run(
+          m.sessionId, auto.display, `slug-${m.projectSlug}`, m.projectSlug, XBUS_VERSION, '[]',
+          lastSeenIso, lastSeenIso, now, m.transcriptPath, now, lastSeenIso,
+        );
+        this.audit('SESSION_IMPORTED', { sessionId: m.sessionId, source: 'import', confidence: 'listing_only' });
+        this.ledger('SESSION_IMPORTED', 'installer', { sessionId: m.sessionId }, { source: 'import', managementState: 'dormant', confidence: 'listing_only' });
+        imported += 1;
+      }
+      return { imported, skipped };
     });
   }
 

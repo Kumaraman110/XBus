@@ -20,6 +20,8 @@ import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { DashboardServer } from './dashboard/server.js';
 import { DashboardAuth } from './dashboard/auth.js';
 import { WorkerReadExecutor } from './dashboard/read-worker.js';
+import { BrokerStore } from './store.js';
+import { scanTranscripts } from './session-import.js';
 
 export interface BrokerHostOptions extends DaemonOptions {
   dataDir: string;
@@ -39,6 +41,11 @@ export interface BrokerHostOptions extends DaemonOptions {
    *  verb land); when true the broker owns the single HTTP server on 127.0.0.1. A
    *  dashboard start failure is best-effort and NEVER fails broker start (I5). */
   dashboard?: boolean | { port?: number };
+  /** Beta.5 Phase 1 (ADR 0013 D5): on start, import previously-existing sessions from the
+   *  Claude transcript listing as DORMANT rows (metadata only). Best-effort — a scan/import
+   *  failure NEVER fails broker start. Default false (opt-in); when a string, overrides the
+   *  projects dir (tests). */
+  importDormantSessions?: boolean | { projectsDir?: string };
 }
 
 export interface RunningBroker {
@@ -68,6 +75,22 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     try { if (fsExists(f)) hardenFile(f); } catch { /* best effort */ }
   }
   runMigrations(db, clock.nowIso());
+  // Beta.5 Phase 1 (ADR 0013 D5): best-effort dormant import from the transcript LISTING
+  // (metadata only). A scan/import failure must NEVER fail broker start (I5), so it is
+  // wrapped + swallowed with a log note. Runs once at start, before the daemon binds.
+  if (opts.importDormantSessions) {
+    try {
+      const projectsDir = typeof opts.importDormantSessions === 'object' ? opts.importDormantSessions.projectsDir : undefined;
+      const metas = scanTranscripts(projectsDir);
+      if (metas.length > 0) {
+        const importStore = new BrokerStore(db, clock, ids, 'importer');
+        const r = importStore.importDormantSessions(metas);
+        opts.log?.(`imported ${r.imported} dormant session(s) (${r.skipped} already known)`);
+      }
+    } catch (e) {
+      opts.log?.(`dormant import skipped (continuing): ${(e as Error).message}`);
+    }
+  }
   const brokerInstanceId = uuidv7();
   const daemonOpts: DaemonOptions = {};
   // Secure transport (XBUS-STP): load/create the per-installation root secret and
