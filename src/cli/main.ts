@@ -214,16 +214,37 @@ async function cmdDoctor(): Promise<CliResult> {
   checks.push({ name: 'node_sqlite', ok: sqliteOk, detail: sqliteDetail });
 
   // Beta.5: SessionStart (+ checkpoint) hooks registered at user scope. Reads the settings
-  // file XBus actually writes hooks to (~/.claude/settings.json); an XBus-OWNED SessionStart
+  // file XBus actually writes hooks to (~/.claude/settings.json); an XBus SessionStart
   // handler is what makes plain `claude` announce every session. Absent → informational when
   // running uninstalled, but a FAIL when a plugin IS installed (a broken beta.5 install).
+  //
+  // Detection is by ENTRY PATH (from the install manifest), not the `_xbusOwner` tag alone:
+  // Claude Code strips non-standard handler keys when it re-serializes settings.json, so a
+  // tag-only check would false-fail a perfectly-wired hook after the first `claude` run. We
+  // still surface owned=false so a host-stripped tag is visible (repair re-applies it), but a
+  // path-matched hook is healthy — the hook executes regardless of the tag.
   let sessionStartOk = true; let hooksDetail: string;
   try {
-    const hk = inspectUserScopeHooks(defaultClaudeSettingsPath());
+    const manifest = readInstallManifest(defaultInstallRoot());
+    // Only derive expected entry paths when the manifest actually carries a pluginDir.
+    // readInstallManifest JSON-casts without validating, so a legacy/corrupt manifest could
+    // lack pluginDir; guard so path.join(undefined,…) can't throw and mask a broken install
+    // as a passing check (the catch would report ok=true, detail 'not checked'). Falls back
+    // to tag-only detection, which still correctly reports NOT registered when appropriate.
+    const pluginDir = typeof manifest?.pluginDir === 'string' && manifest.pluginDir.length > 0 ? manifest.pluginDir : undefined;
+    const expectedEntries = pluginDir ? {
+      SessionStart: path.join(pluginDir, 'dist', 'channel', 'session-start-hook.js'),
+      UserPromptSubmit: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+      Stop: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+    } : undefined;
+    const settingsPath = manifest?.userScope?.settingsPath ?? defaultClaudeSettingsPath();
+    const hk = inspectUserScopeHooks(settingsPath, expectedEntries);
     const ss = hk.events.SessionStart;
     const missing = (['SessionStart', 'UserPromptSubmit', 'Stop'] as const).filter((e) => !hk.events[e].registered);
-    const installedNow = readInstallManifest(defaultInstallRoot()) !== null;
-    sessionStartOk = ss.registered && ss.owned ? true : !installedNow; // uninstalled → informational
+    const installedNow = manifest !== null;
+    // Registered (by tag OR installed entry path) is healthy; the tag is not required for the
+    // hook to fire. Uninstalled + absent → informational, not a failure.
+    sessionStartOk = ss.registered ? true : !installedNow;
     hooksDetail = ss.registered
       ? `SessionStart→${path.basename(ss.entry ?? '?')} (owned=${ss.owned})${missing.length ? `; missing: ${missing.join(',')}` : '; all 3 wired'}`
       : installedNow ? 'SessionStart hook NOT registered (beta.5 session visibility inactive)' : 'no XBus hooks (running uninstalled / from source)';

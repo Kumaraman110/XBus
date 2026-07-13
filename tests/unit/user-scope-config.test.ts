@@ -429,4 +429,42 @@ describe('inspectUserScopeHooks (read-only doctor view)', () => {
     expect(v.events.SessionStart.owned).toBe(false);
     expect(v.events.SessionStart.registered).toBe(false);
   });
+
+  // REGRESSION (beta.5.1): Claude Code strips the non-standard `_xbusOwner` property when it
+  // re-serializes settings.json, leaving a fully-functional but UNTAGGED XBus hook. A tag-only
+  // detector reports registered:false → doctor false-fails a working install. With the installed
+  // entry paths supplied, detection by PATH must still recognize the hook as registered.
+  it('detects a host-stripped (untagged) hook by entry PATH when expectedEntries is supplied', () => {
+    // Simulate the post-host-rewrite file: correct entries, but NO _xbusOwner tag anywhere.
+    writeSettings({ hooks: {
+      SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [SESSION_START_JS] }] }],
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: NODE, args: [HOOK_JS] }] }],
+      Stop: [{ hooks: [{ type: 'command', command: NODE, args: [HOOK_JS] }] }],
+    } });
+    const expected = { SessionStart: SESSION_START_JS, UserPromptSubmit: HOOK_JS, Stop: HOOK_JS };
+    // Tag-only view (no expectedEntries) sees nothing owned — the OLD behavior that false-failed.
+    const tagOnly = inspectUserScopeHooks(settingsPath);
+    expect(tagOnly.events.SessionStart.registered).toBe(false);
+    // Path-aware view recognizes the wired hook: registered:true even though owned:false.
+    const v = inspectUserScopeHooks(settingsPath, expected);
+    expect(v.events.SessionStart).toMatchObject({ registered: true, owned: false });
+    expect(v.events.SessionStart.entry).toContain('session-start-hook.js');
+    expect(v.events.UserPromptSubmit).toMatchObject({ registered: true, owned: false });
+    expect(v.events.Stop).toMatchObject({ registered: true, owned: false });
+  });
+
+  it('path detection is robust to Windows separator/case drift', () => {
+    // Host may re-serialize with mixed separators/case; a normalized compare still matches.
+    const driftedEntry = SESSION_START_JS.replace(/\//g, '\\').toUpperCase();
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [driftedEntry] }] }] } });
+    const v = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS });
+    expect(v.events.SessionStart.registered).toBe(true);
+  });
+
+  it('does NOT claim a foreign untagged hook even when expectedEntries is supplied', () => {
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: ['C:/user/not-ours.js'] }] }] } });
+    const v = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS });
+    expect(v.events.SessionStart.registered).toBe(false);
+    expect(v.events.SessionStart.owned).toBe(false);
+  });
 });

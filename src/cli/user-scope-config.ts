@@ -390,27 +390,51 @@ export function repairUserScope(o: UserScopeOptions): RepairResult {
 }
 
 /** Read-only view of the XBus lifecycle hooks currently registered in a settings file.
- *  For each event, reports whether an XBus-OWNED handler (tagged `_xbusOwner`) is present
- *  and, if so, which dist entry it invokes. Used by `doctor` to prove the beta.5 SessionStart
- *  (and checkpoint) hooks are wired without mutating anything. Missing file → all absent. */
-export function inspectUserScopeHooks(settingsPath: string): {
+ *  For each event, reports whether an XBus handler is present, which dist entry it invokes,
+ *  and whether it still carries our ownership tag. Used by `doctor` to prove the beta.5
+ *  SessionStart (and checkpoint) hooks are wired without mutating anything. Missing file → all absent.
+ *
+ *  An XBus handler is recognized by EITHER of two signals:
+ *    1. the `_xbusOwner` tag (authoritative for uninstall ownership), OR
+ *    2. its exec-form entry PATH matching our installed dist entry for that event.
+ *  Signal 2 exists because `_xbusOwner` is a NON-STANDARD property: a conformant host
+ *  (Claude Code) strips unknown keys from hook handlers when it re-serializes
+ *  settings.json, leaving a perfectly-wired hook that a tag-only check would report as
+ *  "NOT registered" (a false negative → false doctor failure). Callers that know the
+ *  installed entry paths (doctor, via the install manifest) pass `expectedEntries` so a
+ *  host-stripped-but-functional hook is still detected as registered. `owned` reflects the
+ *  tag only, so an untagged (host-stripped) hook reports `registered:true, owned:false`. */
+export function inspectUserScopeHooks(
+  settingsPath: string,
+  expectedEntries?: Partial<Record<XbusHookEvent, string>>,
+): {
   settingsPath: string;
   events: Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
 } {
   const s = readClaudeSettings(settingsPath);
   const out = {} as Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
+  // The install stores backslashes on Windows; a host may re-serialize with mixed separators,
+  // so compare on forward slashes. Case-fold ONLY on Windows (case-insensitive FS); on a
+  // case-sensitive filesystem lowercasing would be an incorrect normalization. Both sides
+  // derive from the same manifest string, so this never desyncs a genuine match.
+  const norm = (p: string): string => { const f = p.replace(/\\/g, '/'); return process.platform === 'win32' ? f.toLowerCase() : f; };
   for (const ev of XBUS_HOOK_EVENTS) {
     const groups = s?.hooks?.[ev] ?? [];
+    const expectedRaw = expectedEntries?.[ev];
+    const expectedNorm = expectedRaw !== undefined ? norm(expectedRaw) : undefined;
     let entry: string | null = null;
     let owned = false;
     for (const g of groups) {
       for (const h of g.hooks ?? []) {
+        const handlerEntry = Array.isArray(h.args) && typeof h.args[0] === 'string'
+          ? h.args[0]
+          : (typeof h.command === 'string' ? h.command : null);
         const isOwned = typeof (h as Record<string, unknown>)[XBUS_OWNER_TAG] === 'string';
-        // Prefer an owned handler; capture its dist entry from the exec-form args.
-        if (isOwned) {
-          owned = true;
-          if (Array.isArray(h.args) && typeof h.args[0] === 'string') entry = h.args[0];
-          else if (typeof h.command === 'string') entry = h.command;
+        const isXbusByPath = expectedNorm !== undefined && handlerEntry !== null && norm(handlerEntry) === expectedNorm;
+        // A handler is ours if we own it (tagged) OR its entry matches our installed path.
+        if (isOwned || isXbusByPath) {
+          if (isOwned) owned = true;
+          if (handlerEntry !== null) entry = handlerEntry;
         }
       }
     }
