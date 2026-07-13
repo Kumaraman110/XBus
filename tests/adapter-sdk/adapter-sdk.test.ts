@@ -257,12 +257,13 @@ describe('adapter SDK — compatibility protection (§16.22-25, §14)', () => {
     // The adapter SDK pins its TARGET wire tuple at schema 5 (FROZEN_PROTOCOL_COMPAT,
     // asserted above) — that is the contract an adapter manifest must declare and is
     // PR #4's territory, deliberately left at s5 while the adapter-broker enforcement
-    // is dormant on this branch. Beta.4 (ADR 0012 §3) moved the LIVE broker schema to
-    // 6 via migration v6, so SCHEMA_VERSION is now 6. The two are intentionally
-    // decoupled: the SDK does not control SCHEMA_VERSION, and the frozen tuple moves
-    // to s6 only when adapters are actually wired to the s6 broker.
+    // is dormant on this branch. Owner-approved migrations have since moved the LIVE
+    // broker schema forward (v6 beta.4 named sessions, v7 beta.5 control-plane). The two
+    // are intentionally DECOUPLED: the SDK does not control SCHEMA_VERSION, and the frozen
+    // tuple stays s5 regardless of how far the live schema advances. This test asserts the
+    // decoupling — the live schema is current (>5) while the frozen tuple is still 5.
     expect(PROTOCOL_VERSION).toBe(1);
-    expect(SCHEMA_VERSION).toBe(6);
+    expect(SCHEMA_VERSION).toBeGreaterThan(5);
     expect(FROZEN_PROTOCOL_COMPAT.schema).toBe(5);
   });
   it('a manifest whose protocolCompat != the frozen tuple is INCOMPATIBLE', () => {

@@ -1,24 +1,28 @@
 /**
- * §8 — the Node support boundary (>=22.5 <25) + actionable unsupported-Node error.
+ * §8 — the Node support boundary (>=22.13 <25) + actionable unsupported-Node error.
+ * Beta.5 raised the floor 22.5 -> 22.13 because the control-plane dashboard needs
+ * node:sqlite `DatabaseSync({ readOnly: true })` (landed 22.12/22.13) for a physically
+ * read-only worker; an older 22.x silently ignores it, yielding a WRITABLE handle.
  */
 import { describe, it, expect } from 'vitest';
 import { evaluateNodeSupport, assertSupportedNode, parseNodeVersion } from '../../src/shared/node-support.js';
 
-describe('node support boundary (>=22.5 <25)', () => {
+describe('node support boundary (>=22.13 <25)', () => {
   it('parses versions', () => {
-    expect(parseNodeVersion('v22.5.1')).toEqual({ major: 22, minor: 5 });
+    expect(parseNodeVersion('v22.13.1')).toEqual({ major: 22, minor: 13 });
     expect(parseNodeVersion('24.0.0')).toEqual({ major: 24, minor: 0 });
   });
-  it('accepts Node 22.5+, 23, 24', () => {
-    for (const v of ['v22.5.0', 'v22.12.0', 'v23.6.0', 'v24.0.0', 'v24.9.9']) {
+  it('accepts Node 22.13+, 23, 24 (readOnly-capable)', () => {
+    for (const v of ['v22.13.0', 'v22.14.0', 'v23.6.0', 'v24.0.0', 'v24.9.9']) {
       expect(evaluateNodeSupport(v).ok, v).toBe(true);
     }
   });
-  it('rejects < 22.5 with an actionable message', () => {
-    const r = evaluateNodeSupport('v22.4.0');
-    expect(r.ok).toBe(false);
-    expect(r.message).toMatch(/requires Node\.js >= 22\.5/);
-    expect(evaluateNodeSupport('v20.11.0').ok).toBe(false);
+  it('rejects < 22.13 (incl. 22.5-22.12, which lack node:sqlite readOnly) with an actionable message', () => {
+    for (const v of ['v22.4.0', 'v22.5.0', 'v22.12.0', 'v20.11.0']) {
+      const r = evaluateNodeSupport(v);
+      expect(r.ok, v).toBe(false);
+    }
+    expect(evaluateNodeSupport('v22.5.0').message).toMatch(/requires Node\.js >= 22\.13/);
   });
   it('rejects Node 25+ (not yet validated) with an actionable message', () => {
     const r = evaluateNodeSupport('v25.8.1');

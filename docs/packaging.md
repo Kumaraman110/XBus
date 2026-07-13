@@ -76,7 +76,7 @@ archive and identical SHA-256. The builder's Node/OS is recorded out of band in 
 
 ## Runtime pin
 
-`runtime.json` records `engines.node` (currently `>=22.5 <25`). The package is
+`runtime.json` records `engines.node` (currently `>=22.13 <25`). The package is
 meant to run on a pinned Node runtime shipped/declared alongside it; because no
 dependency is native, the same staged tree runs on any compatible Node without a
 rebuild.

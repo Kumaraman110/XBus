@@ -56,6 +56,12 @@ export const XBusErrorCode = {
   CHANNEL_BLOCKED: 'XBUS_CHANNEL_BLOCKED',
   POLICY_BLOCKED: 'XBUS_POLICY_BLOCKED',
   DATABASE_ERROR: 'XBUS_DATABASE_ERROR',
+  /** Beta.5 (ADR 0016/0020 Q3): the audit-ledger append (hash-chained
+   *  `ledger_events`) failed inside the state transaction — a ledger-specific
+   *  constraint/trigger/corruption. The whole operation is aborted (no divergence
+   *  between routing state and audit history); a deliberate availability tradeoff.
+   *  Distinct from DATABASE_ERROR so operators can see it is the audit ledger. */
+  AUDIT_PERSISTENCE_FAILED: 'XBUS_AUDIT_PERSISTENCE_FAILED',
   RATE_LIMITED: 'XBUS_RATE_LIMITED',
   CONN_LIMIT: 'XBUS_CONN_LIMIT',
   SLOWLORIS_TIMEOUT: 'XBUS_SLOWLORIS_TIMEOUT',

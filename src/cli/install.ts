@@ -25,6 +25,70 @@ import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, 
 import { validateArtifact } from '../shared/artifact-contract.js';
 import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
 import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
+import { SCHEMA_VERSION } from '../protocol/handshake.js';
+import { snapshotDbCheckpointed, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
+import { openDatabase } from '../database/connection.js';
+import { classifyShutdown, readStateFile, stateFilePath, pidIsAlive } from '../broker/state-file.js';
+
+/**
+ * Blocker #4 stop-before-upgrade: gracefully stop an owned running broker for `dataDir` and
+ * verify no live writer remains, BEFORE we snapshot/migrate the DB. Without this, install
+ * would snapshot/migrate a DB with a live writer (violating the snapshot prerequisite) and a
+ * concurrent write could tear the migration. Best-effort + bounded; returns whether the DB is
+ * now writer-free (a foreign/mismatched broker we must NOT signal → not writer-free → caller
+ * aborts rather than corrupt someone else's data). No-op when nothing is running.
+ */
+async function stopOwnedBrokerForUpgrade(dataDir: string): Promise<{ writerFree: boolean; detail: string }> {
+  const decision = classifyShutdown(dataDir);
+  if (decision.action === 'none') {
+    if (decision.reason.includes('stale')) { try { fs.unlinkSync(stateFilePath(dataDir)); } catch { /* ignore */ } }
+    return { writerFree: true, detail: 'no running broker' };
+  }
+  if (decision.action === 'refuse') return { writerFree: false, detail: `refusing to stop a broker we do not own: ${decision.reason}` };
+  // action === 'ipc': graceful authenticated shutdown, then confirm the pid is gone.
+  const state = readStateFile(dataDir);
+  try {
+    const { IpcClient } = await import('../ipc/client.js');
+    const { defaultEndpoint } = await import('../ipc/transport.js');
+    const { loadOrCreateRootSecret } = await import('../ipc/root-secret.js');
+    const { doHello } = await import('../ipc/hello.js');
+    const { ComponentRole } = await import('../identity/components.js');
+    const c = new IpcClient(defaultEndpoint(dataDir), { requestTimeoutMs: 3000, rootSecret: loadOrCreateRootSecret(dataDir), helloIdentity: { claimedRole: 'admin' } });
+    await c.connect();
+    await doHello(c, ComponentRole.ADMIN);
+    await c.request('register_session', { sessionId: `installer-${process.pid}`, instanceId: `i-${process.pid}`, processId: process.pid, projectId: 'proj-install', cwd: process.cwd(), receiveMode: 'poll_only', capabilities: ['cli'], role: ComponentRole.ADMIN });
+    await c.request('shutdown', { brokerInstanceId: state?.brokerInstanceId });
+    c.close();
+  } catch { /* fall through to pid wait / forced */ }
+  // Wait (bounded) for the pid to exit so no writer holds the DB when we snapshot/migrate.
+  const pid = decision.pid;
+  for (let i = 0; i < 30 && pid && pidIsAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+  if (pid && pidIsAlive(pid)) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* ignore */ }
+    for (let i = 0; i < 20 && pidIsAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+  }
+  if (pid && pidIsAlive(pid)) return { writerFree: false, detail: `broker pid ${pid} did not exit; refusing to snapshot/migrate a live DB` };
+  try { fs.unlinkSync(stateFilePath(dataDir)); } catch { /* ignore */ }
+  return { writerFree: true, detail: 'owned broker stopped; DB writer-free' };
+}
+
+/**
+ * Read the on-disk DB schema version WITHOUT migrating (a plain read of MAX(version) from
+ * schema_migrations). Returns 0 if the DB or table is absent. Used to decide whether the
+ * post-install health check (which starts a broker and thus migrates the live DB) will
+ * apply a schema INCREASE — if so, we snapshot the DB first so a health-check failure can
+ * restore the pre-upgrade DB (ADR 0019 D4). Opens read-only so it never itself migrates.
+ */
+function onDiskSchemaVersion(dbPath: string): number {
+  if (!fs.existsSync(dbPath)) return 0;
+  try {
+    const db = openDatabase(dbPath, { readOnly: true });
+    try {
+      const row = db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number | null } | undefined;
+      return row?.v ?? 0;
+    } finally { db.close(); }
+  } catch { return 0; } // no table / unreadable → treat as fresh (nothing to protect)
+}
 
 export interface InstallOptions {
   /** Source plugin root (the built repo, or a staged artifact). Default cwd. */
@@ -49,6 +113,13 @@ export interface InstallOptions {
   /** Absolute node executable path written into the user-scope MCP/hook command.
    *  Default: the current process's node. */
   nodePath?: string;
+  /** Blocker #4: stop an owned running broker before snapshot/migrate (default true). Tests
+   *  that never start a broker may set false to skip the stop probe. */
+  stopRunningBroker?: boolean;
+  /** Blocker #4 fault injection (TESTS ONLY): throw at a named post-migration boundary to
+   *  prove the DB is restored before plugin/config on EVERY such failure. Stages:
+   *  'after-health' | 'after-userscope' | 'after-manifest' | 'after-marker'. */
+  faultAfter?: 'after-health' | 'after-userscope' | 'after-manifest' | 'after-marker';
 }
 
 export interface InstallPlan {
@@ -162,12 +233,27 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
   fs.mkdirSync(installRoot, { recursive: true });
   try { assertNotReparse(installRoot); } catch (e) { return { ok: false, dryRun: false, plan, error: (e as Error).message }; }
 
+  // Blocker #4 STOP-BEFORE-UPGRADE: gracefully stop an owned running broker + verify no live
+  // writer BEFORE we snapshot/migrate. A broker we do NOT own (foreign/mismatched) → abort
+  // rather than risk corrupting another user's live DB. Skippable via opt for isolated tests
+  // that never start a broker.
+  if (opts.stopRunningBroker !== false) {
+    const stopped = await stopOwnedBrokerForUpgrade(dataDir);
+    if (!stopped.writerFree) {
+      return { ok: false, dryRun: false, plan, error: `cannot upgrade while a broker is active: ${stopped.detail}. Stop it (xbus stop) and retry.` };
+    }
+  }
+
   // Hoisted so the OUTER catch can REVERSE a completed user-scope registration: if
   // the user-scope MCP/hooks write succeeded but a LATER step (manifest rewrite,
   // migration marker) throws, rollback must also unregister the two config files —
   // otherwise they're orphaned pointing at a plugin dir the rollback just deleted,
   // with no manifest left for `uninstall` to key off (adversarial-review minor).
   let userScopeToReverse: Parameters<typeof unregisterUserScope>[0] | undefined;
+  // Blocker #4: the pre-upgrade DB snapshot, kept alive across the WHOLE post-migration tail
+  // (health check, user-scope registration, manifest rewrite, marker) so ANY failure after
+  // migration can restore the DB before restoring plugin/config. Discarded ONLY at the very end.
+  let dbSnapshot: { dir: string; manifest: SnapshotManifest | null } | null = null;
 
   // Stage into a temp dir alongside the final plugin dir, then swap atomically.
   const staging = path.join(installRoot, `.plugin.staging-${process.pid}`);
@@ -264,16 +350,56 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       const detail = installedContract.violations.map((x) => `${x.rule}:${x.detail}`).join('; ');
       return { ok: false, dryRun: false, plan, health: { ok: false, detail: `installed plugin contract: ${detail}` }, rolledBack: rb, error: `installed plugin failed contract validation` };
     }
+    // ADR 0019 D4 — DB snapshot BEFORE the health check migrates the live DB. The health
+    // check starts a broker, which runs migrations on the live data dir; on ANY schema
+    // INCREASE (e.g. 6→7) that migration is irreversible without a backup. So if the
+    // on-disk schema is BELOW this build's SCHEMA_VERSION, snapshot the DB (+WAL/SHM) first
+    // — the broker being installed is not yet running, so there is no live writer (the
+    // stop-before-upgrade prerequisite). A health-check failure then restores the
+    // pre-upgrade DB, so a failed upgrade leaves a WORKING prior install, not a
+    // forward-migrated DB with a rolled-back plugin.
+    const dbPath = path.join(dataDir, 'xbus.sqlite');
+    const onDisk = onDiskSchemaVersion(dbPath);
+    if (onDisk > 0 && onDisk < SCHEMA_VERSION) {
+      // Blocker #4: CHECKPOINT (writer stopped by the pre-flight) then snapshot, so the
+      // snapshot's main DB is self-contained (truthful Windows durability). Kept alive until
+      // the very end (discarded only after ALL final ops commit).
+      const snapDir = path.join(installRoot, `.db.snapshot-${now.replace(/[:.]/g, '-')}`);
+      const nowMs = opts.nowIso ? Date.parse(opts.nowIso) : Date.parse(now);
+      const snapManifest = snapshotDbCheckpointed(dbPath, snapDir, Number.isFinite(nowMs) ? nowMs : 0);
+      dbSnapshot = { dir: snapDir, manifest: snapManifest };
+    }
+
+    // Blocker #4: the SINGLE post-migration failure path. Restores the DB FIRST (if a
+    // snapshot exists) so the DB is never left forward-migrated, THEN rolls back plugin/config.
+    // If the DB restore FAILS, the snapshot is RETAINED and its path is surfaced (never delete
+    // the only recovery artifact); on success the snapshot is discarded here. Returns the error
+    // suffix describing the DB outcome. Used by health-fail, user-scope-fail, and every
+    // fault-injection boundary — so no post-migration failure can leave a forward-migrated DB.
+    const restoreDbThenRollback = (m: InstallManifest): { rb: boolean; dbNote: string } => {
+      let dbNote = '';
+      if (dbSnapshot?.manifest) {
+        const r = restoreDbSnapshot(dbSnapshot.dir);
+        if (r.ok) { dbNote = ' (db restored to pre-upgrade snapshot)'; discardSnapshot(dbSnapshot.dir); }
+        else { dbNote = ` (db restore FAILED: ${r.detail}; recovery snapshot RETAINED at ${dbSnapshot.dir})`; } // keep it!
+      } else if (dbSnapshot) { discardSnapshot(dbSnapshot.dir); } // snapshot dir but no main entry
+      if (userScopeToReverse) { try { unregisterUserScope(userScopeToReverse); } catch { /* best effort */ } }
+      const rb = rollback(installRoot, m);
+      return { rb, dbNote };
+    };
+    const faultThrow = (stage: string): void => { if (opts.faultAfter === stage) throw new Error(`injected fault ${stage}`); };
+
     const health = await healthCheck(dataDir);
     if (!health.ok) {
-      const rb = rollback(installRoot, manifest);
-      return { ok: false, dryRun: false, plan, health, rolledBack: rb, error: `health check failed: ${health.detail}` };
+      const { rb, dbNote } = restoreDbThenRollback(manifest);
+      return { ok: false, dryRun: false, plan, health, rolledBack: rb, error: `health check failed: ${health.detail}${dbNote}` };
     }
+    faultThrow('after-health'); // (test) — the outer catch routes through restoreDbThenRollback
 
     // Beta.4 (ADR 0012 D8): register XBus into the user-scope Claude config so plain
     // `claude` discovers it. Transactional inside the manager; a failure here rolls
-    // back the WHOLE install (fail-closed: fully installed or fully reverted). The
-    // installId (ownership tag) is the broker instance-independent install identity.
+    // back the WHOLE install (DB restored first). The installId (ownership tag) is the
+    // broker instance-independent install identity.
     const wantUserScope = opts.registerUserScope !== false;
     let userScope: InstallManifest['userScope'];
     if (wantUserScope) {
@@ -286,6 +412,9 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
         nodePath: opts.nodePath ?? process.execPath,
         serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        // Beta.5: SessionStart gets its OWN handler (control-plane visibility), distinct
+        // from the checkpoint hook-entry. Registered on the same transactional write.
+        sessionStartHookEntry: path.join(pluginDir, 'dist', 'channel', 'session-start-hook.js'),
         dataDir,
         installId,
       };
@@ -293,14 +422,16 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       if (usr.ok) userScopeToReverse = usrOpts; // arm the rollback for any LATER throw
       if (!usr.ok) {
         const partial: InstallManifest = { schema: 1, name: 'xbus', version: XBUS_VERSION, commit: readCommit(source), buildId: BUILD_ID, installedAt: now, installRoot, pluginDir, dataDir, files, backups };
-        const rb = rollback(installRoot, partial);
-        return { ok: false, dryRun: false, plan, rolledBack: rb, error: `user-scope config registration failed: ${usr.error}` };
+        const { rb, dbNote } = restoreDbThenRollback(partial);
+        return { ok: false, dryRun: false, plan, rolledBack: rb, error: `user-scope config registration failed: ${usr.error}${dbNote}` };
       }
+      faultThrow('after-userscope');
       userScope = { configPath, settingsPath, registeredAt: now, ...(usr.backupPath ? { backupPath: usr.backupPath } : {}), ...(usr.settingsBackupPath ? { settingsBackupPath: usr.settingsBackupPath } : {}) };
       // Persist the userScope record + installId into the manifest (rewrite it).
       const updated: InstallManifest = { ...manifest, installId, userScope };
       fs.writeFileSync(manifestPath(installRoot), JSON.stringify(updated, null, 2) + '\n');
       try { hardenFile(manifestPath(installRoot)); } catch { /* best effort */ }
+      faultThrow('after-manifest');
     }
 
     // After the upgrade commits (runtime installed + health verified),
@@ -317,16 +448,25 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
         destinationBackupPath: null,
       });
     }
+    faultThrow('after-marker'); // (test) — the outer catch restores the DB before plugin/config
 
+    // FULL SUCCESS: every post-migration step committed. Only NOW discard the pre-upgrade
+    // snapshot — it protected the DB across health/user-scope/manifest/marker (blocker #4).
+    if (dbSnapshot) discardSnapshot(dbSnapshot.dir);
     return { ok: true, dryRun: false, plan, manifestPath: manifestPath(installRoot), health, migrated };
   } catch (e) {
-    // Full rollback on ANY failure (incl. post-swap errors like secret/data-dir
-    // creation): remove a swapped plugin dir, restore the most recent backup,
-    // and clean staging + any partial manifest. Leaves the install root as it was.
-    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ }
-    // Reverse a COMPLETED user-scope registration first (best-effort), so a throw
-    // after it succeeded does not orphan ~/.claude.json + ~/.claude/settings.json
-    // entries pointing at the plugin dir we are about to delete.
+    // Full rollback on ANY failure (incl. post-swap errors + post-migration fault boundaries).
+    // Blocker #4: restore the DB FIRST if a snapshot exists (so we never leave a
+    // forward-migrated DB), retaining it if restore fails; THEN plugin/config rollback.
+    try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ } // staging never holds the snapshot
+    let dbNote = '';
+    if (dbSnapshot?.manifest) {
+      const r = restoreDbSnapshot(dbSnapshot.dir);
+      if (r.ok) { dbNote = ' (db restored to pre-upgrade snapshot)'; discardSnapshot(dbSnapshot.dir); }
+      else { dbNote = ` (db restore FAILED: ${r.detail}; recovery snapshot RETAINED at ${dbSnapshot.dir})`; }
+    } else if (dbSnapshot) { discardSnapshot(dbSnapshot.dir); }
+    // Reverse a COMPLETED user-scope registration (best-effort), so a throw after it
+    // succeeded does not orphan the ~/.claude config entries.
     if (userScopeToReverse) { try { unregisterUserScope(userScopeToReverse); } catch { /* best effort */ } }
     let rolledBack = false;
     try {
@@ -336,7 +476,7 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       if (fs.existsSync(manifestPath(installRoot))) fs.rmSync(manifestPath(installRoot), { force: true });
       rolledBack = true;
     } catch { /* best effort */ }
-    return { ok: false, dryRun: false, plan, error: (e as Error).message, rolledBack };
+    return { ok: false, dryRun: false, plan, error: `${(e as Error).message}${dbNote}`, rolledBack };
   }
 }
 
@@ -418,6 +558,9 @@ export function uninstall(opts: UninstallOptions = {}): UninstallResult {
         nodePath: process.execPath,
         serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        // Beta.5: include the SessionStart entry so uninstall removes THAT owned handler too
+        // (isXbusHookHandler matches any XBus entry; strip is installId-scoped).
+        sessionStartHookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'session-start-hook.js'),
         dataDir: manifest.dataDir,
         installId: manifest.installId,
       });

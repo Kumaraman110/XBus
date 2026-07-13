@@ -20,6 +20,21 @@ export interface HardenResult {
 }
 
 /**
+ * TEST-HARNESS ONLY escape hatch. On a host whose AV/EDR intercepts every process
+ * spawn, each `icacls` invocation costs ~1.5-2s (vs ~20ms on a clean host); a test
+ * suite that starts dozens of brokers on fresh data dirs then pays minutes purely in
+ * ACL subprocesses and can exceed the release gate's per-shard budget. When
+ * `XBUS_SKIP_ACL_HARDENING=1` we skip ONLY the Windows icacls SUBPROCESS and report
+ * `method:'skipped'` honestly. It is NEVER set in production (installer/broker/hook do
+ * not set it); the security shard force-CLEARS it so the real hardening + ACL assertions
+ * still run with real icacls. Analogous to the existing `XBUS_ALLOW_UNSUPPORTED_NODE`
+ * dev bypass. Unix chmod is cheap and always runs (never skipped).
+ */
+function aclSubprocessDisabled(): boolean {
+  return process.platform === 'win32' && process.env.XBUS_SKIP_ACL_HARDENING === '1';
+}
+
+/**
  * Harden a directory so only the current user (+ SYSTEM on Windows) can access it.
  *
  * Windows ordering hazard (proven on a real host): `/inheritance:r` removes inherited
@@ -36,6 +51,7 @@ export function hardenDir(dir: string): HardenResult {
     fs.chmodSync(dir, 0o700);
     return { applied: true, method: 'chmod', detail: '0700' };
   }
+  if (aclSubprocessDisabled()) return { applied: false, method: 'skipped', detail: 'XBUS_SKIP_ACL_HARDENING (test harness)' };
   const r = icaclsRestrict(dir);
   // Re-establish access to any pre-existing children orphaned by /inheritance:r.
   // Best-effort: never downgrade the restrict result on a recurse hiccup.
@@ -49,6 +65,7 @@ export function hardenFile(file: string): HardenResult {
     fs.chmodSync(file, 0o600);
     return { applied: true, method: 'chmod', detail: '0600' };
   }
+  if (aclSubprocessDisabled()) return { applied: false, method: 'skipped', detail: 'XBUS_SKIP_ACL_HARDENING (test harness)' };
   return icaclsRestrict(file);
 }
 
@@ -91,6 +108,9 @@ export function reestablishAccess(target: string): HardenResult {
     try { fs.chmodSync(target, 0o700); return { applied: true, method: 'chmod', detail: '0700' }; }
     catch (e) { return { applied: false, method: 'chmod', detail: (e as Error).message.slice(0, 120) }; }
   }
+  // With hardening skipped there is no `/inheritance:r` to orphan children, so the
+  // recursive re-grant is unnecessary — skip its (expensive) icacls spawn too.
+  if (aclSubprocessDisabled()) return { applied: false, method: 'skipped', detail: 'XBUS_SKIP_ACL_HARDENING (test harness)' };
   const user = os.userInfo().username;
   try {
     execFileSync('icacls', [target, '/grant', `${user}:F`, 'SYSTEM:F', '/T', '/C', '/Q'], {

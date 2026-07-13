@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { execFile } from 'node:child_process';
 import { install, uninstall } from '../../src/cli/install.js';
 import { readClaudeConfig, readClaudeSettings, XBUS_OWNER_TAG } from '../../src/cli/user-scope-config.js';
 
@@ -89,4 +90,41 @@ describe('install registers user-scope Claude config', () => {
     expect(fs.existsSync(path.join(root, 'install-manifest.json'))).toBe(false);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus.command).toBe('someoneElse');
   });
+});
+
+// ── Beta.5 blocker #1: artifact-first clean install wires + LAUNCHES SessionStart ──────────
+describe('artifact-first clean install: SessionStart handler in real settings.json + launchable', () => {
+  it('registers SessionStart→session-start-hook.js (event-specific) and the installed command runs + exits 0', async () => {
+    const r = await inst({ stopRunningBroker: false });
+    expect(r.ok, r.error).toBe(true);
+    // Inspect the REAL settings.json the installer wrote.
+    const s = readClaudeSettings(settingsPath)!;
+    const ssGroups = s.hooks!.SessionStart ?? [];
+    const ssHandler = ssGroups.flatMap((g) => g.hooks).find((h) => h[XBUS_OWNER_TAG] !== undefined);
+    expect(ssHandler, 'a SessionStart owned handler exists').toBeTruthy();
+    const ssArgs = ssHandler!.args as string[];
+    expect(ssArgs.some((a) => a.endsWith('session-start-hook.js')), 'SessionStart → session-start-hook.js').toBe(true);
+    // UPS/Stop still point at the checkpoint entry.
+    for (const ev of ['UserPromptSubmit', 'Stop']) {
+      const h = (s.hooks![ev] ?? []).flatMap((g) => g.hooks).find((x) => x[XBUS_OWNER_TAG] !== undefined)!;
+      expect((h.args as string[]).some((a) => a.endsWith('hook-entry.js')), `${ev} → hook-entry.js`).toBe(true);
+    }
+    // LAUNCH the installed SessionStart command exactly as Claude would (node <entry>), with
+    // malformed stdin against an isolated data dir → it must exit 0 (never blocks Claude).
+    const entry = ssArgs[ssArgs.length - 1]!;
+    expect(fs.existsSync(entry)).toBe(true);
+    const code = await new Promise<number>((resolve) => {
+      const child = execFile(process.execPath, [entry], {
+        env: { ...process.env, XBUS_DATA_DIR: path.join(root, 'ss-data'), XBUS_ALLOW_UNSUPPORTED_NODE: '1', CLAUDE_CODE_SESSION_ID: '' },
+        timeout: 30_000,
+      }, (err) => resolve(err && typeof (err as { code?: number }).code === 'number' ? (err as { code: number }).code : 0));
+      child.stdin!.end('not json'); // malformed → must still exit 0
+    });
+    expect(code).toBe(0);
+    // Clean up any broker the hook auto-started against the isolated data dir.
+    try {
+      const { execFileSync } = await import('node:child_process');
+      execFileSync(process.execPath, [path.join(root, 'plugin', 'dist', 'cli', 'main.js'), 'stop'], { env: { ...process.env, XBUS_DATA_DIR: path.join(root, 'ss-data'), XBUS_ALLOW_UNSUPPORTED_NODE: '1' }, timeout: 15_000, stdio: 'ignore' });
+    } catch { /* best effort */ }
+  }, 90_000);
 });

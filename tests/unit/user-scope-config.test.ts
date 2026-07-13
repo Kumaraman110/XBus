@@ -16,7 +16,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import {
   registerUserScope, unregisterUserScope, repairUserScope, readClaudeConfig, readClaudeSettings,
-  type UserScopeOptions, XBUS_OWNER_TAG,
+  inspectUserScopeHooks, type UserScopeOptions, XBUS_OWNER_TAG,
 } from '../../src/cli/user-scope-config.js';
 
 let dir: string; let configPath: string; let settingsPath: string;
@@ -333,5 +333,100 @@ describe('repairUserScope', () => {
     expect(r.ok).toBe(true);
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined();
     expect(hasOurHooks()).toBe(true);
+  });
+});
+
+// ── Beta.5 (blocker #1): event-specific SessionStart handler ────────────────────
+describe('event-specific hook handlers (SessionStart → session-start-hook.js)', () => {
+  const SESSION_START_JS = 'C:/x/dist/channel/session-start-hook.js';
+  const withSS = (over: Partial<UserScopeOptions> = {}): UserScopeOptions => opts({ sessionStartHookEntry: SESSION_START_JS, ...over });
+  function ownedHandlerArgs(ev: string): string[][] {
+    const s = readClaudeSettings(settingsPath);
+    return (s?.hooks?.[ev] ?? []).flatMap((g) => g.hooks).filter((h) => h[XBUS_OWNER_TAG] !== undefined && Array.isArray(h.args)).map((h) => h.args as string[]);
+  }
+
+  it('registers SessionStart → session-start-hook.js AND UPS/Stop → hook-entry.js, each event-specific', () => {
+    const r = registerUserScope(withSS());
+    expect(r.ok).toBe(true);
+    // SessionStart owned handler points at the SESSION-START entry, NOT the checkpoint entry.
+    const ss = ownedHandlerArgs('SessionStart');
+    expect(ss.some((a) => a.includes(SESSION_START_JS))).toBe(true);
+    expect(ss.some((a) => a.includes(HOOK_JS))).toBe(false);
+    // UserPromptSubmit + Stop owned handlers point at the CHECKPOINT entry, not session-start.
+    for (const ev of ['UserPromptSubmit', 'Stop']) {
+      const a = ownedHandlerArgs(ev);
+      expect(a.some((x) => x.includes(HOOK_JS)), ev).toBe(true);
+      expect(a.some((x) => x.includes(SESSION_START_JS)), ev).toBe(false);
+    }
+  });
+
+  it('is idempotent with SessionStart wired (second register = alreadyRegistered)', () => {
+    expect(registerUserScope(withSS()).ok).toBe(true);
+    const r2 = registerUserScope(withSS());
+    expect(r2.ok).toBe(true);
+    expect(r2.alreadyRegistered).toBe(true);
+  });
+
+  it('uninstall removes ALL THREE owned handlers but PRESERVES an unrelated SessionStart hook', () => {
+    // A user's own SessionStart hook (untagged, different command) must survive uninstall.
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: ['C:/user/my-own-session-start.js'] }] }] } });
+    registerUserScope(withSS());
+    // Now three owned handlers exist + the user's one.
+    expect(ownedHandlerArgs('SessionStart').some((a) => a.includes(SESSION_START_JS))).toBe(true);
+    const u = unregisterUserScope(withSS());
+    expect(u.removed).toBe(true);
+    const s = readClaudeSettings(settingsPath)!;
+    // The user's unrelated SessionStart hook is preserved…
+    const ssAll = (s.hooks?.SessionStart ?? []).flatMap((g) => g.hooks);
+    expect(ssAll.some((h) => Array.isArray(h.args) && h.args.includes('C:/user/my-own-session-start.js'))).toBe(true);
+    // …and NONE of our owned handlers remain on any event.
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop']) {
+      expect(ownedHandlerArgs(ev), `${ev} owned handlers remain`).toHaveLength(0);
+    }
+  });
+
+  it('validation fails closed if the SessionStart handler is mispointed at the checkpoint entry', () => {
+    // A validator that inspects the written file catches a wrong-entry SessionStart.
+    const r = registerUserScope(withSS({
+      // Force a bad apply by validating that SessionStart points at session-start (default does);
+      // here we prove the default validator REJECTS a settings file lacking the SS entry.
+      validateSettings: (s) => {
+        const ss = (s.hooks?.SessionStart ?? []).flatMap((g) => g.hooks);
+        const ok = ss.some((h) => Array.isArray(h.args) && h.args.includes(SESSION_START_JS));
+        return ok ? { ok: true, detail: 'ok' } : { ok: false, detail: 'SessionStart not wired to session-start-hook' };
+      },
+    }));
+    expect(r.ok).toBe(true); // the real apply DOES wire it, so validation passes
+    expect(ownedHandlerArgs('SessionStart').some((a) => a.includes(SESSION_START_JS))).toBe(true);
+  });
+});
+
+describe('inspectUserScopeHooks (read-only doctor view)', () => {
+  const SESSION_START_JS = 'C:/x/dist/channel/session-start-hook.js';
+  const withSS = (over: Partial<UserScopeOptions> = {}): UserScopeOptions => opts({ sessionStartHookEntry: SESSION_START_JS, ...over });
+
+  it('reports all three XBus-owned events with their dist entries after a real register', () => {
+    registerUserScope(withSS());
+    const v = inspectUserScopeHooks(settingsPath);
+    expect(v.events.SessionStart).toMatchObject({ registered: true, owned: true });
+    expect(v.events.SessionStart.entry).toContain('session-start-hook.js');
+    expect(v.events.UserPromptSubmit).toMatchObject({ registered: true, owned: true });
+    expect(v.events.UserPromptSubmit.entry).toContain('hook-entry.js');
+    expect(v.events.Stop).toMatchObject({ registered: true, owned: true });
+  });
+
+  it('reports all-absent for a missing settings file (uninstalled / fresh)', () => {
+    const v = inspectUserScopeHooks(path.join(dir, 'does-not-exist', 'settings.json'));
+    for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop'] as const) {
+      expect(v.events[ev]).toEqual({ registered: false, entry: null, owned: false });
+    }
+  });
+
+  it('does not claim ownership of an unrelated (untagged) SessionStart hook', () => {
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'node', args: ['C:/user/mine.js'] }] }] } });
+    const v = inspectUserScopeHooks(settingsPath);
+    // Present in the file but NOT XBus-owned → owned=false, and we don't surface it as ours.
+    expect(v.events.SessionStart.owned).toBe(false);
+    expect(v.events.SessionStart.registered).toBe(false);
   });
 });

@@ -35,6 +35,10 @@ export default tseslint.config(
       'eslint.config.js', // this config; not part of the TS project
       'vitest.config.ts', // tooling config; not in tsconfig `include`
       '.lint-tmp/**', // local lint-triage scratch; never committed
+      'src/broker/dashboard/static/**', // beta.5 inert browser UI (vanilla JS/HTML/CSS) — a
+      // dashboard CLIENT, not part of the compiled TS product (tsconfig include is *.ts), so
+      // the type-aware parser can't project it. It ships as static assets, verified by its
+      // own integration test (dashboard-ui.test.ts: no inline script, no forbidden APIs).
     ],
   },
   js.configs.recommended,

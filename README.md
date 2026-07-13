@@ -28,6 +28,10 @@ Terminal A (architect)                 Terminal B (implementer)
 - **Acknowledge** and **reply** with preserved correlation + causation.
 - **Queue offline**: a disconnected recipient gets the message when it reconnects.
 - **Survive restarts**: the broker can restart without losing queued messages.
+- **See everything (beta.5)**: every session auto-registers at `SessionStart` and appears in
+  an authenticated **localhost dashboard** (opened automatically) — each session's lifecycle
+  state, readiness, last sent/received, and queued/delivered/acknowledged/replied/failed
+  breakdown, plus audit-ledger health. No manual broker start, config edit, or token handling.
 
 ## Honest limitations (read these)
 
@@ -45,7 +49,7 @@ The broker IPC runs over a Windows named pipe / Unix socket, treated as an **unt
 
 ## Install (developer preview)
 
-> **Requires Node.js `>=22.5` and `<25`** (Node 25+ is not yet supported).
+> **Requires Node.js `>=22.13` and `<25`** (Node 25+ is not yet supported).
 > Install is **PATH-free**: there is no global `xbus` command — you invoke the built
 > entrypoint with `node`. Installation copies the plugin to a user-scope root and
 > registers the MCP server + hook; it does **not** modify PATH, the registry, or a
@@ -59,13 +63,22 @@ npm install
 npm run build
 node .\dist\cli\main.js install --dry-run   # preview (writes nothing)
 node .\dist\cli\main.js install             # user-scope install (no PATH change)
-node .\dist\cli\main.js doctor              # verify health
+node .\dist\cli\main.js doctor              # verify health (hooks, dashboard, ledger)
 node .\dist\launcher\xclaude.js             # launch Claude Code with XBus enabled
+```
+
+After install, just run Claude Code normally — the `SessionStart` hook registers the
+session, the broker auto-starts, and the dashboard opens in your default browser. To
+reopen or focus it later (or get its URL for a `--no-open` run):
+
+```powershell
+node .\dist\cli\main.js dashboard            # open/focus the localhost dashboard
+node .\dist\cli\main.js dashboard --no-open  # print the authenticated URL, don't open
 ```
 
 ## Quick start
 
-See [docs/quickstart.md](docs/quickstart.md) — launch two sessions from unrelated directories, register aliases, send, and watch the delivery state.
+See [docs/quickstart.md](docs/quickstart.md) — launch two sessions from unrelated directories, register aliases, send, and watch the delivery state (and the live dashboard).
 
 ## Architecture
 
@@ -73,7 +86,7 @@ A per-user **broker** (Node + `node:sqlite`/WAL) owns the durable store and rout
 
 ## Docs
 - [Quickstart](docs/quickstart.md) · [Installation](docs/installation.md) · [Demo](docs/demo.md)
-- [Architecture](docs/architecture.md) · [Delivery semantics](docs/delivery-semantics.md) · [Providers](docs/providers.md)
+- [Architecture](docs/architecture.md) · [Control plane / dashboard (beta.5)](docs/beta5-control-plane-architecture.md) · [Delivery semantics](docs/delivery-semantics.md) · [Providers](docs/providers.md)
 - [Security](docs/security.md) · [Privacy](docs/privacy.md) · [Troubleshooting](docs/troubleshooting.md)
 - [Benchmarks](docs/benchmarks.md) · [Compatibility](docs/compatibility.md) · [Roadmap](docs/roadmap.md)
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Changelog](CHANGELOG.md)

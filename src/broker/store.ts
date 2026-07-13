@@ -23,10 +23,41 @@ import type { SendInput } from '../protocol/schemas.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
+import { ledgerAppend, type LedgerSubject } from './ledger.js';
+import type { ImportedSessionMeta } from './session-import.js';
 
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
+
+/**
+ * Beta.5 Phase 1 (ADR 0013 D2): SessionStart `source` → the ledger event type recorded
+ * for that lifecycle transition. `fork` is not a distinct SessionStart source — a fork
+ * fires `startup` with a NEW session_id (ADR 0013 D4), so it maps to the same
+ * SESSION_STARTED; the NEW-identity property is what makes it a fork, not a `source` value.
+ */
+type LifecycleSource = 'startup' | 'resume' | 'clear' | 'compact';
+const LIFECYCLE_EVENT_BY_SOURCE: Record<LifecycleSource, string> = {
+  startup: 'SESSION_STARTED',
+  resume: 'SESSION_RESUMED',
+  clear: 'SESSION_CLEARED',
+  compact: 'SESSION_COMPACTED',
+};
+
+/** Normalize an untrusted SessionStart `source` to a known lifecycle kind. Unknown /
+ *  `--continue` variants collapse to `resume` (the hook contract lists resume as covering
+ *  `--resume`/`--continue`/`/resume`); a genuinely unrecognized value degrades to `resume`
+ *  rather than throwing — the hook must never fail Claude startup over a new source name. */
+function normalizeLifecycleSource(raw: string): LifecycleSource {
+  switch (raw) {
+    case 'startup': return 'startup';
+    case 'clear': return 'clear';
+    case 'compact': return 'compact';
+    case 'resume':
+    case 'continue':
+    default: return 'resume';
+  }
+}
 
 export interface RegisterInput {
   sessionId: string;
@@ -118,6 +149,19 @@ export class BrokerStore {
         JSON.stringify(fields),
         this.clock.nowIso(),
       );
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0016/0020 Q3): append ONE hash-chained `ledger_events` row in
+   * the CALLER's transaction, so the audit projection shares the state mutation's fate
+   * (no divergence). `actor` is the authenticated session id (or 'broker'/'installer').
+   * `subject` carries ids only; `payload` carries SAFE metadata (states/counts/hashes),
+   * never bodies/secrets. A ledger-specific failure throws AUDIT_PERSISTENCE_FAILED,
+   * aborting the whole op — a deliberate availability tradeoff (Q3). MUST be called
+   * inside a `this.db.transaction(...)`.
+   */
+  private ledger(eventType: string, actor: string, subject: LedgerSubject, payload: Record<string, unknown>): void {
+    ledgerAppend(this.db, this.ids, this.clock, eventType, actor, subject, payload);
   }
 
   /**
@@ -457,6 +501,135 @@ export class BrokerStore {
       if (!clash) this.upsertAliasRow(alias, 'global', null, auth.sessionId, now);
       this.audit('ALIAS_REGISTERED', { sessionId: auth.sessionId, alias: alias.display });
       return { alias: alias.display };
+    });
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D2 / ADR 0020): record a SessionStart lifecycle signal
+   * for the AUTHENTICATED session and make it visible in the control plane. Runs in ONE
+   * transaction: an idempotent UPDATE of the visibility columns + exactly one hash-chained
+   * ledger event (or none, for a deduped duplicate birth) — never state without its audit
+   * row (Q3). Identity is the connection's authenticated `auth.sessionId`; nothing here is
+   * read from a caller-supplied session id.
+   *
+   * The session row already exists (the daemon enforces register_session BEFORE announce),
+   * and the epoch/expiry/fork mechanics are already settled by register(): an expired
+   * `resume` advanced the epoch + cleared the tombstone (fresh lifecycle, NO message
+   * resurrection); a fork arrived with a DISTINCT session_id → its own epoch-1 row. So
+   * announce is purely the visibility + audit layer on top.
+   *
+   * Idempotency (identity-level, tested): repeated announces converge the same columns,
+   * never create a second session row or inflate the epoch, and the session appears
+   * exactly once in the read model. A duplicate `startup` (a second "birth" of a session
+   * already seen) is absorbed — state re-stamped, NO duplicate STARTED ledger event. The
+   * genuinely-repeatable signals (`resume`/`clear`/`compact`) each append their own event,
+   * because that is exactly the lifecycle history an append-only audit ledger exists to keep.
+   */
+  announceSession(
+    auth: SessionAuthority,
+    input: { source: string; cwd?: string; transcriptPath?: string; agentType?: string },
+  ): { managementState: string; priorManagementState: string; source: string; lifecycleEvent: string; epoch: number; appended: boolean } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const row = this.db
+        .prepare('SELECT active_epoch AS epoch, management_state AS mgmt, expired_at AS expiredAt FROM sessions WHERE session_id=?')
+        .get(auth.sessionId) as { epoch: number; mgmt: string; expiredAt: string | null } | undefined;
+      if (!row) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
+
+      const source = normalizeLifecycleSource(input.source);
+      const lifecycleEvent = LIFECYCLE_EVENT_BY_SOURCE[source];
+      const priorManagementState = row.mgmt;
+
+      // TOMBSTONE GUARD (ADR 0012 D6): an announce must NEVER revive an EXPIRED session.
+      // Resurrection is the exclusive job of the register/rename fresh-lifecycle paths,
+      // which clear expired_at + advance the epoch (no message resurrection). The normal
+      // hook re-registers BEFORE announcing, so a genuinely-resumed session already has
+      // expired_at cleared by the time we get here. If we still see a tombstone (e.g. a
+      // long-lived connection that idled 15d on heartbeats then announced without
+      // re-registering), do NOT flip management_state to 'active' and do NOT append a
+      // lifecycle event claiming the session is active — that would create the
+      // unroutable-yet-active anti-pattern the register/rename paths defend against.
+      // Honest no-op: the session stays expired until a real re-register resurrects it.
+      if (row.expiredAt !== null) {
+        this.audit('SESSION_ANNOUNCE_SKIPPED_EXPIRED', { sessionId: auth.sessionId, source, epoch: row.epoch });
+        return { managementState: priorManagementState, priorManagementState, source, lifecycleEvent, epoch: row.epoch, appended: false };
+      }
+
+      // Idempotent visibility update. management_state → 'active' (a live SessionStart
+      // signal is the highest-confidence identification); a dormant/unmanaged row is thus
+      // activated. transcript_path + agent_type are backfilled (COALESCE) so a later
+      // richer signal fills gaps without clobbering an existing value. first_seen_at is
+      // stamped once. identify_confidence is 'signal' (documented hook input, ADR 0020 Q1).
+      this.db
+        .prepare(
+          `UPDATE sessions SET management_state='active', source_last=?, identify_confidence='signal',
+             transcript_path=COALESCE(?, transcript_path), agent_type=COALESCE(agent_type, ?),
+             cwd=COALESCE(?, cwd),
+             first_seen_at=COALESCE(first_seen_at, ?), last_seen_source_at=?, updated_at=? WHERE session_id=?`,
+        )
+        .run(source, input.transcriptPath ?? null, input.agentType ?? null, input.cwd ?? null, now, now, now, auth.sessionId);
+
+      this.audit('SESSION_ANNOUNCED', { sessionId: auth.sessionId, source, epoch: row.epoch, priorManagementState });
+
+      // Exactly one ledger event per genuine lifecycle signal. Dedup a `startup` ONLY when a
+      // SESSION_STARTED has ALREADY been recorded for THIS session (a meaningless second
+      // birth) — keyed on the actual ledger history, NOT on first_seen_at (which is also set
+      // by import + by a first resume/clear/compact, so a first_seen_at test would wrongly
+      // suppress a genuine post-import/post-resume `startup`). resume/clear/compact always
+      // append — that repeatable lifecycle history is exactly what the audit ledger keeps.
+      let appended = true;
+      if (source === 'startup') {
+        const priorStart = this.db
+          .prepare(`SELECT 1 FROM ledger_events WHERE event_type='SESSION_STARTED' AND subject_json=? LIMIT 1`)
+          .get(JSON.stringify({ sessionId: auth.sessionId }));
+        if (priorStart) appended = false;
+      }
+      if (appended) {
+        this.ledger(lifecycleEvent, auth.sessionId, { sessionId: auth.sessionId }, {
+          source, epoch: row.epoch, managementState: 'active', priorManagementState, confidence: 'signal',
+        });
+      }
+      return { managementState: 'active', priorManagementState, source, lifecycleEvent, epoch: row.epoch, appended };
+    });
+  }
+
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D5): import previously-existing sessions as DORMANT rows from
+   * transcript-listing metadata (session-import.ts — filenames + mtime ONLY, no bodies).
+   * Each becomes an UNROUTABLE `dormant` row with `identify_confidence='listing_only'`
+   * (honest: known from on-disk history, not a live managed session). One ledger event per
+   * newly-imported session (SESSION_IMPORTED). Idempotent + SAFE:
+   *   - a session_id that ALREADY exists is SKIPPED entirely — import must never downgrade
+   *     an active/dormant/expired row, overwrite its name/epoch, or reset activity;
+   *   - a re-run imports only genuinely-new ids (already-imported ones are skipped).
+   * Returns the count actually imported. All in one transaction.
+   */
+  importDormantSessions(metas: ImportedSessionMeta[]): { imported: number; skipped: number } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      let imported = 0; let skipped = 0;
+      for (const m of metas) {
+        const existing = this.db.prepare('SELECT session_id FROM sessions WHERE session_id=?').get(m.sessionId) as { session_id: string } | undefined;
+        if (existing) { skipped += 1; continue; } // never touch an already-known session
+        const auto = automaticAlias(m.sessionId);
+        const lastSeenIso = new Date(m.lastSeenMs).toISOString();
+        // Insert a minimal dormant row. It is NOT connected (state='disconnected'), NOT
+        // routable (dormant + no active name), NOT counted active, and its retention clock
+        // is NOT started (dormant is not meaningful activity — ADR 0013). project_id is the
+        // opaque slug (we did not open the transcript to learn the real cwd).
+        this.db.prepare(
+          `INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, receive_mode, state, last_seen_at, created_at, updated_at,
+             management_state, source_last, identify_confidence, transcript_path, first_seen_at, last_seen_source_at)
+           VALUES (?,?,?,?,?,?, 'disconnected', 'disconnected', ?,?,?, 'dormant', 'import', 'listing_only', ?,?,?)`,
+        ).run(
+          m.sessionId, auto.display, `slug-${m.projectSlug}`, m.projectSlug, XBUS_VERSION, '[]',
+          lastSeenIso, lastSeenIso, now, m.transcriptPath, now, lastSeenIso,
+        );
+        this.audit('SESSION_IMPORTED', { sessionId: m.sessionId, source: 'import', confidence: 'listing_only' });
+        this.ledger('SESSION_IMPORTED', 'installer', { sessionId: m.sessionId }, { source: 'import', managementState: 'dormant', confidence: 'listing_only' });
+        imported += 1;
+      }
+      return { imported, skipped };
     });
   }
 

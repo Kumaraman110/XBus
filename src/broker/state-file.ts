@@ -25,6 +25,11 @@ export interface BrokerStateFile {
   endpoint: string;
   /** Hash of the owning OS user (never the raw username in logs). */
   ownerIdentityHash: string;
+  /** Beta.5 Phase 1: the loopback dashboard HTTP port + URL, when the broker started one
+   *  (ADR 0015 single-instance). Optional + additive — absent on a broker with no dashboard
+   *  and on older state files. `xbus dashboard` reads these to reach/open the running UI. */
+  dashboardPort?: number;
+  dashboardUrl?: string;
 }
 
 export function stateFilePath(dataDir: string): string {

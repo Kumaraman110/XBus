@@ -1,6 +1,6 @@
 {
   "name": "xbus",
-  "version": "0.1.0-beta.4.1",
+  "version": "0.1.0-beta.5",
   "description": "XBus — a durable local coordination layer for independent coding-agent sessions on one machine. Independent, unofficial; not affiliated with Anthropic.",
   "type": "module",
   "bin": {
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "postbuild": "node dist/tools/write-provenance.js",
+    "postbuild": "node dist/tools/copy-static.js && node dist/tools/write-provenance.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "lint": "eslint .",
@@ -23,7 +23,7 @@
     "accept:clean-machine": "npm run build && node scripts/clean-machine-accept.mjs"
   },
   "engines": {
-    "node": ">=22.5 <25"
+    "node": ">=22.13 <25"
   },
   "dependencies": {
     "uuid": "11.1.1",
@@ -31,7 +31,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "22.10.5",
+    "@types/node": "22.13.0",
     "eslint": "10.5.0",
     "fast-check": "3.23.2",
     "typescript": "5.7.3",

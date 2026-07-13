@@ -108,9 +108,16 @@ async function main(): Promise<void> {
   let totalFiles = 0, totalTests = 0, totalFailed = 0, totalSkipped = 0;
   for (const shard of SHARDS) {
     const reportFile = path.join(isoHome, `vitest-${shard.name}.json`);
+    // ACL-subprocess skip (Windows only): on a host whose AV/EDR intercepts every process
+    // spawn, each `icacls` costs ~1.5-2s, so broker-start-heavy shards spend minutes purely
+    // in hardening subprocesses. Skip that spawn for every shard EXCEPT `security`, which
+    // MUST prove the real Windows ACL with real icacls (windows-acl / secure-channel). The
+    // functional guarantee under test is identical either way; only the OS-permission side
+    // effect — asserted solely in the security shard — differs. See src/ipc/acl.ts.
+    const shardEnv = { ...testEnv, XBUS_SKIP_ACL_HARDENING: shard.name === 'security' ? '0' : '1' };
     // 30min per shard: the install-heavy integration shard on a slow Windows runner
     // (each real install 60-90s) can exceed the default 10min; bounded to catch a hang.
-    const r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], testEnv, 1_800_000);
+    const r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], shardEnv, 1_800_000);
     let files = 0, tests = 0, passed = 0, failed = 0, skipped = 0;
     try {
       const j = JSON.parse(fs.readFileSync(reportFile, 'utf8')) as {

@@ -4,7 +4,7 @@
 
 | Requirement | Value |
 |-------------|-------|
-| Node.js | `>=22.5` (uses the `node:sqlite` built-in) |
+| Node.js | `>=22.13` (uses the `node:sqlite` built-in) |
 | Native addons | None (pure-JS deps only) |
 | Build toolchain at runtime | Not required |
 

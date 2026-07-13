@@ -17,6 +17,11 @@ import { readProvenance, resolveIdentity, provenancePathFromDist } from '../shar
 import { checkSingleton } from './singleton.js';
 import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
+import { DashboardServer } from './dashboard/server.js';
+import { DashboardAuth } from './dashboard/auth.js';
+import { WorkerReadExecutor } from './dashboard/read-worker.js';
+import { BrokerStore } from './store.js';
+import { scanTranscripts } from './session-import.js';
 
 export interface BrokerHostOptions extends DaemonOptions {
   dataDir: string;
@@ -31,6 +36,16 @@ export interface BrokerHostOptions extends DaemonOptions {
   enforceSingleton?: boolean;
   /** Enable the XBUS-STP secure transport (default true). Tests may disable. */
   secureTransport?: boolean;
+  /** Beta.5 Phase 1: start the loopback read-only dashboard alongside the broker
+   *  (ADR 0015). Default false in Phase 1 (opt-in until the UI slice + `xbus dashboard`
+   *  verb land); when true the broker owns the single HTTP server on 127.0.0.1. A
+   *  dashboard start failure is best-effort and NEVER fails broker start (I5). */
+  dashboard?: boolean | { port?: number };
+  /** Beta.5 Phase 1 (ADR 0013 D5): on start, import previously-existing sessions from the
+   *  Claude transcript listing as DORMANT rows (metadata only). Best-effort — a scan/import
+   *  failure NEVER fails broker start. Default false (opt-in); when a string, overrides the
+   *  projects dir (tests). */
+  importDormantSessions?: boolean | { projectsDir?: string };
 }
 
 export interface RunningBroker {
@@ -40,6 +55,9 @@ export interface RunningBroker {
   brokerInstanceId: string;
   /** Present when the secure transport is enabled — clients need it to connect. */
   rootSecret?: Buffer;
+  /** Present when a dashboard was started (ADR 0015). */
+  dashboard?: DashboardServer;
+  dashboardUrl?: string;
   stop(): Promise<void>;
 }
 
@@ -57,6 +75,22 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     try { if (fsExists(f)) hardenFile(f); } catch { /* best effort */ }
   }
   runMigrations(db, clock.nowIso());
+  // Beta.5 Phase 1 (ADR 0013 D5): best-effort dormant import from the transcript LISTING
+  // (metadata only). A scan/import failure must NEVER fail broker start (I5), so it is
+  // wrapped + swallowed with a log note. Runs once at start, before the daemon binds.
+  if (opts.importDormantSessions) {
+    try {
+      const projectsDir = typeof opts.importDormantSessions === 'object' ? opts.importDormantSessions.projectsDir : undefined;
+      const metas = scanTranscripts(projectsDir);
+      if (metas.length > 0) {
+        const importStore = new BrokerStore(db, clock, ids, 'importer');
+        const r = importStore.importDormantSessions(metas);
+        opts.log?.(`imported ${r.imported} dormant session(s) (${r.skipped} already known)`);
+      }
+    } catch (e) {
+      opts.log?.(`dormant import skipped (continuing): ${(e as Error).message}`);
+    }
+  }
   const brokerInstanceId = uuidv7();
   const daemonOpts: DaemonOptions = {};
   // Secure transport (XBUS-STP): load/create the per-installation root secret and
@@ -100,12 +134,43 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     throw e;
   }
 
+  // Beta.5 Phase 1 (ADR 0015): start the loopback read-only dashboard alongside the
+  // broker, best-effort — a dashboard failure must NEVER fail broker start (I5). The
+  // broker owns the single HTTP server; the read path is an OFF-LOOP worker with its own
+  // readOnly:true handle (ADR 0020 Q5), so it cannot stall delivery or mutate the DB.
+  let dashboard: DashboardServer | undefined;
+  let dashboardUrl: string | undefined;
+  if (opts.dashboard) {
+    try {
+      const auth = new DashboardAuth(clock);
+      const reader = new WorkerReadExecutor(dbPath, { requestTimeoutMs: 5000 });
+      const wantPort = typeof opts.dashboard === 'object' && opts.dashboard.port !== undefined ? opts.dashboard.port : 0;
+      dashboard = new DashboardServer({ auth, reader, host: '127.0.0.1', port: wantPort, ...(opts.log ? { log: opts.log } : {}) });
+      await dashboard.start();
+      dashboardUrl = dashboard.url;
+      // Push live snapshots to open streams on every session-state mutation (off-loop read).
+      daemon.onSessionStateChanged = () => dashboard!.notifyChange();
+      // Beta.5 (blocker #3): let the `xbus dashboard` CLI mint a one-time open-URL over IPC.
+      // mintOpenUrl() returns `${url}/#n=<nonce>` (nonce in fragment, single-use, short-TTL);
+      // it travels back on the encrypted IPC channel only — never logged/persisted.
+      daemon.dashboardUrlMinter = () => ({ url: dashboard!.mintOpenUrl(), dashboardUrl: dashboard!.url });
+    } catch (e) {
+      opts.log?.(`dashboard start failed (continuing without it): ${(e as Error).message}`);
+      try { await dashboard?.stop(); } catch { /* ignore */ }
+      dashboard = undefined;
+      dashboardUrl = undefined;
+    }
+  }
+
   // Write the identity-rich state file (ADR 0007) so `xbus stop` can target this
   // broker safely. Atomic + user-only perms; written only if a dataDir is real.
   let stopped = false;
   const doStop = async () => {
     if (stopped) return;
     stopped = true;
+    // Stop the dashboard FIRST (its off-loop worker holds a read-only DB handle; close it
+    // before the writer's db.close()). Best-effort.
+    if (dashboard) { try { await dashboard.stop(); } catch { /* ignore */ } }
     await daemon.stop();
     removeStateFileIfOwned(opts.dataDir, brokerInstanceId);
     db.close();
@@ -128,6 +193,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
       sourceCommit: stateIdentity.sourceCommit,
       endpoint,
       ownerIdentityHash: ownerIdentityHash(),
+      ...(dashboard ? { dashboardPort: dashboard.port, dashboardUrl: dashboard.url } : {}),
     });
     // The authenticated IPC shutdown path triggers a graceful stop. The host
     // does NOT exit the process — the caller (CLI start loop) decides that via
@@ -141,6 +207,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     endpoint,
     brokerInstanceId,
     ...(rootSecret ? { rootSecret } : {}),
+    ...(dashboard && dashboardUrl ? { dashboard, dashboardUrl } : {}),
     stop: doStop,
   };
 }

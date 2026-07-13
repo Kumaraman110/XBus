@@ -8,7 +8,7 @@
  * insufficient WITHOUT the installation secret, and full §6 downgrade/identity/
  * reflection/nonce-reuse resistance.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -148,6 +148,11 @@ describe('XBUS-STP handshake + AEAD', () => {
 
 describe('root secret lifecycle (§9)', () => {
   let dir: string;
+  // The 'no broad principals' assertion inspects the REAL on-disk ACL, so force the icacls
+  // hardening subprocess ON here even if the dev harness disabled it for speed elsewhere.
+  let priorSkip: string | undefined;
+  beforeAll(() => { priorSkip = process.env.XBUS_SKIP_ACL_HARDENING; delete process.env.XBUS_SKIP_ACL_HARDENING; });
+  afterAll(() => { if (priorSkip === undefined) delete process.env.XBUS_SKIP_ACL_HARDENING; else process.env.XBUS_SKIP_ACL_HARDENING = priorSkip; });
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-rs-')); });
   afterEach(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
 

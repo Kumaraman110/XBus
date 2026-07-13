@@ -10,7 +10,7 @@
 import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import { IpcServer, type ServerConn, type ServerOptions } from '../ipc/server.js';
-import { makeFrame, type Frame, type FrameType, type RegisterPayload } from '../protocol/commands.js';
+import { makeFrame, type Frame, type FrameType, type RegisterPayload, type AnnouncePayload } from '../protocol/commands.js';
 import { BrokerStore, type SessionAuthority } from './store.js';
 import { DeliveryOps, INJECTION_METADATA_KEY } from './delivery.js';
 import { Reaper, type SweepResult } from './reaper.js';
@@ -23,6 +23,7 @@ import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../ide
 import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, BUILD_ID, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
+import { verifyLedger } from './ledger.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
 import { TrustedEvidenceRegistry } from '../adapter-broker/trusted-evidence.js';
 import type { AwardedSupport } from '../adapter/evidence.js';
@@ -37,6 +38,9 @@ export interface DaemonOptions {
   /** Reaper sweep interval (ms). 0 disables the periodic timer (tests drive it
    *  explicitly via runReaperSweep). Default 30s. */
   reaperIntervalMs?: number;
+  /** Beta.5 blocker #7: audit-ledger verify interval (ms). 0 disables the periodic timer
+   *  (tests drive verifyLedgerNow explicitly). Default 1h. Startup verify always runs. */
+  ledgerVerifyIntervalMs?: number;
   /** IPC transport resource bounds (§3). Passed through to the IpcServer. */
   maxConnections?: number;
   idleTimeoutMs?: number;
@@ -56,6 +60,10 @@ export class BrokerDaemon {
   private readonly metrics: BrokerMetrics;
   private reaperTimer: NodeJS.Timeout | null = null;
   private readonly reaperIntervalMs: number;
+  private ledgerVerifyTimer: NodeJS.Timeout | null = null;
+  /** Beta.5 blocker #7: ledger-verify interval (ms). 0 disables the timer (tests drive it).
+   *  Default 1h (ADR 0020 Q4 tamper-detection latency bound). */
+  private readonly ledgerVerifyIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
   /** In-memory awarded support per connection (adapter-aware registrations only; never persisted).
@@ -107,6 +115,7 @@ export class BrokerDaemon {
     // the EXACT build id (this.identity.buildId) — provenance, not the compat tuple.
     this.metrics = new BrokerMetrics(brokerInstanceId, this.identity.buildId, SCHEMA_VERSION, opts.rootSecret !== undefined, () => clock.nowMs());
     this.reaperIntervalMs = opts.reaperIntervalMs ?? 30_000;
+    this.ledgerVerifyIntervalMs = opts.ledgerVerifyIntervalMs ?? 60 * 60_000;
     this.authSecret = opts.authSecret;
     this.rootSecret = opts.rootSecret;
     this.serverTuning = {
@@ -138,6 +147,38 @@ export class BrokerDaemon {
       }, this.reaperIntervalMs);
       if (typeof this.reaperTimer.unref === 'function') this.reaperTimer.unref();
     }
+    // Beta.5 blocker #7: audit-ledger verification on STARTUP + on a periodic interval, so
+    // an out-of-band tamper / bit-rot is caught within at most one interval (ADR 0020 Q4),
+    // not "next restart". A broken chain is LOGGED + recorded (LEDGER_CHAIN_BROKEN) but does
+    // NOT block delivery (the ledger is a projection). Records a LEDGER_VERIFIED audit row so
+    // the dashboard shows a freshness stamp. Best-effort — never throws into start().
+    this.verifyLedgerNow();
+    if (this.ledgerVerifyIntervalMs > 0) {
+      this.ledgerVerifyTimer = setInterval(() => this.verifyLedgerNow(), this.ledgerVerifyIntervalMs);
+      if (typeof this.ledgerVerifyTimer.unref === 'function') this.ledgerVerifyTimer.unref();
+    }
+  }
+
+  /**
+   * Verify the audit-ledger hash chain now (blocker #7). Records the outcome as a
+   * LEDGER_VERIFIED audit row (freshness stamp for the dashboard); on a break, logs +
+   * records LEDGER_CHAIN_BROKEN with the first bad seq. NEVER throws (verification failing
+   * must not crash the broker) and NEVER blocks delivery (the chain is a projection).
+   * Returns the verify result for tests/doctor.
+   */
+  verifyLedgerNow(): { ok: boolean; checked: number; firstBreakSeq: number | null } {
+    try {
+      const v = verifyLedger(this.db);
+      this.audit('LEDGER_VERIFIED', { ok: v.ok, checked: v.checked, ...(v.firstBreak ? { firstBreakSeq: v.firstBreak.seq } : {}) });
+      if (!v.ok) {
+        this.log(`AUDIT LEDGER CHAIN BROKEN at seq ${v.firstBreak?.seq ?? '?'} (delivery unaffected; audit history compromised)`);
+        this.audit('LEDGER_CHAIN_BROKEN', { firstBreakSeq: v.firstBreak?.seq ?? null });
+      }
+      return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null };
+    } catch (e) {
+      this.log(`ledger verify failed: ${(e as Error).message}`);
+      return { ok: false, checked: 0, firstBreakSeq: null };
+    }
   }
 
   /** Explicit reaper sweep — used by tests (with a FakeClock) and by `xbus doctor`.
@@ -152,6 +193,7 @@ export class BrokerDaemon {
 
   async stop(): Promise<void> {
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    if (this.ledgerVerifyTimer) { clearInterval(this.ledgerVerifyTimer); this.ledgerVerifyTimer = null; }
     await this.ipc?.close();
   }
 
@@ -238,6 +280,10 @@ export class BrokerDaemon {
           return this.onHello(conn, frame);
         case 'register_session':
           return this.onRegister(conn, frame);
+        case 'announce_session':
+          return this.onAnnounceSession(conn, frame);
+        case 'ensure_dashboard':
+          return this.onEnsureDashboard(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
         case 'rename_session':
@@ -428,6 +474,40 @@ export class BrokerDaemon {
     this.reply(conn, 'register_session_ack', ackPayload, frame.requestId);
   }
 
+  /**
+   * Beta.5 Phase 1 (ADR 0013 D2 / ADR 0020): the SessionStart lifecycle signal. The
+   * connection MUST have completed register_session (requireAuth) — identity is the
+   * authenticated `auth.sessionId`, NEVER a payload sessionId (a caller cannot announce
+   * for another session). The store records visibility + exactly one ledger event in one
+   * transaction. Any role may announce (the hook registers as `hook`); this mutates only
+   * visibility + audit, no routing state, so it is not gated by the send/name matrix.
+   */
+  private onAnnounceSession(conn: ServerConn, frame: Frame): void {
+    const auth = this.requireAuth(conn);
+    const p = (frame.payload ?? {}) as Partial<AnnouncePayload>;
+    if (typeof p.source !== 'string' || !p.source) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'announce_session requires a non-empty source');
+    }
+    // Optional string fields flow into TEXT columns; reject a present-but-non-string value
+    // with a clean PROTOCOL_VIOLATION (a boolean/object would throw a raw bind error).
+    const cwd = this.optString(p.cwd, 'cwd');
+    const transcriptPath = this.optString(p.transcriptPath, 'transcriptPath');
+    const agentType = this.optString(p.agentType, 'agentType');
+    const r = this.store.announceSession(auth, {
+      source: p.source,
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+      ...(agentType !== undefined ? { agentType } : {}),
+    });
+    // Beta.5: nudge any open dashboard streams that session state changed (best-effort,
+    // off-loop read; never throws into the handler). No-op if no dashboard is wired.
+    try { this.onSessionStateChanged?.(); } catch { /* dashboard notify is best-effort */ }
+    this.reply(conn, 'announce_session_ack', {
+      sessionId: auth.sessionId, managementState: r.managementState, source: r.source,
+      lifecycleEvent: r.lifecycleEvent, epoch: r.epoch, appended: r.appended,
+    }, frame.requestId);
+  }
+
   private onRenameSession(conn: ServerConn, frame: Frame): void {
     // Beta.4 (ADR 0012 D4): choose/change the session's human-readable name. This is
     // the resolution path for a session stranded in pending_name (e.g. two sessions
@@ -540,6 +620,28 @@ export class BrokerDaemon {
 
   /** Set by the host: performs graceful broker stop + state-file cleanup. */
   onShutdownRequested?: () => void | Promise<void>;
+
+  /** Beta.5: set by the host when a dashboard is running — called after a session-state
+   *  mutation (e.g. announce) so open dashboard streams get a fresh snapshot. Best-effort. */
+  onSessionStateChanged?: () => void;
+
+  /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time
+   *  browser-open URL (nonce in the URL fragment) from the broker-owned DashboardServer.
+   *  Returns null when no dashboard is running. The URL carries a live single-use nonce, so
+   *  it is returned ONLY over the authenticated+encrypted IPC channel, never logged/persisted. */
+  dashboardUrlMinter?: () => { url: string; dashboardUrl: string } | null;
+
+  /**
+   * Mint a dashboard open-URL for an authenticated caller (the `xbus dashboard` CLI). Requires
+   * a registered connection (requireAuth); the URL's nonce is single-use + short-TTL and never
+   * leaves this encrypted channel. Returns {available:false} when no dashboard runs.
+   */
+  private onEnsureDashboard(conn: ServerConn, frame: Frame): void {
+    this.requireAuth(conn);
+    const minted = this.dashboardUrlMinter ? this.dashboardUrlMinter() : null;
+    if (!minted) { this.reply(conn, 'ensure_dashboard_ack', { available: false }, frame.requestId); return; }
+    this.reply(conn, 'ensure_dashboard_ack', { available: true, openUrl: minted.url, dashboardUrl: minted.dashboardUrl }, frame.requestId);
+  }
 
   /** Set the CALLER's own receive control (pause/resume/dnd/manual). */
   private onSetControl(conn: ServerConn, frame: Frame): void {

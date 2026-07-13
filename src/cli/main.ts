@@ -19,9 +19,10 @@ import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, inv
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../launcher/install-paths.js';
-import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
+import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, inspectUserScopeHooks } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
+import { dashboardAlive } from '../broker/dashboard/browser.js';
 
 /** This process's exact identity: prefer the packaged provenance.json next to the
  *  installed binaries (works with no git/source), else a labelled source identity.
@@ -100,6 +101,8 @@ function cmdRepair(): CliResult {
     nodePath: process.execPath,
     serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
     hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+    // Beta.5: repair re-applies the SessionStart handler too (fixes a drifted/missing one).
+    sessionStartHookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'session-start-hook.js'),
     dataDir: manifest.dataDir,
     installId: manifest.installId ?? `xbus-repair-${process.pid}`,
   });
@@ -209,6 +212,58 @@ async function cmdDoctor(): Promise<CliResult> {
   try { const { DatabaseSync } = await import('node:sqlite'); sqliteOk = typeof DatabaseSync === 'function'; sqliteDetail = sqliteOk ? 'node:sqlite available' : 'node:sqlite export missing'; }
   catch (e) { sqliteDetail = `node:sqlite import failed: ${(e as Error).message}`; }
   checks.push({ name: 'node_sqlite', ok: sqliteOk, detail: sqliteDetail });
+
+  // Beta.5: SessionStart (+ checkpoint) hooks registered at user scope. Reads the settings
+  // file XBus actually writes hooks to (~/.claude/settings.json); an XBus-OWNED SessionStart
+  // handler is what makes plain `claude` announce every session. Absent → informational when
+  // running uninstalled, but a FAIL when a plugin IS installed (a broken beta.5 install).
+  let sessionStartOk = true; let hooksDetail: string;
+  try {
+    const hk = inspectUserScopeHooks(defaultClaudeSettingsPath());
+    const ss = hk.events.SessionStart;
+    const missing = (['SessionStart', 'UserPromptSubmit', 'Stop'] as const).filter((e) => !hk.events[e].registered);
+    const installedNow = readInstallManifest(defaultInstallRoot()) !== null;
+    sessionStartOk = ss.registered && ss.owned ? true : !installedNow; // uninstalled → informational
+    hooksDetail = ss.registered
+      ? `SessionStart→${path.basename(ss.entry ?? '?')} (owned=${ss.owned})${missing.length ? `; missing: ${missing.join(',')}` : '; all 3 wired'}`
+      : installedNow ? 'SessionStart hook NOT registered (beta.5 session visibility inactive)' : 'no XBus hooks (running uninstalled / from source)';
+  } catch (e) { hooksDetail = `not checked: ${(e as Error).message}`; }
+  checks.push({ name: 'session_start_hook', ok: sessionStartOk, detail: hooksDetail });
+
+  // Beta.5: the loopback dashboard. When a broker is running it records dashboardUrl in the
+  // state file; probe /alive (bounded). Not running / no dashboard → informational, not a fail.
+  let dashOk = true; let dashDetail: string;
+  const dashUrl = state?.dashboardUrl;
+  if (brokerOk && dashUrl) {
+    const alive = await dashboardAlive(dashUrl, { timeoutMs: 1500 });
+    dashOk = alive;
+    dashDetail = alive ? `reachable at ${dashUrl}` : `state file advertises ${dashUrl} but /alive did not answer`;
+  } else if (brokerOk && !dashUrl) {
+    dashDetail = 'broker running without a dashboard (start advertises XBUS_NO_DASHBOARD?)';
+  } else {
+    dashDetail = 'broker not running (dashboard starts with the broker)';
+  }
+  checks.push({ name: 'dashboard', ok: dashOk, detail: dashDetail });
+
+  // Beta.5 blocker #7: audit-ledger chain health. Verify the hash chain over a PHYSICALLY
+  // read-only handle (never mutates, never blocks delivery). A broken chain is reported
+  // honestly as a failure with the first broken seq; an absent DB is informational.
+  let auditOk = true; let auditDetail: string;
+  try {
+    const dbPath = path.join(dir, 'xbus.sqlite');
+    if (fs.existsSync(dbPath)) {
+      const { openDatabase } = await import('../database/connection.js');
+      const { verifyLedger } = await import('../broker/ledger.js');
+      const rdb = openDatabase(dbPath, { readOnly: true });
+      try {
+        const v = verifyLedger(rdb);
+        auditOk = v.ok;
+        auditDetail = v.ok ? `chain intact (${v.checked} entries verified)` : `CHAIN BROKEN at seq ${v.firstBreak?.seq ?? '?'} (${v.checked} checked; delivery unaffected, audit history compromised)`;
+      } finally { try { rdb.close(); } catch { /* ignore */ } }
+    } else { auditDetail = 'no database yet (fresh install / broker never started)'; }
+  } catch (e) { auditDetail = `not checked: ${(e as Error).message}`; }
+  checks.push({ name: 'audit_ledger', ok: auditOk, detail: auditDetail });
+
   // If XBus is installed, validate the installed plugin against the SAME
   // normative contract the packager + installer use (consume one contract, not
   // ad-hoc lists). Absent install → informational, not a failure.
@@ -322,7 +377,20 @@ async function cmdSend(to: string, text: string): Promise<CliResult> {
 async function cmdStart(): Promise<CliResult> {
   const dir = dataDir();
   // The host writes the identity-rich state file (ADR 0007) + enables IPC shutdown.
-  const broker = await startBrokerHost({ dataDir: dir, onStopped: () => process.exit(0) });
+  // Beta.5 (blocker #2): the PRODUCTION start path — the single funnel EVERY broker reaches
+  // (ensure.ts auto-start spawns `node dist/cli/main.js start`, and the manual CLI runs the
+  // same) — enables the control plane: the read-only localhost dashboard AND the metadata-only
+  // dormant import. Both are best-effort inside the host (a failure never fails broker start,
+  // I5), so turning them on here cannot regress messaging. Opt-OUT via env for constrained
+  // environments (headless CI that only needs messaging), never opt-in-for-tests.
+  const dashboardOff = process.env.XBUS_DASHBOARD === '0' || process.env.XBUS_NO_DASHBOARD === '1';
+  const importOff = process.env.XBUS_IMPORT_DORMANT === '0';
+  const broker = await startBrokerHost({
+    dataDir: dir,
+    onStopped: () => process.exit(0),
+    ...(dashboardOff ? {} : { dashboard: true }),
+    ...(importOff ? {} : { importDormantSessions: true }),
+  });
   // F-stopwait: AWAIT a clean stop (WAL checkpoint + state-file removal + db.close)
   // before exiting, so a slow stop never leaks a stale state file. A bounded
   // backstop timer guards against a stop that hangs.
@@ -337,9 +405,47 @@ async function cmdStart(): Promise<CliResult> {
   };
   process.on('SIGINT', () => { void gracefulExit(); });
   process.on('SIGTERM', () => { void gracefulExit(); });
-  process.stdout.write(`XBus broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\nPID: ${process.pid}\nPress Ctrl+C to stop.\n`);
+  const dashLine = broker.dashboardUrl ? `Dashboard: ${broker.dashboardUrl} (open with: xbus dashboard)\n` : '';
+  process.stdout.write(`XBus broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\n${dashLine}PID: ${process.pid}\nPress Ctrl+C to stop.\n`);
   await new Promise(() => {}); // run until killed
   return { human: '', json: {}, exitCode: 0 };
+}
+
+/**
+ * `xbus dashboard [--no-open]` (beta.5 blocker #3): mint a one-time browser-open URL from the
+ * RUNNING broker and open the default browser (unless --no-open). The nonce lives only in the
+ * URL fragment we hand the browser; it is NEVER printed, logged, or persisted — the CLI prints
+ * only the base dashboard URL. Requires a running broker with the dashboard enabled (the
+ * production start path enables it; start one with `xbus start` if absent).
+ */
+async function cmdDashboard(noOpen: boolean): Promise<CliResult> {
+  let openUrl: string; let dashboardUrl: string; let available: boolean;
+  try {
+    const c = await connectAsAdmin();
+    const r = await c.request('ensure_dashboard', {});
+    c.close();
+    if (r.frameType === 'error') {
+      const p = r.payload as { code: XBusErrorCode; message: string };
+      return errorResult(new XBusError(p.code, p.message));
+    }
+    const p = r.payload as { available: boolean; openUrl?: string; dashboardUrl?: string };
+    available = p.available;
+    openUrl = p.openUrl ?? '';
+    dashboardUrl = p.dashboardUrl ?? '';
+  } catch {
+    return { human: `Dashboard unavailable: no broker reachable. Start one with: ${invocationHint('start')}`, json: { ok: false, reason: 'broker_unreachable' }, exitCode: 1 };
+  }
+  if (!available || !openUrl) {
+    return { human: `The running broker has no dashboard enabled (it may be running with XBUS_DASHBOARD=0). Restart with the dashboard enabled.`, json: { ok: false, reason: 'dashboard_disabled' }, exitCode: 1 };
+  }
+  if (noOpen) {
+    // Print the open-URL for a human to paste ONCE (it carries a single-use nonce). This is
+    // the explicit --no-open path; the nonce is consumed on first load and expires shortly.
+    return { human: `Dashboard: ${dashboardUrl}\nOne-time open link (single-use, expires in ~60s):\n  ${openUrl}`, json: { ok: true, dashboardUrl, opened: false }, exitCode: 0 };
+  }
+  const { BrowserOpener } = await import('../broker/dashboard/browser.js');
+  new BrowserOpener().forceOpen(openUrl); // explicit re-open bypasses debounce
+  return { human: `Opened the XBus dashboard in your default browser.\n  ${dashboardUrl}`, json: { ok: true, dashboardUrl, opened: true }, exitCode: 0 };
 }
 
 /**
@@ -413,6 +519,8 @@ export async function run(argv: string[]): Promise<void> {
         return emit(await cmdStart(), asJson);
       case 'stop':
         return emit(await cmdStop(), asJson);
+      case 'dashboard':
+        return emit(await cmdDashboard(args.includes('--no-open')), asJson);
       case 'pause':
       case 'resume':
       case 'dnd': {
@@ -517,7 +625,8 @@ export async function run(argv: string[]): Promise<void> {
           '  sessions                          list registered sessions',
           '  metrics                           body-free operational health/counters (admin)',
           '  send <recipient> <text>           send a message',
-          '  start | stop                      run / stop the broker',
+          '  start | stop                      run / stop the broker (start enables the dashboard)',
+          '  dashboard [--no-open]             open the control-plane dashboard in your browser',
           '  pause | resume                    suspend / resume automatic delivery',
           '  dnd [on|off]                      do-not-disturb toggle',
           '  block <alias> | unblock <alias>   block / unblock a peer alias',

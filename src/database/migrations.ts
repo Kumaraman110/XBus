@@ -381,6 +381,74 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE last_meaningful_activity_at IS NULL;
     `,
   },
+  {
+    version: 7,
+    name: 'control_plane_session_visibility_and_audit_ledger',
+    sql: `
+      -- ADR 0013/0016/0020 (beta.5 Phase 1): control-plane session visibility +
+      -- append-only hash-chained audit ledger. All ADDITIVE. Moves SCHEMA_VERSION
+      -- 6 -> 7, so the wire tuple becomes xbus-p1-stp1-s7 (protocol + STP frozen at
+      -- 1). Fail-closed: an s6 (beta.4.1) component meeting a v7 broker is rejected
+      -- 'upgrade_component' at the handshake (checkCompatibility); beta.5 is a
+      -- controlled whole-install upgrade (ADR 0019), NOT mixed-version operation.
+
+      -- Session VISIBILITY columns (ADR 0020 Q1/Q2). management_state is orthogonal
+      -- to the existing connection 'state' {connected,disconnected} and the
+      -- 'readiness' enum:
+      --   'active'    XBus manages it this broker lifetime (learned via SessionStart)
+      --   'dormant'   imported from transcript listing (prior run; not live)
+      --   'unmanaged' aggregate-only sentinel (see ADR 0013 D6; not per-session)
+      -- Existing rows were live pre-migration -> default 'active' / 'signal'.
+      ALTER TABLE sessions ADD COLUMN management_state TEXT NOT NULL DEFAULT 'active';
+      -- how the row was last learned: startup|resume|clear|compact|fork|import
+      ALTER TABLE sessions ADD COLUMN source_last TEXT;
+      -- identification confidence: signal (SessionStart) | listing_only (import) | unidentified
+      ALTER TABLE sessions ADD COLUMN identify_confidence TEXT NOT NULL DEFAULT 'signal';
+      -- diagnostic-only parent linkage (normally NULL; no documented fork field yet)
+      ALTER TABLE sessions ADD COLUMN forked_from TEXT;
+      -- documented SessionStart input (path to the session transcript .jsonl)
+      ALTER TABLE sessions ADD COLUMN transcript_path TEXT;
+      ALTER TABLE sessions ADD COLUMN first_seen_at TEXT;
+      ALTER TABLE sessions ADD COLUMN last_seen_source_at TEXT;
+
+      CREATE INDEX idx_sessions_management ON sessions(management_state);
+
+      -- Append-only, hash-chained AUDIT LEDGER (ADR 0016/0020 Q4). This is an audit
+      -- PROJECTION written in the SAME transaction as each state mutation (ADR 0020
+      -- Q3) — NOT the source of truth for routing state. Bodies/secrets are never
+      -- stored here (ids/states/hashes only).
+      CREATE TABLE ledger_events (
+        event_id     TEXT PRIMARY KEY,          -- UUIDv7
+        seq          INTEGER NOT NULL UNIQUE,    -- dense monotonic, gap-free per ledger
+        event_type   TEXT NOT NULL,
+        actor        TEXT NOT NULL,              -- session id | 'operator' | 'broker' | 'installer'
+        subject_json TEXT NOT NULL,              -- {sessionId?,threadId?,messageId?} ids only
+        payload_json TEXT NOT NULL,              -- SAFE metadata: states/counts/hashes, NO bodies/secrets
+        created_at   TEXT NOT NULL,              -- UTC ISO-8601
+        prev_hash    TEXT NOT NULL,              -- entry_hash of seq-1 (genesis = 64 zeros)
+        entry_hash   TEXT NOT NULL               -- sha256(canonical(fields ‖ prev_hash))
+      );
+      CREATE UNIQUE INDEX ux_ledger_seq ON ledger_events(seq);
+      -- append-only enforcement: reject UPDATE/DELETE (the vacuum path drops/recreates
+      -- ONLY the delete trigger inside its own transaction — ADR 0020 Q4).
+      CREATE TRIGGER ledger_no_update BEFORE UPDATE ON ledger_events
+        BEGIN SELECT RAISE(ABORT, 'ledger_events is append-only'); END;
+      CREATE TRIGGER ledger_no_delete BEFORE DELETE ON ledger_events
+        BEGIN SELECT RAISE(ABORT, 'ledger_events is append-only'); END;
+
+      -- Compaction anchors (trust roots for a pruned prefix) — ALSO append-only.
+      CREATE TABLE ledger_anchors (
+        anchor_seq   INTEGER PRIMARY KEY,        -- seq of the anchored event
+        anchor_hash  TEXT NOT NULL,              -- entry_hash at anchor_seq
+        created_at   TEXT NOT NULL,
+        reason       TEXT NOT NULL               -- 'vacuum' | 'periodic'
+      );
+      CREATE TRIGGER anchors_no_update BEFORE UPDATE ON ledger_anchors
+        BEGIN SELECT RAISE(ABORT, 'ledger_anchors is append-only'); END;
+      CREATE TRIGGER anchors_no_delete BEFORE DELETE ON ledger_anchors
+        BEGIN SELECT RAISE(ABORT, 'ledger_anchors is append-only'); END;
+    `,
+  },
 ];
 
 function checksum(sql: string): string {

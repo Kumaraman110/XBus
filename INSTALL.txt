@@ -15,8 +15,10 @@ folder.
 Requirements
 ------------
   - Windows.
-  - Node.js >= 22.5 and < 25  (Node 22 LTS or Node 24; Node 25+ is NOT yet
-    supported and will be refused with an actionable message).
+  - Node.js >= 22.13 and < 25  (Node 22.13+ LTS or Node 24; Node 25+ is NOT yet
+    supported and will be refused with an actionable message). beta.5 raised the
+    floor to 22.13 so the read-only dashboard worker can open the database with a
+    physically read-only handle.
   - Do NOT set XBUS_ALLOW_UNSUPPORTED_NODE — supported runtimes do not need it.
 
 Check your Node:
@@ -47,7 +49,9 @@ What install does
 -----------------
   1. Copies the XBus plugin to a user-scope install root
      (default: %USERPROFILE%\.claude\xbus-install\plugin).
-  2. Registers the XBus MCP server + checkpoint hook for Claude Code (user scope).
+  2. Registers the XBus MCP server + lifecycle hooks for Claude Code (user scope):
+     a SessionStart hook (so every session auto-registers and appears in the
+     dashboard) plus the UserPromptSubmit/Stop checkpoint-delivery hooks.
   3. Creates an ACL-restricted per-user data directory with a per-install secret
      (default: %USERPROFILE%\.claude\xbus-install\data).
 
@@ -78,6 +82,20 @@ CLAUDE_CODE_EXECPATH to its full path first, e.g.:
 On Amazon Bedrock, delivery is at the receiver's next checkpoint (its next
 prompt); idle sessions are not woken. See the project README for the honest
 delivery-semantics notes.
+
+
+The session dashboard (beta.5)
+------------------------------
+After install, just run Claude Code normally. Each session auto-registers at
+SessionStart, the broker auto-starts, and an authenticated dashboard opens in
+your default browser showing every session's state, readiness, last sent/
+received, delivery breakdown, and audit-ledger health. To reopen/focus it, or to
+get its URL without opening a browser:
+
+    node .\dist\cli\main.js dashboard            # open/focus in your browser
+    node .\dist\cli\main.js dashboard --no-open  # print a one-time open link
+
+The dashboard is loopback-only (127.0.0.1) and every request is authenticated.
 
 
 Invoke an installed XBus by absolute path

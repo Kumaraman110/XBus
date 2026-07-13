@@ -10,7 +10,8 @@
   installed plugin's absolute path (see INSTALL.txt in this folder).
 
 .NOTES
-  Requires Node.js >= 22.5 and < 25 (Node 25+ is not yet supported).
+  Requires Node.js >= 22.13 and < 25 (Node 25+ is not yet supported). The bundled
+  CLI enforces this floor and refuses an unsupported runtime with an actionable message.
 #>
 [CmdletBinding()]
 param(

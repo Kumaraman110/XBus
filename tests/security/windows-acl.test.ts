@@ -7,7 +7,7 @@
  * principals (Everyone/Authenticated Users/Users) and that inheritance was
  * removed; on Unix it asserts 0700/0600.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -15,6 +15,13 @@ import { startBrokerHost, type RunningBroker } from '../../src/broker/host.js';
 import { describeAcl, hardenDir, hardenFile, assertNotReparse } from '../../src/ipc/acl.js';
 import { loadOrCreateRootSecret, secretPath } from '../../src/ipc/root-secret.js';
 import { ensureDataDir } from '../../src/ipc/transport.js';
+
+// This shard PROVES the real Windows ACL: force the icacls subprocess ON even when the
+// dev harness set XBUS_SKIP_ACL_HARDENING=1 for speed elsewhere (verify:release also sets
+// it to '0' for the security shard). Restore the prior value so nothing else is disturbed.
+let priorSkip: string | undefined;
+beforeAll(() => { priorSkip = process.env.XBUS_SKIP_ACL_HARDENING; delete process.env.XBUS_SKIP_ACL_HARDENING; });
+afterAll(() => { if (priorSkip === undefined) delete process.env.XBUS_SKIP_ACL_HARDENING; else process.env.XBUS_SKIP_ACL_HARDENING = priorSkip; });
 
 let dataDir: string;
 let broker: RunningBroker;

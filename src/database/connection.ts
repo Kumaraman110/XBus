@@ -29,14 +29,33 @@ export interface OpenOptions {
   /** Apply WAL + foreign_keys + busy_timeout on open. */
   applyPragmas?: boolean;
   busyTimeoutMs?: number;
+  /**
+   * Beta.5 Phase 1 (ADR 0020 Q5): open a PHYSICALLY read-only handle
+   * (`DatabaseSync({ readOnly: true })`, landed node:sqlite 22.12/22.13 — the reason the
+   * runtime floor is >=22.13). INSERT/UPDATE/DELETE/DDL and write-pragmas all throw
+   * `ERR_SQLITE_ERROR` — there is no writer handle in this process, so the dashboard read
+   * worker cannot mutate the DB (I4: broker stays the single writer). A read-only WAL
+   * handle reads correct, current rows while the broker (writer) is live; it cannot
+   * create/recover `-wal`/`-shm` or checkpoint, so write pragmas are SKIPPED here.
+   */
+  readOnly?: boolean;
 }
 
 /** Open (or create) a database with XBus's standard durability pragmas. */
 export function openDatabase(filename: string, opts: OpenOptions = {}): SqliteDriver {
-  const db = new DatabaseSync(filename);
+  // `readOnly` is supported by the node:sqlite RUNTIME (landed 22.12/22.13 — the reason the
+  // floor is >=22.13) but @types/node@22.13 hasn't yet added it to DatabaseSyncOptions, so
+  // cast the options past the stale type. Verified at runtime on Node 22.13+ and 24/25.
+  const db = opts.readOnly === true
+    ? new DatabaseSync(filename, { readOnly: true } as unknown as import('node:sqlite').DatabaseSyncOptions)
+    : new DatabaseSync(filename);
   const busy = opts.busyTimeoutMs ?? 5000;
 
-  if (opts.applyPragmas !== false) {
+  // A read-only handle cannot run write pragmas (journal_mode/synchronous/foreign_keys
+  // are writes on the DB) — attempting them throws. Skip ALL pragma writes; the writer
+  // broker already established WAL. busy_timeout is a read-side setting but is redundant
+  // for a single-reader worker, so we skip the whole block for readOnly to stay pure-read.
+  if (opts.readOnly !== true && opts.applyPragmas !== false) {
     // Durability posture documented in docs/protocol.md. WAL for concurrent
     // readers + a single writer; synchronous=NORMAL is the standard WAL pairing
     // (loss window = last txn on OS crash, acceptable for a local message bus).
