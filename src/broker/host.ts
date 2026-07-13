@@ -103,6 +103,13 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
   if (opts.authSecret !== undefined) daemonOpts.authSecret = opts.authSecret;
   if (opts.ackDeadlineMs !== undefined) daemonOpts.ackDeadlineMs = opts.ackDeadlineMs;
   if (opts.requireReceipt !== undefined) daemonOpts.requireReceipt = opts.requireReceipt;
+  // Timer intervals passthrough: without these, a caller-supplied reaper / ledger-verify
+  // interval was silently dropped and the daemon always used its hardcoded defaults (the
+  // BrokerHostOptions type advertised them, but the host never forwarded them — a
+  // non-functional, untestable option). Forward both so the periodic audit-ledger verify
+  // (blocker #7) and reaper cadence are actually configurable through startBrokerHost.
+  if (opts.reaperIntervalMs !== undefined) daemonOpts.reaperIntervalMs = opts.reaperIntervalMs;
+  if (opts.ledgerVerifyIntervalMs !== undefined) daemonOpts.ledgerVerifyIntervalMs = opts.ledgerVerifyIntervalMs;
   // §3 transport resource bounds passthrough.
   if (opts.maxConnections !== undefined) daemonOpts.maxConnections = opts.maxConnections;
   if (opts.idleTimeoutMs !== undefined) daemonOpts.idleTimeoutMs = opts.idleTimeoutMs;

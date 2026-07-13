@@ -120,6 +120,10 @@ export interface InstallOptions {
    *  prove the DB is restored before plugin/config on EVERY such failure. Stages:
    *  'after-health' | 'after-userscope' | 'after-manifest' | 'after-marker'. */
   faultAfter?: 'after-health' | 'after-userscope' | 'after-manifest' | 'after-marker';
+  /** Blocker #4 fault injection (TESTS ONLY): force the DB-restore step to fail, to prove
+   *  that on a restore failure the recovery snapshot is RETAINED and its path is reported
+   *  (never delete the only recovery artifact). Paired with faultAfter. */
+  faultRestore?: boolean;
 }
 
 export interface InstallPlan {
@@ -379,7 +383,9 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     const restoreDbThenRollback = (m: InstallManifest): { rb: boolean; dbNote: string } => {
       let dbNote = '';
       if (dbSnapshot?.manifest) {
-        const r = restoreDbSnapshot(dbSnapshot.dir);
+        // faultRestore (tests only) forces the restore to fail without corrupting the snapshot,
+        // so the RETAIN-and-report-path branch is exercised deterministically.
+        const r = opts.faultRestore === true ? { ok: false, detail: 'injected restore fault' } : restoreDbSnapshot(dbSnapshot.dir);
         if (r.ok) { dbNote = ' (db restored to pre-upgrade snapshot)'; discardSnapshot(dbSnapshot.dir); }
         else { dbNote = ` (db restore FAILED: ${r.detail}; recovery snapshot RETAINED at ${dbSnapshot.dir})`; } // keep it!
       } else if (dbSnapshot) { discardSnapshot(dbSnapshot.dir); } // snapshot dir but no main entry
@@ -461,7 +467,7 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* ignore */ } // staging never holds the snapshot
     let dbNote = '';
     if (dbSnapshot?.manifest) {
-      const r = restoreDbSnapshot(dbSnapshot.dir);
+      const r = opts.faultRestore === true ? { ok: false, detail: 'injected restore fault' } : restoreDbSnapshot(dbSnapshot.dir);
       if (r.ok) { dbNote = ' (db restored to pre-upgrade snapshot)'; discardSnapshot(dbSnapshot.dir); }
       else { dbNote = ` (db restore FAILED: ${r.detail}; recovery snapshot RETAINED at ${dbSnapshot.dir})`; }
     } else if (dbSnapshot) { discardSnapshot(dbSnapshot.dir); }

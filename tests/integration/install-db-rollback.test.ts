@@ -97,4 +97,52 @@ describe('install DB rollback — fault injection after every post-migration bou
     const leftover = fs.readdirSync(root).filter((n) => n.startsWith('.db.snapshot-'));
     expect(leftover).toHaveLength(0);
   }, 60_000);
+
+  it('restore FAILURE: the recovery snapshot is RETAINED and its path is reported (never deleted)', async () => {
+    expect(schemaVersion(dbPath)).toBe(6);
+    // Force a boundary fault AND force the DB restore itself to fail. The DB is left
+    // forward-migrated (we could not roll it back), but the recovery snapshot MUST survive so
+    // the operator can restore manually — and its path must be surfaced in the error.
+    const r = await install({ ...baseOpts(), faultAfter: 'after-manifest', faultRestore: true });
+    expect(r.ok).toBe(false);
+    // The error reports the restore failure + retains + names the snapshot path.
+    expect(r.error ?? '', 'error must report the retained recovery snapshot path').toMatch(/db restore FAILED.*recovery snapshot RETAINED at .*\.db\.snapshot-/);
+    // The snapshot dir is STILL on disk (not discarded) so recovery is possible.
+    const kept = fs.readdirSync(root).filter((n) => n.startsWith('.db.snapshot-'));
+    expect(kept.length, 'the recovery snapshot dir must be retained on restore failure').toBeGreaterThanOrEqual(1);
+    // And it actually contains the pre-upgrade main DB archive (a usable recovery artifact).
+    const snapDir = path.join(root, kept[0]!);
+    const hasArchive = fs.readdirSync(snapDir).some((n) => n.includes('xbus.sqlite'));
+    expect(hasArchive, 'retained snapshot contains the main-DB archive').toBe(true);
+  }, 60_000);
+
+  it('aborts the upgrade when a FOREIGN broker holds the DB (never snapshot/migrate under a writer we do not own)', async () => {
+    // Write a broker state file owned by a DIFFERENT OS user (a foreign owner hash). The
+    // installer's pre-migration writer-free gate (stopOwnedBrokerForUpgrade → classifyShutdown)
+    // REFUSES to signal a broker it does not own, so install() must ABORT before any
+    // snapshot/migrate — the seeded s6 DB must be left completely untouched.
+    const { writeStateFile } = await import('../../src/broker/state-file.js');
+    writeStateFile(dataDir, {
+      pid: process.pid, // alive, but owned by a foreign identity hash below
+      processStartedAt: '2026-01-01T00:00:00.000Z',
+      brokerInstanceId: 'foreign-instance',
+      buildId: 'xbus-p1-stp1-s7',
+      endpoint: 'foreign-endpoint',
+      ownerIdentityHash: 'ffffffffffffffff', // NOT this process's owner → classifyShutdown 'refuse'
+    });
+    expect(schemaVersion(dbPath)).toBe(6);
+    // Default stop-broker probe (stopRunningBroker defaults to true).
+    const r = await install({ ...baseOpts(), stopRunningBroker: undefined });
+    expect(r.ok, 'must refuse to upgrade under a foreign live writer').toBe(false);
+    expect(r.error ?? '').toMatch(/cannot upgrade while a broker is active|do not own|writer/i);
+    // THE INVARIANT: the DB was never snapshotted/migrated — still s6, sentinel intact, no s7 tables.
+    expect(schemaVersion(dbPath), 'DB untouched (still s6) when a foreign writer holds it').toBe(6);
+    const ro = openDatabase(dbPath, { readOnly: true });
+    try {
+      expect((ro.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id='pre-existing'").get() as { n: number }).n).toBe(1);
+      expect(ro.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='ledger_events'`).get(), 'no s7 migration happened').toBeUndefined();
+    } finally { ro.close(); }
+    // No snapshot was taken (abort was BEFORE snapshot).
+    expect(fs.readdirSync(root).filter((n) => n.startsWith('.db.snapshot-')), 'no snapshot taken on a pre-migration abort').toHaveLength(0);
+  }, 60_000);
 });
