@@ -51,19 +51,26 @@ async function mcpClient(sessionId: string, alias: string): Promise<IpcClient> {
   await c.request('register_alias', { alias });
   return c;
 }
+/** Obtain a tab token via the SAME PUBLIC path a user's browser drives (blocker #3): mint a
+ *  one-time open-URL through the broker's public `ensure_dashboard` IPC (no private-field
+ *  access), parse the nonce from the URL FRAGMENT, then exchange it over real HTTP. */
 async function token(): Promise<string> {
-  // The auth store is broker-owned + in-memory; drive the exchange through HTTP the same
-  // way a browser would. We can't mint a nonce from the test (the broker owns it), so use
-  // the dashboard's exchange after minting via the running server's auth — exposed only
-  // through the real flow. Here we reach the broker's DashboardServer directly.
-  const url = broker.dashboardUrl!;
-  // The server holds a DashboardAuth; there is no HTTP "mint" (mint is broker-internal on
-  // browser-open). For the test we mint via the server's auth object accessed off the
-  // RunningBroker.dashboard instance, then exchange over real HTTP.
-  const auth = (broker.dashboard as unknown as { auth: { mintNonce(): string } }).auth;
-  const nonce = auth.mintNonce();
-  const res = await fetch(`${url}/auth/exchange`, { method: 'POST', body: JSON.stringify({ nonce }) });
+  const openUrl = await mintOpenUrl();
+  const nonce = /#n=([^&]+)/.exec(openUrl)![1]!;
+  const res = await fetch(`${broker.dashboardUrl!}/auth/exchange`, { method: 'POST', body: JSON.stringify({ nonce: decodeURIComponent(nonce) }) });
   return (await res.json() as { token: string }).token;
+}
+/** Mint an open-URL via the public ensure_dashboard IPC frame (the CLI's path). */
+async function mintOpenUrl(): Promise<string> {
+  const c = new IpcClient(endpoint, { rootSecret, requestTimeoutMs: 5000, helloIdentity: { claimedRole: 'admin' } });
+  await c.connect();
+  await doHello(c, ComponentRole.ADMIN);
+  await c.request('register_session', { sessionId: `cli-${Math.random().toString(36).slice(2)}`, instanceId: 'i', processId: process.pid, projectId: 'proj-cli', cwd: '/tmp/x', receiveMode: 'poll_only', capabilities: ['cli'], role: ComponentRole.ADMIN });
+  const r = await c.request('ensure_dashboard', {});
+  c.close();
+  const p = r.payload as { available: boolean; openUrl?: string };
+  if (!p.available || !p.openUrl) throw new Error('dashboard not available via ensure_dashboard');
+  return p.openUrl;
 }
 
 describe('control plane E2E — announce → ledger → authenticated dashboard', () => {
@@ -90,10 +97,31 @@ describe('control plane E2E — announce → ledger → authenticated dashboard'
     c.close();
   });
 
-  it('the state file records the dashboard port + url (single-instance discovery)', () => {
+  it('the state file records the dashboard port + url (single-instance discovery), and NEVER a nonce/token', () => {
     const s = readStateFile(dataDir)!;
     expect(s.dashboardPort).toBeGreaterThan(0);
     expect(s.dashboardUrl).toContain('127.0.0.1');
+    // Blocker #3: the nonce/token must NEVER be written to the state file.
+    const raw = JSON.stringify(s);
+    expect(raw).not.toContain('#n=');
+    expect(/token/i.test(raw)).toBe(false);
+  });
+
+  it('blocker #3: public ensure_dashboard mint → fragment nonce → exchange → authed read; nonce is single-use', async () => {
+    const openUrl = await mintOpenUrl();
+    // The nonce is in the URL FRAGMENT, and the base dashboard URL carries NO nonce.
+    expect(openUrl.startsWith(`${broker.dashboardUrl!}/#n=`)).toBe(true);
+    expect(broker.dashboardUrl!).not.toContain('#');
+    const nonce = decodeURIComponent(/#n=([^&]+)/.exec(openUrl)![1]!);
+    // First exchange succeeds → a working tab token.
+    const r1 = await fetch(`${broker.dashboardUrl!}/auth/exchange`, { method: 'POST', body: JSON.stringify({ nonce }) });
+    expect(r1.status).toBe(200);
+    const tk = (await r1.json() as { token: string }).token;
+    const authed = await fetch(`${broker.dashboardUrl!}/api/sessions`, { headers: { Authorization: `Bearer ${tk}` } });
+    expect(authed.status).toBe(200);
+    // The SAME nonce cannot be exchanged twice (single-use).
+    const r2 = await fetch(`${broker.dashboardUrl!}/auth/exchange`, { method: 'POST', body: JSON.stringify({ nonce }) });
+    expect(r2.status).toBe(401);
   });
 
   it('beta.4.1 messaging is UNCHANGED while the dashboard is live (send→inbox→ack→reply)', async () => {

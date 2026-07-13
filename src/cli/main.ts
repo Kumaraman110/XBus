@@ -100,6 +100,8 @@ function cmdRepair(): CliResult {
     nodePath: process.execPath,
     serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
     hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+    // Beta.5: repair re-applies the SessionStart handler too (fixes a drifted/missing one).
+    sessionStartHookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'session-start-hook.js'),
     dataDir: manifest.dataDir,
     installId: manifest.installId ?? `xbus-repair-${process.pid}`,
   });
@@ -322,7 +324,20 @@ async function cmdSend(to: string, text: string): Promise<CliResult> {
 async function cmdStart(): Promise<CliResult> {
   const dir = dataDir();
   // The host writes the identity-rich state file (ADR 0007) + enables IPC shutdown.
-  const broker = await startBrokerHost({ dataDir: dir, onStopped: () => process.exit(0) });
+  // Beta.5 (blocker #2): the PRODUCTION start path — the single funnel EVERY broker reaches
+  // (ensure.ts auto-start spawns `node dist/cli/main.js start`, and the manual CLI runs the
+  // same) — enables the control plane: the read-only localhost dashboard AND the metadata-only
+  // dormant import. Both are best-effort inside the host (a failure never fails broker start,
+  // I5), so turning them on here cannot regress messaging. Opt-OUT via env for constrained
+  // environments (headless CI that only needs messaging), never opt-in-for-tests.
+  const dashboardOff = process.env.XBUS_DASHBOARD === '0' || process.env.XBUS_NO_DASHBOARD === '1';
+  const importOff = process.env.XBUS_IMPORT_DORMANT === '0';
+  const broker = await startBrokerHost({
+    dataDir: dir,
+    onStopped: () => process.exit(0),
+    ...(dashboardOff ? {} : { dashboard: true }),
+    ...(importOff ? {} : { importDormantSessions: true }),
+  });
   // F-stopwait: AWAIT a clean stop (WAL checkpoint + state-file removal + db.close)
   // before exiting, so a slow stop never leaks a stale state file. A bounded
   // backstop timer guards against a stop that hangs.
@@ -337,9 +352,47 @@ async function cmdStart(): Promise<CliResult> {
   };
   process.on('SIGINT', () => { void gracefulExit(); });
   process.on('SIGTERM', () => { void gracefulExit(); });
-  process.stdout.write(`XBus broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\nPID: ${process.pid}\nPress Ctrl+C to stop.\n`);
+  const dashLine = broker.dashboardUrl ? `Dashboard: ${broker.dashboardUrl} (open with: xbus dashboard)\n` : '';
+  process.stdout.write(`XBus broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\n${dashLine}PID: ${process.pid}\nPress Ctrl+C to stop.\n`);
   await new Promise(() => {}); // run until killed
   return { human: '', json: {}, exitCode: 0 };
+}
+
+/**
+ * `xbus dashboard [--no-open]` (beta.5 blocker #3): mint a one-time browser-open URL from the
+ * RUNNING broker and open the default browser (unless --no-open). The nonce lives only in the
+ * URL fragment we hand the browser; it is NEVER printed, logged, or persisted — the CLI prints
+ * only the base dashboard URL. Requires a running broker with the dashboard enabled (the
+ * production start path enables it; start one with `xbus start` if absent).
+ */
+async function cmdDashboard(noOpen: boolean): Promise<CliResult> {
+  let openUrl: string; let dashboardUrl: string; let available: boolean;
+  try {
+    const c = await connectAsAdmin();
+    const r = await c.request('ensure_dashboard', {});
+    c.close();
+    if (r.frameType === 'error') {
+      const p = r.payload as { code: XBusErrorCode; message: string };
+      return errorResult(new XBusError(p.code, p.message));
+    }
+    const p = r.payload as { available: boolean; openUrl?: string; dashboardUrl?: string };
+    available = p.available;
+    openUrl = p.openUrl ?? '';
+    dashboardUrl = p.dashboardUrl ?? '';
+  } catch {
+    return { human: `Dashboard unavailable: no broker reachable. Start one with: ${invocationHint('start')}`, json: { ok: false, reason: 'broker_unreachable' }, exitCode: 1 };
+  }
+  if (!available || !openUrl) {
+    return { human: `The running broker has no dashboard enabled (it may be running with XBUS_DASHBOARD=0). Restart with the dashboard enabled.`, json: { ok: false, reason: 'dashboard_disabled' }, exitCode: 1 };
+  }
+  if (noOpen) {
+    // Print the open-URL for a human to paste ONCE (it carries a single-use nonce). This is
+    // the explicit --no-open path; the nonce is consumed on first load and expires shortly.
+    return { human: `Dashboard: ${dashboardUrl}\nOne-time open link (single-use, expires in ~60s):\n  ${openUrl}`, json: { ok: true, dashboardUrl, opened: false }, exitCode: 0 };
+  }
+  const { BrowserOpener } = await import('../broker/dashboard/browser.js');
+  new BrowserOpener().forceOpen(openUrl); // explicit re-open bypasses debounce
+  return { human: `Opened the XBus dashboard in your default browser.\n  ${dashboardUrl}`, json: { ok: true, dashboardUrl, opened: true }, exitCode: 0 };
 }
 
 /**
@@ -413,6 +466,8 @@ export async function run(argv: string[]): Promise<void> {
         return emit(await cmdStart(), asJson);
       case 'stop':
         return emit(await cmdStop(), asJson);
+      case 'dashboard':
+        return emit(await cmdDashboard(args.includes('--no-open')), asJson);
       case 'pause':
       case 'resume':
       case 'dnd': {
@@ -517,7 +572,8 @@ export async function run(argv: string[]): Promise<void> {
           '  sessions                          list registered sessions',
           '  metrics                           body-free operational health/counters (admin)',
           '  send <recipient> <text>           send a message',
-          '  start | stop                      run / stop the broker',
+          '  start | stop                      run / stop the broker (start enables the dashboard)',
+          '  dashboard [--no-open]             open the control-plane dashboard in your browser',
           '  pause | resume                    suspend / resume automatic delivery',
           '  dnd [on|off]                      do-not-disturb toggle',
           '  block <alias> | unblock <alias>   block / unblock a peer alias',

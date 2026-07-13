@@ -150,6 +150,10 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
       dashboardUrl = dashboard.url;
       // Push live snapshots to open streams on every session-state mutation (off-loop read).
       daemon.onSessionStateChanged = () => dashboard!.notifyChange();
+      // Beta.5 (blocker #3): let the `xbus dashboard` CLI mint a one-time open-URL over IPC.
+      // mintOpenUrl() returns `${url}/#n=<nonce>` (nonce in fragment, single-use, short-TTL);
+      // it travels back on the encrypted IPC channel only — never logged/persisted.
+      daemon.dashboardUrlMinter = () => ({ url: dashboard!.mintOpenUrl(), dashboardUrl: dashboard!.url });
     } catch (e) {
       opts.log?.(`dashboard start failed (continuing without it): ${(e as Error).message}`);
       try { await dashboard?.stop(); } catch { /* ignore */ }

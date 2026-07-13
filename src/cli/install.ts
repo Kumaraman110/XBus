@@ -334,6 +334,9 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
         nodePath: opts.nodePath ?? process.execPath,
         serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        // Beta.5: SessionStart gets its OWN handler (control-plane visibility), distinct
+        // from the checkpoint hook-entry. Registered on the same transactional write.
+        sessionStartHookEntry: path.join(pluginDir, 'dist', 'channel', 'session-start-hook.js'),
         dataDir,
         installId,
       };
@@ -466,6 +469,9 @@ export function uninstall(opts: UninstallOptions = {}): UninstallResult {
         nodePath: process.execPath,
         serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        // Beta.5: include the SessionStart entry so uninstall removes THAT owned handler too
+        // (isXbusHookHandler matches any XBus entry; strip is installId-scoped).
+        sessionStartHookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'session-start-hook.js'),
         dataDir: manifest.dataDir,
         installId: manifest.installId,
       });

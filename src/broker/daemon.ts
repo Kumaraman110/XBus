@@ -240,6 +240,8 @@ export class BrokerDaemon {
           return this.onRegister(conn, frame);
         case 'announce_session':
           return this.onAnnounceSession(conn, frame);
+        case 'ensure_dashboard':
+          return this.onEnsureDashboard(conn, frame);
         case 'register_alias':
           return this.onRegisterAlias(conn, frame);
         case 'rename_session':
@@ -580,6 +582,24 @@ export class BrokerDaemon {
   /** Beta.5: set by the host when a dashboard is running — called after a session-state
    *  mutation (e.g. announce) so open dashboard streams get a fresh snapshot. Best-effort. */
   onSessionStateChanged?: () => void;
+
+  /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time
+   *  browser-open URL (nonce in the URL fragment) from the broker-owned DashboardServer.
+   *  Returns null when no dashboard is running. The URL carries a live single-use nonce, so
+   *  it is returned ONLY over the authenticated+encrypted IPC channel, never logged/persisted. */
+  dashboardUrlMinter?: () => { url: string; dashboardUrl: string } | null;
+
+  /**
+   * Mint a dashboard open-URL for an authenticated caller (the `xbus dashboard` CLI). Requires
+   * a registered connection (requireAuth); the URL's nonce is single-use + short-TTL and never
+   * leaves this encrypted channel. Returns {available:false} when no dashboard runs.
+   */
+  private onEnsureDashboard(conn: ServerConn, frame: Frame): void {
+    this.requireAuth(conn);
+    const minted = this.dashboardUrlMinter ? this.dashboardUrlMinter() : null;
+    if (!minted) { this.reply(conn, 'ensure_dashboard_ack', { available: false }, frame.requestId); return; }
+    this.reply(conn, 'ensure_dashboard_ack', { available: true, openUrl: minted.url, dashboardUrl: minted.dashboardUrl }, frame.requestId);
+  }
 
   /** Set the CALLER's own receive control (pause/resume/dnd/manual). */
   private onSetControl(conn: ServerConn, frame: Frame): void {

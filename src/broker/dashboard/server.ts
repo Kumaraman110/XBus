@@ -109,6 +109,18 @@ export class DashboardServer {
   }
   get url(): string { return `http://${this.host}:${this.port}`; }
 
+  /**
+   * PUBLIC controller entry (beta.5 blocker #3): mint a fresh one-time nonce and return the
+   * browser-open URL with the nonce in the URL FRAGMENT (`…/#n=<nonce>`). The fragment is
+   * never sent to the server / never logged / never in query params (ADR 0018 D2). This is
+   * the ONLY supported way to obtain an open-URL — the nonce store stays encapsulated (auth
+   * is private), so tests + the `xbus dashboard` CLI drive the SAME public path a user does,
+   * never a private field. Callers must NOT log the returned URL (it carries a live nonce).
+   */
+  mintOpenUrl(): string {
+    return `${this.url}/#n=${encodeURIComponent(this.auth.mintNonce())}`;
+  }
+
   async start(): Promise<void> {
     // ADR 0018 D1: refuse a non-loopback bind BEFORE listening (fail closed).
     if (!isLoopback(this.host)) throw new Error(`dashboard refuses non-loopback bind: ${this.host}`);

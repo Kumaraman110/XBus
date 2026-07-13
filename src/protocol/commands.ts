@@ -10,6 +10,7 @@ export type FrameType =
   | 'hello' | 'hello_ack'
   | 'register_session' | 'register_session_ack'
   | 'announce_session' | 'announce_session_ack'   // beta.5 Phase 1: proactive SessionStart lifecycle signal (visibility) — NOT a routing binding
+  | 'ensure_dashboard' | 'ensure_dashboard_ack'   // beta.5: mint a one-time dashboard open-URL (nonce in fragment) from the running broker
   | 'register_alias' | 'register_alias_ack'
   | 'rename_session' | 'rename_session_ack'   // beta.4: choose/change the human-readable session name (resolves pending_name)
   | 'heartbeat' | 'heartbeat_ack'

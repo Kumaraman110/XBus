@@ -33,8 +33,17 @@ import path from 'node:path';
 export const XBUS_OWNER_TAG = '_xbusOwner';
 /** Stable key the XBus MCP server is registered under. */
 export const XBUS_MCP_KEY = 'xbus';
-/** Lifecycle events XBus hooks into (the checkpoint legs). */
-export const XBUS_HOOK_EVENTS = ['UserPromptSubmit', 'Stop'] as const;
+/**
+ * Lifecycle events XBus hooks into, each with its OWN dedicated handler entry (beta.5):
+ *   - SessionStart              → session-start-hook.js  (control-plane VISIBILITY: announce
+ *                                  every new/resumed/cleared/compacted session; always exit 0)
+ *   - UserPromptSubmit / Stop   → hook-entry.js          (checkpoint message DELIVERY legs)
+ * Registering the WRONG entry on an event is a silent product break (e.g. SessionStart
+ * pointed at the checkpoint hook would never announce), so the entry is event-specific and
+ * the installer resolves each from the plugin's dist paths (see hookEntries()).
+ */
+export const XBUS_HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop'] as const;
+export type XbusHookEvent = (typeof XBUS_HOOK_EVENTS)[number];
 
 /** A single MCP server entry (Claude config shape; extra keys preserved). */
 export interface McpServerEntry {
@@ -65,7 +74,12 @@ export interface UserScopeOptions {
   settingsPath?: string;
   nodePath: string;
   serverEntry: string;
+  /** The checkpoint-delivery hook entry (UserPromptSubmit + Stop) — dist/channel/hook-entry.js. */
   hookEntry: string;
+  /** Beta.5: the SessionStart lifecycle hook entry — dist/channel/session-start-hook.js.
+   *  Optional for back-compat; when omitted, SessionStart is NOT registered (older callers),
+   *  but the installer always supplies it so every install wires session visibility. */
+  sessionStartHookEntry?: string;
   dataDir: string;
   installId: string;
   dryRun?: boolean;
@@ -148,15 +162,33 @@ function mcpEntryMateriallyEqual(cur: McpServerEntry, canonical: McpServerEntry)
     && JSON.stringify(cur.args) === JSON.stringify(canonical.args)
     && canonicalEnv(cur.env) === canonicalEnv(canonical.env);
 }
-/** Our canonical hook handler (EXEC form — no shell, paths passed literally). */
-function xbusHookHandler(o: UserScopeOptions): HookHandler {
-  return { type: 'command', command: o.nodePath, args: [o.hookEntry], [XBUS_OWNER_TAG]: o.installId };
+/**
+ * The dist entry each event's handler must invoke. SessionStart is only wired when the
+ * caller supplied `sessionStartHookEntry` (the installer always does); events with no
+ * resolved entry are skipped, so an older caller that omits it simply doesn't register
+ * SessionStart rather than misregistering it.
+ */
+function hookEntries(o: UserScopeOptions): Partial<Record<XbusHookEvent, string>> {
+  const m: Partial<Record<XbusHookEvent, string>> = { UserPromptSubmit: o.hookEntry, Stop: o.hookEntry };
+  if (o.sessionStartHookEntry) m.SessionStart = o.sessionStartHookEntry;
+  return m;
 }
-/** Is this hook handler ours (references our hook entry)? Exec form puts the entry
- *  in args[]; tolerate a legacy shell-form command string too. */
+/** All XBus-owned entry paths (for the "is this handler ours?" membership test). */
+function allXbusEntries(o: UserScopeOptions): string[] {
+  const s = new Set<string>([o.hookEntry]);
+  if (o.sessionStartHookEntry) s.add(o.sessionStartHookEntry);
+  return [...s];
+}
+/** Our canonical hook handler for a SPECIFIC event's entry (EXEC form — no shell). */
+function xbusHookHandlerFor(o: UserScopeOptions, entry: string): HookHandler {
+  return { type: 'command', command: o.nodePath, args: [entry], [XBUS_OWNER_TAG]: o.installId };
+}
+/** Is this hook handler ours (references ANY XBus entry — checkpoint OR session-start)?
+ *  Exec form puts the entry in args[]; tolerate a legacy shell-form command string too. */
 function isXbusHookHandler(h: HookHandler, o: UserScopeOptions): boolean {
-  if (Array.isArray(h.args) && h.args.some((a) => a === o.hookEntry)) return true;
-  return typeof h.command === 'string' && h.command.includes(o.hookEntry);
+  const entries = allXbusEntries(o);
+  if (Array.isArray(h.args) && h.args.some((a) => entries.includes(a as string))) return true;
+  return typeof h.command === 'string' && entries.some((e) => h.command.includes(e));
 }
 
 // ── transactional file helpers ──────────────────────────────────────────────
@@ -193,12 +225,16 @@ function applyMcp(cfg: ClaudeConfig, o: UserScopeOptions): ClaudeConfig {
 }
 function applyHooks(s: ClaudeSettings, o: UserScopeOptions): ClaudeSettings {
   const next: ClaudeSettings = { ...s, hooks: { ...(s.hooks ?? {}) } };
-  const handler = xbusHookHandler(o);
+  const entries = hookEntries(o);
   for (const ev of XBUS_HOOK_EVENTS) {
+    const entry = entries[ev];
+    if (entry === undefined) continue; // event we don't wire this install (e.g. SessionStart omitted)
+    // Preserve the user's OTHER handlers on this event; drop only prior XBus-owned ones, then
+    // append THIS event's dedicated handler (SessionStart → session-start-hook, else checkpoint).
     const groups = (next.hooks![ev] ?? [])
-      .map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h) => !isXbusHookHandler(h, o)) })) // drop prior ours
+      .map((g) => ({ ...g, hooks: (g.hooks ?? []).filter((h) => !isXbusHookHandler(h, o)) }))
       .filter((g) => g.hooks.length > 0);
-    groups.push({ hooks: [handler] });
+    groups.push({ hooks: [xbusHookHandlerFor(o, entry)] });
     next.hooks![ev] = groups;
   }
   return next;
@@ -254,9 +290,22 @@ function stripHooks(s: ClaudeSettings, o: UserScopeOptions, ownerToMatch: string
 function defaultValidateConfig(cfg: ClaudeConfig): { ok: boolean; detail: string } {
   return cfg.mcpServers?.[XBUS_MCP_KEY] ? { ok: true, detail: 'ok' } : { ok: false, detail: 'xbus mcp entry missing after write' };
 }
-function defaultValidateSettings(s: ClaudeSettings): { ok: boolean; detail: string } {
-  const ok = XBUS_HOOK_EVENTS.every((ev) => (s.hooks?.[ev] ?? []).some((g) => g.hooks.some((h) => h[XBUS_OWNER_TAG] !== undefined)));
-  return ok ? { ok: true, detail: 'ok' } : { ok: false, detail: 'xbus hooks missing after write' };
+/** Validate that every event we WIRE this install has an XBus-owned handler pointing at the
+ *  CORRECT entry (SessionStart → session-start-hook.js, UserPromptSubmit/Stop → hook-entry.js).
+ *  Events not wired this install (e.g. SessionStart when the caller omitted its entry) are not
+ *  required — but a wired event pointing at the WRONG entry fails validation. */
+function makeValidateSettings(o: UserScopeOptions): (s: ClaudeSettings) => { ok: boolean; detail: string } {
+  const entries = hookEntries(o);
+  return (s: ClaudeSettings) => {
+    for (const ev of XBUS_HOOK_EVENTS) {
+      const entry = entries[ev];
+      if (entry === undefined) continue;
+      const present = (s.hooks?.[ev] ?? []).some((g) => g.hooks.some((h) =>
+        h[XBUS_OWNER_TAG] !== undefined && Array.isArray(h.args) && h.args.includes(entry)));
+      if (!present) return { ok: false, detail: `xbus ${ev} handler missing/mispointed after write (expected ${entry})` };
+    }
+    return { ok: true, detail: 'ok' };
+  };
 }
 
 /** Register XBus into the user MCP config + settings (two files, transactional). */
@@ -274,7 +323,14 @@ export function registerUserScope(o: UserScopeOptions): RegisterResult {
   // hooks already present. Including env means a moved data dir (or node path) is NOT
   // mistaken for already-registered — it triggers a rewrite so the entry stays correct.
   const settingsCur = readClaudeSettings(settingsPath) ?? {};
-  const hooksPresent = XBUS_HOOK_EVENTS.every((ev) => (settingsCur.hooks?.[ev] ?? []).some((g) => g.hooks.some((h) => (h[XBUS_OWNER_TAG]) === o.installId && isXbusHookHandler(h, o))));
+  const wiredEntries = hookEntries(o);
+  // Idempotency: every event we WIRE this install already has OUR owned handler pointing at
+  // the correct entry. (Events we don't wire — e.g. SessionStart when its entry was omitted —
+  // are not required, so an older caller stays idempotent.)
+  const hooksPresent = (Object.keys(wiredEntries) as XbusHookEvent[]).every((ev) => {
+    const entry = wiredEntries[ev]!;
+    return (settingsCur.hooks?.[ev] ?? []).some((g) => g.hooks.some((h) => h[XBUS_OWNER_TAG] === o.installId && Array.isArray(h.args) && h.args.includes(entry)));
+  });
   if (cur && cur[XBUS_OWNER_TAG] === o.installId && mcpEntryMateriallyEqual(cur, canonical) && hooksPresent) {
     return { ok: true, dryRun: !!o.dryRun, alreadyRegistered: true };
   }
@@ -289,7 +345,7 @@ export function registerUserScope(o: UserScopeOptions): RegisterResult {
     if (!vCfg.ok) { rollbackTxn(cfgTxn); return { ok: false, dryRun: false, rolledBack: true, error: `mcp config validation failed: ${vCfg.detail}` }; }
 
     setTxn = backupAndWrite(settingsPath, applyHooks(settingsCur, o));
-    const vSet = (o.validateSettings ?? defaultValidateSettings)(readClaudeSettings(settingsPath) ?? {});
+    const vSet = (o.validateSettings ?? makeValidateSettings(o))(readClaudeSettings(settingsPath) ?? {});
     if (!vSet.ok) { rollbackTxn(setTxn); rollbackTxn(cfgTxn); return { ok: false, dryRun: false, rolledBack: true, error: `settings/hooks validation failed: ${vSet.detail}` }; }
 
     const result: RegisterResult = { ok: true, dryRun: false };
