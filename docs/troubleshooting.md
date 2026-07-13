@@ -78,6 +78,31 @@ The recorded migration text differs from this build's. This usually means a
 partially-applied or tampered store. Back up and inspect the data dir; do not
 force past it.
 
+### The dashboard didn't open / I want its URL again (beta.5)
+
+The dashboard opens automatically when the broker starts. To reopen or focus it, or to
+get its authenticated URL without opening a browser:
+
+```powershell
+node .\dist\cli\main.js dashboard            # open/focus in your default browser
+node .\dist\cli\main.js dashboard --no-open  # print a one-time open link (single-use, ~60s)
+```
+
+`xbus doctor` reports the dashboard line: `[ok] dashboard: reachable at http://127.0.0.1:<port>`.
+If it says `broker not running`, start Claude Code (or `xbus start`) first. If it says
+`broker running without a dashboard`, the broker was started with `XBUS_DASHBOARD=0` /
+`XBUS_NO_DASHBOARD=1` — restart it without those. The dashboard is **loopback-only**
+(`127.0.0.1`) and every data request is authenticated; the one-time nonce lives only in the
+URL fragment and is never logged, persisted, or written to the ledger.
+
+### `xbus doctor` says the SessionStart hook is not registered (beta.5)
+
+Plain `claude` announces each session via a user-scope `SessionStart` hook. If doctor shows
+`session_start_hook: SessionStart hook NOT registered`, run `node .\dist\cli\main.js repair`
+to re-wire the hooks (it preserves any unrelated hooks you configured). `audit_ledger` should
+read `chain intact`; a `CHAIN BROKEN at seq N` line means the audit history was tampered or
+truncated (message delivery is unaffected) — back up and inspect the data dir.
+
 ### Reset everything
 
 ```powershell
