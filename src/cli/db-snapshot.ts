@@ -10,13 +10,23 @@
  * before it is trusted.
  *
  * PREREQUISITE (ADR 0019 D4, enforced by the caller): the broker is STOPPED before a
- * snapshot/restore — we never snapshot a DB with a live writer. With no writer, copying
- * `<db>` + `<db>-wal` + `<db>-shm` together captures a consistent set (any committed WAL
- * frames are carried in the copied `-wal`; SQLite replays them on next open).
+ * snapshot/restore — we never snapshot a DB with a live writer.
+ *
+ * WINDOWS DURABILITY — truthful claim (blocker #4): we do NOT rely on atomically copying
+ * three files (`<db>`/`-wal`/`-shm`) as a consistent set (there is no cross-file atomic copy
+ * on Windows, and a crash mid-copy could mismatch them). Instead `checkpointMainDb()` runs,
+ * with the writer stopped, a `PRAGMA wal_checkpoint(TRUNCATE)` that folds ALL committed WAL
+ * frames into the main DB file and empties the `-wal`. The snapshot is then of a
+ * SELF-CONTAINED main DB (the `-wal`/`-shm`, if still present, are empty/rebuildable). Restore
+ * writes the main DB last and removes any live `-wal`/`-shm` so SQLite never replays a stale
+ * WAL over the restored DB. So the durability rests on: writer-stopped + checkpoint + a
+ * digest-verified main-DB copy — NOT on multi-file atomicity. Crash-point tests prove restore
+ * yields either the pre- or post-restore main DB, never a mismatched mix.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { openDatabase } from '../database/connection.js';
 
 const SIDECAR_SUFFIXES = ['', '-wal', '-shm'] as const;
 
@@ -41,11 +51,46 @@ function fsyncDir(dir: string): void {
 }
 
 /**
+ * Fold all committed WAL frames into the main DB (writer MUST be stopped — caller's
+ * responsibility). `wal_checkpoint(TRUNCATE)` checkpoints then truncates the `-wal` to zero,
+ * so afterwards the main DB is self-contained. Best-effort + honest: returns whether the
+ * checkpoint fully completed (`busy=0`), so the caller can decide (we still snapshot the
+ * sidecars as a belt-and-braces set even if a checkpoint couldn't fully complete). Never
+ * throws — a checkpoint failure degrades to the file-set copy, it does not abort the snapshot.
+ */
+export function checkpointMainDb(dbPath: string): { ok: boolean; detail: string } {
+  if (!fs.existsSync(dbPath)) return { ok: true, detail: 'no db' };
+  let db: ReturnType<typeof openDatabase> | null = null;
+  try {
+    db = openDatabase(dbPath, { applyPragmas: true }); // writer handle; writer is stopped
+    const row = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number } | undefined;
+    // busy=0 means the checkpoint obtained the needed lock + completed (no other connection).
+    const ok = !row || (row.busy ?? 0) === 0;
+    return { ok, detail: ok ? 'checkpoint complete' : 'checkpoint busy (another handle open?)' };
+  } catch (e) {
+    return { ok: false, detail: `checkpoint failed: ${(e as Error).message}` };
+  } finally {
+    if (db) { try { db.close(); } catch { /* ignore */ } }
+  }
+}
+
+/**
+ * CHECKPOINT then snapshot (the truthful-durability path, blocker #4). Requires the writer
+ * stopped. Checkpoints committed WAL frames into the main DB so the snapshot's main-DB file
+ * is self-contained, then snapshots via snapshotDb. Returns the manifest (null if no DB).
+ */
+export function snapshotDbCheckpointed(dbPath: string, backupDir: string, nowMs: number): SnapshotManifest | null {
+  checkpointMainDb(dbPath); // best-effort; snapshotDb still copies whatever sidecars remain
+  return snapshotDb(dbPath, backupDir, nowMs);
+}
+
+/**
  * Snapshot `<dbPath>` (+ `-wal`/`-shm` if present) into `backupDir`. Copies to temp names,
  * fsyncs, then atomically renames each into place, and writes a manifest with a sha256 +
  * size per file so `restoreDbSnapshot` can VERIFY the archive before trusting it. Returns
  * the manifest. If the DB file itself is absent (fresh install — nothing to protect),
- * returns null and writes nothing.
+ * returns null and writes nothing. Prefer snapshotDbCheckpointed() so the main-DB file is
+ * self-contained; this raw form is kept for callers that already checkpointed.
  */
 export function snapshotDb(dbPath: string, backupDir: string, nowMs: number): SnapshotManifest | null {
   if (!fs.existsSync(dbPath)) return null; // fresh install: no live DB to snapshot
@@ -114,26 +159,25 @@ export function restoreDbSnapshot(backupDir: string): { ok: boolean; detail: str
   if (!v.ok) return { ok: false, detail: `snapshot verify failed: ${v.detail}` };
 
   const dbPath = manifest.dbPath;
-  const snapshottedSuffixes = new Set(manifest.files.map((f) => f.suffix));
+  const mainEntry = manifest.files.find((f) => f.suffix === '');
+  if (!mainEntry) return { ok: false, detail: 'snapshot has no main DB file' };
   try {
-    // 2) Drop current sidecars so a post-migration WAL is not replayed onto the old DB.
-    for (const suffix of ['-wal', '-shm']) {
-      const live = dbPath + suffix;
-      if (!snapshottedSuffixes.has(suffix) && fs.existsSync(live)) fs.rmSync(live, { force: true });
-    }
-    // 3) Restore archived files; main DB ('') LAST so a crash mid-restore never leaves a
-    //    new DB with a stale/absent WAL that SQLite would misread.
-    const ordered = [...manifest.files].sort((a, b) => (a.suffix === '' ? 1 : 0) - (b.suffix === '' ? 1 : 0));
-    for (const f of ordered) {
-      const archived = path.join(backupDir, path.basename(dbPath) + f.suffix);
-      const target = dbPath + f.suffix;
-      const tmp = `${target}.restore-tmp`;
-      fs.copyFileSync(archived, tmp);
-      fsyncFile(tmp);
-      fs.renameSync(tmp, target);
-    }
+    // MAIN-DB-AUTHORITATIVE restore (truthful Windows durability, blocker #4): the snapshot's
+    // main DB was checkpointed self-contained (snapshotDbCheckpointed), so we restore ONLY the
+    // main DB and REMOVE any live `-wal`/`-shm`. SQLite rebuilds the sidecars from the restored
+    // main DB on next open; a stale WAL is never replayed over it. This avoids depending on
+    // multi-file atomic copy (which Windows can't give). The main DB is written via a temp +
+    // atomic rename, so a crash leaves either the pre- or post-restore main DB — never a torn one.
+    const archivedMain = path.join(backupDir, path.basename(dbPath));
+    const tmp = `${dbPath}.restore-tmp`;
+    fs.copyFileSync(archivedMain, tmp);
+    fsyncFile(tmp);
+    // Remove live sidecars FIRST (they belong to the post-migration DB we're discarding),
+    // then atomic-rename the restored main DB into place.
+    for (const suffix of ['-wal', '-shm']) { const live = dbPath + suffix; if (fs.existsSync(live)) fs.rmSync(live, { force: true }); }
+    fs.renameSync(tmp, dbPath);
     fsyncDir(path.dirname(dbPath));
-    return { ok: true, detail: `restored ${manifest.files.length} file(s) from snapshot` };
+    return { ok: true, detail: 'restored main DB from checkpointed snapshot (sidecars rebuilt by SQLite on open)' };
   } catch (e) {
     return { ok: false, detail: `restore failed: ${(e as Error).message}` };
   }

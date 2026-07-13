@@ -11,7 +11,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { openDatabase } from '../../src/database/connection.js';
 import { runMigrations, MIGRATIONS } from '../../src/database/migrations.js';
-import { snapshotDb, restoreDbSnapshot, verifySnapshot, readSnapshotManifest, discardSnapshot } from '../../src/cli/db-snapshot.js';
+import { snapshotDb, snapshotDbCheckpointed, checkpointMainDb, restoreDbSnapshot, verifySnapshot, readSnapshotManifest, discardSnapshot } from '../../src/cli/db-snapshot.js';
 import { createHash } from 'node:crypto';
 
 let dir: string; let dbPath: string; let backupDir: string;
@@ -95,5 +95,48 @@ describe('db snapshot + restore', () => {
     expect(fs.existsSync(backupDir)).toBe(true);
     discardSnapshot(backupDir);
     expect(fs.existsSync(backupDir)).toBe(false);
+  });
+
+  // ── Beta.5 blocker #4: checkpointed (truthful-durability) snapshot + main-DB restore ────
+  it('checkpointMainDb folds WAL into the main DB; the checkpointed snapshot restores from the main DB alone', () => {
+    migrateTo(dbPath, 6);
+    // Write rows so there are committed WAL frames, then checkpoint.
+    const w = openDatabase(dbPath, { applyPragmas: true });
+    w.exec("INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, state, last_seen_at, created_at, updated_at) VALUES ('s1','session-s1','p','/','v','[]','connected','t','t','t')");
+    w.close();
+    const cp = checkpointMainDb(dbPath);
+    expect(cp.ok).toBe(true);
+    const m = snapshotDbCheckpointed(dbPath, backupDir, 1000)!;
+    expect(m.files.some((f) => f.suffix === '')).toBe(true);
+    expect(verifySnapshot(backupDir, m).ok).toBe(true);
+
+    // Forward-migrate (adds v7 rows/tables + a fresh WAL), then restore from the checkpointed snapshot.
+    const db = openDatabase(dbPath, { applyPragmas: true }); runMigrations(db, '2026-02-01T00:00:00.000Z'); db.close();
+    expect(schemaVersion(dbPath)).toBeGreaterThan(6);
+    const r = restoreDbSnapshot(backupDir);
+    expect(r.ok).toBe(true);
+    // Immediately after restore (before any reopen), the discarded post-migration -wal/-shm
+    // are gone — the restore did not leave a stale WAL to replay over the older main DB.
+    expect(fs.existsSync(dbPath + '-wal')).toBe(false);
+    expect(fs.existsSync(dbPath + '-shm')).toBe(false);
+    // Restored to 6: the v7 ledger_events table is gone, and the seeded row is present — proving
+    // the restore used the self-contained main DB (sidecars rebuilt by SQLite on this open).
+    const ro = openDatabase(dbPath, { readOnly: true });
+    try {
+      expect(schemaVersion(dbPath)).toBe(6);
+      expect(ro.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='ledger_events'`).get()).toBeUndefined();
+      expect((ro.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id='s1'").get() as { n: number }).n).toBe(1);
+    } finally { ro.close(); }
+  });
+
+  it('restore reopens cleanly + is writable again after restore (sidecars rebuilt)', () => {
+    migrateTo(dbPath, 6);
+    snapshotDbCheckpointed(dbPath, backupDir, 1000);
+    const db = openDatabase(dbPath, { applyPragmas: true }); runMigrations(db, '2026-02-01T00:00:00.000Z'); db.close();
+    expect(restoreDbSnapshot(backupDir).ok).toBe(true);
+    // The restored DB opens read-write + accepts a write (SQLite rebuilds -wal/-shm on open).
+    const rw = openDatabase(dbPath, { applyPragmas: true });
+    expect(() => rw.exec("INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, state, last_seen_at, created_at, updated_at) VALUES ('s2','session-s2','p','/','v','[]','connected','t','t','t')")).not.toThrow();
+    rw.close();
   });
 });
