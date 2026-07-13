@@ -187,7 +187,7 @@ function xbusHookHandlerFor(o: UserScopeOptions, entry: string): HookHandler {
  *  Exec form puts the entry in args[]; tolerate a legacy shell-form command string too. */
 function isXbusHookHandler(h: HookHandler, o: UserScopeOptions): boolean {
   const entries = allXbusEntries(o);
-  if (Array.isArray(h.args) && h.args.some((a) => entries.includes(a as string))) return true;
+  if (Array.isArray(h.args) && h.args.some((a) => typeof a === 'string' && entries.includes(a))) return true;
   return typeof h.command === 'string' && entries.some((e) => h.command.includes(e));
 }
 

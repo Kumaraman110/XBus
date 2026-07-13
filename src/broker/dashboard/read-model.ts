@@ -187,7 +187,7 @@ export class DashboardReadModel {
     const rawLimit = opts.limit;
     const wantLimit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 100;
     const limit = Math.min(Math.max(wantLimit, 1), 500);
-    const before = Number.isSafeInteger(opts.beforeSeq) && (opts.beforeSeq as number) > 0 ? opts.beforeSeq as number : null;
+    const before = typeof opts.beforeSeq === 'number' && Number.isSafeInteger(opts.beforeSeq) && opts.beforeSeq > 0 ? opts.beforeSeq : null;
     const rows = (before === null
       ? this.db.prepare(`SELECT seq, event_type AS eventType, actor, subject_json AS subjectJson, payload_json AS payloadJson, created_at AS createdAt, entry_hash AS entryHash FROM ledger_events ORDER BY seq DESC LIMIT ?`).all(limit)
       : this.db.prepare(`SELECT seq, event_type AS eventType, actor, subject_json AS subjectJson, payload_json AS payloadJson, created_at AS createdAt, entry_hash AS entryHash FROM ledger_events WHERE seq < ? ORDER BY seq DESC LIMIT ?`).all(before, limit)
@@ -222,11 +222,11 @@ export class DashboardReadModel {
     // LEDGER_VERIFIED audit_events row on startup + each periodic verify (no schema bump —
     // reuses the existing audit_events table), so the read worker reads the newest one for the
     // freshness stamp. Absent (pre-first-verify) → null.
-    let lastVerifiedAt: string | null = null;
+    let lastVerifiedAt: string | null;
     try {
       const row = this.db.prepare(`SELECT created_at AS at FROM audit_events WHERE event_type='LEDGER_VERIFIED' ORDER BY created_at DESC LIMIT 1`).get() as { at: string } | undefined;
       lastVerifiedAt = row?.at ?? null;
-    } catch { lastVerifiedAt = null; }
+    } catch { lastVerifiedAt = null; } // table absent (older DB / pre-first-verify) → null
     return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null, lastVerifiedAt };
   }
 }
