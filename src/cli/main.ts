@@ -19,9 +19,10 @@ import { errorResult, emit, formatSessions, formatSendResult, formatMetrics, inv
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../launcher/install-paths.js';
-import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
+import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, inspectUserScopeHooks } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
+import { dashboardAlive } from '../broker/dashboard/browser.js';
 
 /** This process's exact identity: prefer the packaged provenance.json next to the
  *  installed binaries (works with no git/source), else a labelled source identity.
@@ -211,6 +212,58 @@ async function cmdDoctor(): Promise<CliResult> {
   try { const { DatabaseSync } = await import('node:sqlite'); sqliteOk = typeof DatabaseSync === 'function'; sqliteDetail = sqliteOk ? 'node:sqlite available' : 'node:sqlite export missing'; }
   catch (e) { sqliteDetail = `node:sqlite import failed: ${(e as Error).message}`; }
   checks.push({ name: 'node_sqlite', ok: sqliteOk, detail: sqliteDetail });
+
+  // Beta.5: SessionStart (+ checkpoint) hooks registered at user scope. Reads the settings
+  // file XBus actually writes hooks to (~/.claude/settings.json); an XBus-OWNED SessionStart
+  // handler is what makes plain `claude` announce every session. Absent → informational when
+  // running uninstalled, but a FAIL when a plugin IS installed (a broken beta.5 install).
+  let sessionStartOk = true; let hooksDetail: string;
+  try {
+    const hk = inspectUserScopeHooks(defaultClaudeSettingsPath());
+    const ss = hk.events.SessionStart;
+    const missing = (['SessionStart', 'UserPromptSubmit', 'Stop'] as const).filter((e) => !hk.events[e].registered);
+    const installedNow = readInstallManifest(defaultInstallRoot()) !== null;
+    sessionStartOk = ss.registered && ss.owned ? true : !installedNow; // uninstalled → informational
+    hooksDetail = ss.registered
+      ? `SessionStart→${path.basename(ss.entry ?? '?')} (owned=${ss.owned})${missing.length ? `; missing: ${missing.join(',')}` : '; all 3 wired'}`
+      : installedNow ? 'SessionStart hook NOT registered (beta.5 session visibility inactive)' : 'no XBus hooks (running uninstalled / from source)';
+  } catch (e) { hooksDetail = `not checked: ${(e as Error).message}`; }
+  checks.push({ name: 'session_start_hook', ok: sessionStartOk, detail: hooksDetail });
+
+  // Beta.5: the loopback dashboard. When a broker is running it records dashboardUrl in the
+  // state file; probe /alive (bounded). Not running / no dashboard → informational, not a fail.
+  let dashOk = true; let dashDetail: string;
+  const dashUrl = state?.dashboardUrl;
+  if (brokerOk && dashUrl) {
+    const alive = await dashboardAlive(dashUrl, { timeoutMs: 1500 });
+    dashOk = alive;
+    dashDetail = alive ? `reachable at ${dashUrl}` : `state file advertises ${dashUrl} but /alive did not answer`;
+  } else if (brokerOk && !dashUrl) {
+    dashDetail = 'broker running without a dashboard (start advertises XBUS_NO_DASHBOARD?)';
+  } else {
+    dashDetail = 'broker not running (dashboard starts with the broker)';
+  }
+  checks.push({ name: 'dashboard', ok: dashOk, detail: dashDetail });
+
+  // Beta.5 blocker #7: audit-ledger chain health. Verify the hash chain over a PHYSICALLY
+  // read-only handle (never mutates, never blocks delivery). A broken chain is reported
+  // honestly as a failure with the first broken seq; an absent DB is informational.
+  let auditOk = true; let auditDetail: string;
+  try {
+    const dbPath = path.join(dir, 'xbus.sqlite');
+    if (fs.existsSync(dbPath)) {
+      const { openDatabase } = await import('../database/connection.js');
+      const { verifyLedger } = await import('../broker/ledger.js');
+      const rdb = openDatabase(dbPath, { readOnly: true });
+      try {
+        const v = verifyLedger(rdb);
+        auditOk = v.ok;
+        auditDetail = v.ok ? `chain intact (${v.checked} entries verified)` : `CHAIN BROKEN at seq ${v.firstBreak?.seq ?? '?'} (${v.checked} checked; delivery unaffected, audit history compromised)`;
+      } finally { try { rdb.close(); } catch { /* ignore */ } }
+    } else { auditDetail = 'no database yet (fresh install / broker never started)'; }
+  } catch (e) { auditDetail = `not checked: ${(e as Error).message}`; }
+  checks.push({ name: 'audit_ledger', ok: auditOk, detail: auditDetail });
+
   // If XBus is installed, validate the installed plugin against the SAME
   // normative contract the packager + installer use (consume one contract, not
   // ad-hoc lists). Absent install → informational, not a failure.

@@ -388,3 +388,33 @@ export function repairUserScope(o: UserScopeOptions): RepairResult {
   if (!r.ok) return { ok: false, repaired: false, ...(r.error ? { error: r.error } : {}) };
   return { ok: true, repaired: !r.alreadyRegistered };
 }
+
+/** Read-only view of the XBus lifecycle hooks currently registered in a settings file.
+ *  For each event, reports whether an XBus-OWNED handler (tagged `_xbusOwner`) is present
+ *  and, if so, which dist entry it invokes. Used by `doctor` to prove the beta.5 SessionStart
+ *  (and checkpoint) hooks are wired without mutating anything. Missing file → all absent. */
+export function inspectUserScopeHooks(settingsPath: string): {
+  settingsPath: string;
+  events: Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
+} {
+  const s = readClaudeSettings(settingsPath);
+  const out = {} as Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
+  for (const ev of XBUS_HOOK_EVENTS) {
+    const groups = s?.hooks?.[ev] ?? [];
+    let entry: string | null = null;
+    let owned = false;
+    for (const g of groups) {
+      for (const h of g.hooks ?? []) {
+        const isOwned = typeof (h as Record<string, unknown>)[XBUS_OWNER_TAG] === 'string';
+        // Prefer an owned handler; capture its dist entry from the exec-form args.
+        if (isOwned) {
+          owned = true;
+          if (Array.isArray(h.args) && typeof h.args[0] === 'string') entry = h.args[0];
+          else if (typeof h.command === 'string') entry = h.command;
+        }
+      }
+    }
+    out[ev] = { registered: entry !== null, entry, owned };
+  }
+  return { settingsPath, events: out };
+}
