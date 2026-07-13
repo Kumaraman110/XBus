@@ -22,6 +22,18 @@ delete process.env.CLAUDE_CODE_SESSION_ID;
 delete process.env.CLAUDE_CONFIG_DIR;
 process.env.XBUS_ALLOW_UNSUPPORTED_NODE = '1';
 
+// (6) Skip the Windows icacls hardening SUBPROCESS by default in the dev suite. On a host
+// whose AV/EDR intercepts every process spawn, each icacls costs ~1.5-2s, so broker-heavy
+// files spend minutes purely in ACL subprocesses. The functional behavior under test is
+// identical; only the OS-permission side effect differs, and it is asserted ONLY in the
+// security shard — where windows-acl.test.ts and the 'root secret lifecycle' describe
+// force this flag back OFF to prove the REAL ACL with real icacls. verify:release sets it
+// per-shard explicitly (security='0', all others='1'), so this default only affects a bare
+// `vitest`/`npm test`. Respect an explicit outer value (e.g. a shard set it) — don't clobber.
+if (process.env.XBUS_SKIP_ACL_HARDENING === undefined) {
+  process.env.XBUS_SKIP_ACL_HARDENING = '1';
+}
+
 // (4) Pin the legacy-data-root to an isolated EMPTY dir so NO test ever scans or
 // migrates the developer's real ~/.claude/xbus (which would hang on a locked live DB
 // or silently mutate real data). A test that wants to exercise migration sets its own
