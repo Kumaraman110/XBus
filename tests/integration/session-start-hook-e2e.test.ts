@@ -112,3 +112,58 @@ describe('SessionStart hook E2E — real entrypoint, all five lifecycle paths', 
     expect(r).toBe(0);
   }, 60_000);
 });
+
+/**
+ * COLD-START regression (the bug the pre-started-broker suite above cannot catch): the FIRST
+ * SessionStart hook against an EMPTY data dir must itself auto-start the broker AND land its
+ * own announce. This exercises `ensureBrokerDefault`'s real backoff wait — where an `unref()`'d
+ * sleep timer let the short-lived hook process exit 0 mid-wait (empty ref'd event loop) and
+ * silently drop the first session (no error, hook still exited 0). A ref'd sleep keeps the hook
+ * alive to finish the announce. This describe does NOT pre-start a broker — the hook does.
+ */
+describe('SessionStart hook E2E — COLD start (hook boots the broker + lands its own announce)', () => {
+  let coldDir: string;
+  beforeEach(() => { coldDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-sshcold-')); ensureDataDir(coldDir); });
+  afterEach(async () => {
+    // Stop whatever broker the hook started, then remove the dir.
+    try {
+      const { defaultEndpoint } = await import('../../src/ipc/transport.js');
+      const { IpcClient } = await import('../../src/ipc/client.js');
+      const { loadOrCreateRootSecret } = await import('../../src/ipc/root-secret.js');
+      const c = new IpcClient(defaultEndpoint(coldDir), { requestTimeoutMs: 2000, rootSecret: loadOrCreateRootSecret(coldDir), helloIdentity: { claimedRole: 'admin' } });
+      await c.connect(); await c.request('shutdown', {}); c.close();
+    } catch { /* broker may already be gone */ }
+    await new Promise((r) => setTimeout(r, 500));
+    try { fs.rmSync(coldDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  function runColdHook(input: Record<string, unknown>): Promise<{ code: number; stderr: string }> {
+    return new Promise((resolve) => {
+      const child = execFile(process.execPath, [HOOK], {
+        env: { ...process.env, XBUS_DATA_DIR: coldDir, XBUS_ALLOW_UNSUPPORTED_NODE: '1', XBUS_SKIP_ACL_HARDENING: '1', CLAUDE_CODE_SESSION_ID: '' },
+        timeout: 30_000,
+      }, (err, _o, stderr) => resolve({ code: err && typeof (err as { code?: number }).code === 'number' ? (err as { code: number }).code : 0, stderr: stderr ?? '' }));
+      child.stdin!.end(JSON.stringify(input));
+    });
+  }
+
+  it('the FIRST hook against an empty data dir starts the broker AND records its own SESSION_STARTED', async () => {
+    const SID = '71000000-0000-4000-8000-0000000000c1';
+    const cwd = path.join(coldDir, 'wd'); fs.mkdirSync(cwd, { recursive: true });
+    const r = await runColdHook({ hook_event_name: 'SessionStart', session_id: SID, source: 'startup', cwd });
+    expect(r.code, `cold hook stderr: ${r.stderr}`).toBe(0);
+    // The hook must have booted a broker (state file) AND its own announce must be persisted.
+    const state = readStateFile(coldDir);
+    expect(state, 'the cold hook did not start a broker').not.toBeNull();
+    const dbPath = path.join(coldDir, 'xbus.sqlite');
+    const db = openDatabase(dbPath, { readOnly: true });
+    try {
+      const events = (db.prepare(`SELECT event_type FROM ledger_events WHERE subject_json LIKE ? ORDER BY seq`).all(`%${SID}%`) as Array<{ event_type: string }>).map((x) => x.event_type);
+      // The regression: this array was EMPTY before the fix (announce dropped when the hook
+      // exited mid-wait). It must now contain the session's own STARTED event.
+      expect(events, 'first cold-start announce was dropped (ensure.ts realSleep must be ref\'d)').toEqual(['SESSION_STARTED']);
+      const active = (db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE session_id=? AND management_state='active'`).get(SID) as { n: number }).n;
+      expect(active).toBe(1);
+    } finally { db.close(); }
+  }, 120_000);
+});

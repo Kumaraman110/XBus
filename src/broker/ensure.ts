@@ -237,7 +237,16 @@ async function verifyCompatibleDefault(endpoint: string, dataDir: string): Promi
   }
 }
 
-const realSleep = (ms: number): Promise<void> => new Promise((r) => { const t = setTimeout(r, ms); if (typeof t.unref === 'function') t.unref(); });
+// The backoff sleep between reachability probes MUST be a REF'd timer. `ensureBroker` is
+// awaited by SHORT-LIVED callers (the SessionStart hook, the CLI) whose only pending
+// event-loop handle during a COLD start is this sleep — `spawnDetachedBroker` already
+// `unref()`s the broker child it spawns. An UNREF'd sleep here let Node see an empty ref'd
+// loop and EXIT 0 mid-await, silently abandoning the ensureBroker promise before the
+// announce ran (reproduced: the first SessionStart after a cold broker start was dropped
+// with no error). A ref'd timer keeps the caller alive to finish the wait; the loop's own
+// `deadline` (handshakeTimeoutMs) still bounds it, so it can never hang. On a warm broker
+// the first probe succeeds and this timer never arms.
+const realSleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms); });
 
 /**
  * Production ensureBroker: wires the real probe / singleton / detached-spawn /
