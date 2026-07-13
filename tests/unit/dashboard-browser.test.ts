@@ -4,7 +4,7 @@
  * port is touched.
  */
 import { describe, it, expect } from 'vitest';
-import { BrowserOpener, dashboardAlive } from '../../src/broker/dashboard/browser.js';
+import { BrowserOpener, dashboardAlive, defaultOpen } from '../../src/broker/dashboard/browser.js';
 
 describe('BrowserOpener — debounce + no-tab-storm', () => {
   it('openIfIdle opens once, then suppresses within the debounce window (four-session burst → 1 tab)', () => {
@@ -39,6 +39,24 @@ describe('BrowserOpener — debounce + no-tab-storm', () => {
     // we wrap here — the PRODUCTION defaultOpen swallows spawn errors (asserted structurally
     // by its try/catch). Confirm forceOpen/openIfIdle don't add their own throw path.
     expect(() => { try { b.forceOpen('u'); } catch { /* injected fn threw; real defaultOpen catches */ } }).not.toThrow();
+  });
+});
+
+describe('defaultOpen — never crashes the process (D1)', () => {
+  it('returns synchronously without throwing even for an unusual url (async spawn error is caught)', async () => {
+    // defaultOpen spawns the platform launcher; a missing binary emits an ASYNC 'error'
+    // event which the fix swallows via c.on('error'). We can't force ENOENT deterministically
+    // cross-platform, but we CAN prove: (a) the call returns synchronously without throwing,
+    // and (b) no unhandledRejection/uncaughtException fires on the async tick after it.
+    let asyncCrash: unknown = null;
+    const onUnhandled = (e: unknown) => { asyncCrash = e; };
+    process.once('uncaughtException', onUnhandled);
+    process.once('unhandledRejection', onUnhandled);
+    expect(() => defaultOpen('http://127.0.0.1:0/#n=x')).not.toThrow();
+    await new Promise((r) => setTimeout(r, 200)); // let any async 'error' fire
+    process.removeListener('uncaughtException', onUnhandled);
+    process.removeListener('unhandledRejection', onUnhandled);
+    expect(asyncCrash).toBeNull();
   });
 });
 

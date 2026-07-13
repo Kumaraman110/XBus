@@ -152,7 +152,13 @@ export class WorkerReadExecutor implements ReadExecutor {
       this.worker = null;
     };
     w.on('error', () => fail('read worker crashed'));
-    w.on('exit', (code) => { if (code !== 0) fail(`read worker exited ${code}`); });
+    // ANY exit while this is the current generation drops the dead worker + rejects its
+    // pending calls (D3): a code-0 exit is still a dead thread — leaving this.worker pointing
+    // at it would make ensure() hand out a corpse and force every later read to time out.
+    // (In normal operation the worker never exits on its own — the parentPort listener keeps
+    // it alive — so this only fires on an unexpected exit; close() bumps the generation first,
+    // so an intentional terminate() is ignored here.)
+    w.on('exit', (code) => fail(`read worker exited ${code}`));
     this.worker = w;
     return { worker: w, generation: g };
   }

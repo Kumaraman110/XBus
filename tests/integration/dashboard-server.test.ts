@@ -226,6 +226,34 @@ describe('dashboard server — stream + broadcast + overload bounds', () => {
     } finally { await s.stop(); }
   });
 
+  it('broadcast recovers after a SYNCHRONOUS reader throw (does not wedge live updates) — D2', async () => {
+    // A reader whose run('sessions') THROWS synchronously on the first call, then works.
+    let throwOnce = true;
+    const calls: string[] = [];
+    const reader: ReadExecutor = {
+      run: (method) => { calls.push(method); if (method === 'sessions' && throwOnce) { throwOnce = false; throw new Error('sync spawn failure'); } return Promise.resolve(method === 'sessions' ? [{ ok: 1 }] : { events: [] }); },
+      close: () => Promise.resolve(),
+    };
+    const auth2 = new DashboardAuth(new FakeClock());
+    const s = new DashboardServer({ auth: auth2, reader });
+    await s.start();
+    try {
+      const t = await getTokenFor(s, auth2);
+      const c = new AbortController();
+      // Open a stream (its initial read throws sync — must not wedge). Then a notifyChange
+      // must still broadcast a snapshot (broadcasting flag was reset despite the throw).
+      const streamRes = await fetch(`${s.url}/api/stream`, { headers: { Authorization: `Bearer ${t}` }, signal: c.signal });
+      const rdr = streamRes.body!.getReader();
+      await new Promise((r) => setTimeout(r, 20));
+      s.notifyChange(); // first broadcast may hit the sync-throw; flag must reset
+      s.notifyChange(); // this one must succeed and reach the stream
+      const { value } = await rdr.read();
+      const line = new TextDecoder().decode(value).split('\n').find((l) => l.trim())!;
+      expect(JSON.parse(line).type).toBe('sessions'); // live updates NOT wedged
+      c.abort();
+    } finally { await s.stop(); }
+  });
+
   it('a ReadOverloadedError from the reader → 503 overloaded with Retry-After', async () => {
     const { reader } = countingReader({ overload: true });
     const auth2 = new DashboardAuth(new FakeClock());

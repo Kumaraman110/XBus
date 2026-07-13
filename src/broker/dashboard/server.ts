@@ -276,13 +276,21 @@ export class DashboardServer {
     if (this.streams.size === 0) return;
     if (this.broadcasting) { this.broadcastPending = true; return; }
     this.broadcasting = true;
-    void this.reader.run('sessions').then((sessions) => {
-      const line = JSON.stringify({ type: 'sessions', sessions }) + '\n';
-      for (const res of this.streams) { if (!res.writableEnded) { try { res.write(line); } catch { /* per-stream write failure; cleanup on close */ } } }
-    }).catch(() => { /* skip this tick */ }).finally(() => {
+    const done = (): void => {
       this.broadcasting = false;
       if (this.broadcastPending) { this.broadcastPending = false; this.broadcast(); }
-    });
+    };
+    // reader.run() can throw SYNCHRONOUSLY (a worker respawn failure inside ensure()), which
+    // would escape BEFORE .finally attaches and leave `broadcasting` wedged true forever —
+    // permanently disabling live updates. Wrap in try/catch so the flag is ALWAYS reset, then
+    // coalesce via .finally on the async path. (D2 fix.)
+    let p: Promise<unknown>;
+    try { p = this.reader.run('sessions'); }
+    catch { done(); return; }
+    void p.then((sessions) => {
+      const line = JSON.stringify({ type: 'sessions', sessions }) + '\n';
+      for (const res of this.streams) { if (!res.writableEnded) { try { res.write(line); } catch { /* per-stream write failure; cleanup on close */ } } }
+    }).catch(() => { /* skip this tick */ }).finally(done);
   }
 
   /** Notify all open streams that state changed (broker calls this after a mutation) — one

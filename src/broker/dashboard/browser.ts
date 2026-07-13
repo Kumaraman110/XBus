@@ -19,20 +19,20 @@ export type OpenFn = (url: string) => void;
 /** Default per-platform open. Detached + stdio-ignored so it never blocks the broker. */
 export function defaultOpen(url: string): void {
   const plat = process.platform;
+  const [cmd, args]: [string, string[]] = plat === 'win32'
+    // `cmd /c start "" <url>` — the empty title arg is required so a quoted URL isn't treated
+    // as the window title.
+    ? ['cmd', ['/c', 'start', '', url]]
+    : plat === 'darwin' ? ['open', [url]] : ['xdg-open', [url]];
   try {
-    if (plat === 'win32') {
-      // `cmd /c start "" <url>` — the empty title arg is required so a quoted URL isn't
-      // treated as the window title. windowsHide keeps no console flashing.
-      const c = realSpawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true });
-      c.unref();
-    } else if (plat === 'darwin') {
-      const c = realSpawn('open', [url], { detached: true, stdio: 'ignore' });
-      c.unref();
-    } else {
-      const c = realSpawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
-      c.unref();
-    }
-  } catch { /* best-effort: a browser-open failure must never affect the broker */ }
+    const c = realSpawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+    // CRITICAL: a missing launcher binary (e.g. headless Linux with no xdg-open) does NOT
+    // throw synchronously — spawn emits an ASYNC 'error' event, and a ChildProcess with no
+    // 'error' listener throws on emit → an uncaught exception that would crash the broker/CLI.
+    // Attach a no-op listener so a launch failure stays best-effort ("never affects the broker").
+    c.on('error', () => { /* browser-open failed (binary missing / not permitted) — ignore */ });
+    c.unref();
+  } catch { /* best-effort: a synchronous spawn failure must never affect the broker either */ }
 }
 
 export interface BrowserOpenerConfig {
