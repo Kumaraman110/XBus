@@ -20,6 +20,7 @@ import { defaultEndpoint } from '../../src/ipc/transport.js';
 import { doHello } from '../../src/ipc/hello.js';
 import { ComponentRole } from '../../src/identity/components.js';
 import { readStateFile } from '../../src/broker/state-file.js';
+import { verifyLedger } from '../../src/broker/ledger.js';
 
 let dataDir: string; let broker: RunningBroker; let endpoint: string; let rootSecret: Buffer;
 
@@ -120,4 +121,68 @@ describe('control plane E2E — announce → ledger → authenticated dashboard'
     await scan; // the concurrent dashboard read completed independently
     A.close(); B.close();
   });
+
+  it('FOUR-REPLICA directed matrix delivers correctly UNDER concurrent dashboard load (reads never disturb delivery)', async () => {
+    // Four sessions (replicas) sharing the one broker + the live dashboard. Each sends a
+    // directed message to the next in a ring (r0→r1→r2→r3→r0) while a pathological dashboard
+    // read load (repeated full ledger + sessions scans) hammers the off-loop worker. Every
+    // message must deliver + ack + reply correctly, the broker instance must be unchanged
+    // throughout, and the hash chain must stay valid — proving the Q5 "dashboard cannot
+    // destabilize delivery" guarantee at multi-session scale, not just a 2-party round-trip.
+    const ids = ['40404040-4040-4040-8040-000000000001', '40404040-4040-4040-8040-000000000002', '40404040-4040-4040-8040-000000000003', '40404040-4040-4040-8040-000000000004'];
+    const aliases = ['rep0', 'rep1', 'rep2', 'rep3'];
+    const clients = await Promise.all(ids.map((id, i) => mcpClient(id, aliases[i]!)));
+    const instanceBefore = broker.brokerInstanceId;
+    const tk = await token();
+    const url = broker.dashboardUrl!;
+
+    // Background pathological dashboard load: keep scanning the full ledger + all sessions
+    // for the duration of the matrix. A flag stops it once the matrix completes.
+    let loadRunning = true;
+    let scans = 0;
+    const loadLoop = (async () => {
+      while (loadRunning) {
+        await Promise.all([
+          fetch(`${url}/api/ledger?limit=500`, { headers: { Authorization: `Bearer ${tk}` } }).then((r) => r.arrayBuffer()),
+          fetch(`${url}/api/sessions`, { headers: { Authorization: `Bearer ${tk}` } }).then((r) => r.arrayBuffer()),
+        ]);
+        scans += 1;
+      }
+    })();
+
+    // Directed ring matrix: each replica sends to the next; the recipient acks + replies.
+    for (let i = 0; i < clients.length; i++) {
+      const sender = clients[i]!;
+      const recipientAlias = aliases[(i + 1) % clients.length]!;
+      const recipient = clients[(i + 1) % clients.length]!;
+      const nonce = `MATRIX-${i}`;
+      const s = await sender.request('send_message', { to: recipientAlias, text: `ring ${nonce}`, requiresAck: true, requiresReply: true });
+      expect(s.frameType, `send ${i}→${recipientAlias}`).toBe('send_message_ack');
+      const inb = await recipient.request('inbox', { limit: 10 });
+      const m = (inb.payload as { messages: Array<{ messageId: string; text: string; injectionId: string }> }).messages.find((x) => x.text.includes(nonce));
+      expect(m, `recipient ${recipientAlias} received ${nonce}`).toBeTruthy();
+      const ack = await recipient.request('ack_message', { messageId: m!.messageId, status: 'accepted', injectionId: m!.injectionId });
+      expect((ack.payload as { state: string }).state).toBe('accepted');
+      const reply = await recipient.request('reply_message', { messageId: m!.messageId, text: `ack ${nonce}`, outcome: 'completed', injectionId: m!.injectionId });
+      expect(reply.frameType).toBe('reply_message_ack');
+      // The original sender receives the correlated reply.
+      const back = await sender.request('inbox', { limit: 10 });
+      expect((back.payload as { messages: Array<{ text: string }> }).messages.some((x) => x.text === `ack ${nonce}`)).toBe(true);
+    }
+
+    loadRunning = false;
+    await loadLoop;
+    expect(scans, 'the dashboard was under real concurrent read load').toBeGreaterThan(0);
+
+    // One broker throughout; every matrix message delivered (12 deliveries: 4 requests + 4
+    // replies is 8, plus acks are receipts not deliveries) — assert all 4 requests completed.
+    expect(broker.brokerInstanceId).toBe(instanceBefore);
+    const completed = (broker.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE state='completed'`).get() as { n: number }).n;
+    expect(completed).toBeGreaterThanOrEqual(4);
+    // Hash chain still valid after all the concurrent activity.
+    const v = verifyLedger(broker.db);
+    expect(v.ok).toBe(true);
+
+    for (const c of clients) c.close();
+  }, 60_000);
 });
