@@ -128,7 +128,12 @@ export class DashboardReadModel {
    * pages backward. Bodies are never present (the ledger stores ids/states/hashes only).
    */
   ledger(opts: { beforeSeq?: number; limit?: number } = {}): LedgerPage {
-    const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 100), 1), 500);
+    // Clamp to [1, 500]. A non-numeric/NaN limit (e.g. `?limit=abc` → Number('abc')=NaN)
+    // must fall back to the default 100, not propagate NaN through Math.min/max into the
+    // bind — so guard NaN explicitly before clamping.
+    const rawLimit = opts.limit;
+    const wantLimit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 100;
+    const limit = Math.min(Math.max(wantLimit, 1), 500);
     const before = Number.isSafeInteger(opts.beforeSeq) && (opts.beforeSeq as number) > 0 ? opts.beforeSeq as number : null;
     const rows = (before === null
       ? this.db.prepare(`SELECT seq, event_type AS eventType, actor, subject_json AS subjectJson, payload_json AS payloadJson, created_at AS createdAt, entry_hash AS entryHash FROM ledger_events ORDER BY seq DESC LIMIT ?`).all(limit)

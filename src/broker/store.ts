@@ -532,14 +532,28 @@ export class BrokerStore {
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
       const row = this.db
-        .prepare('SELECT active_epoch AS epoch, management_state AS mgmt, first_seen_at AS firstSeen, agent_type AS agentType FROM sessions WHERE session_id=?')
-        .get(auth.sessionId) as { epoch: number; mgmt: string; firstSeen: string | null; agentType: string | null } | undefined;
+        .prepare('SELECT active_epoch AS epoch, management_state AS mgmt, expired_at AS expiredAt FROM sessions WHERE session_id=?')
+        .get(auth.sessionId) as { epoch: number; mgmt: string; expiredAt: string | null } | undefined;
       if (!row) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
 
       const source = normalizeLifecycleSource(input.source);
       const lifecycleEvent = LIFECYCLE_EVENT_BY_SOURCE[source];
       const priorManagementState = row.mgmt;
-      const isFirstAnnounce = row.firstSeen === null;
+
+      // TOMBSTONE GUARD (ADR 0012 D6): an announce must NEVER revive an EXPIRED session.
+      // Resurrection is the exclusive job of the register/rename fresh-lifecycle paths,
+      // which clear expired_at + advance the epoch (no message resurrection). The normal
+      // hook re-registers BEFORE announcing, so a genuinely-resumed session already has
+      // expired_at cleared by the time we get here. If we still see a tombstone (e.g. a
+      // long-lived connection that idled 15d on heartbeats then announced without
+      // re-registering), do NOT flip management_state to 'active' and do NOT append a
+      // lifecycle event claiming the session is active — that would create the
+      // unroutable-yet-active anti-pattern the register/rename paths defend against.
+      // Honest no-op: the session stays expired until a real re-register resurrects it.
+      if (row.expiredAt !== null) {
+        this.audit('SESSION_ANNOUNCE_SKIPPED_EXPIRED', { sessionId: auth.sessionId, source, epoch: row.epoch });
+        return { managementState: priorManagementState, priorManagementState, source, lifecycleEvent, epoch: row.epoch, appended: false };
+      }
 
       // Idempotent visibility update. management_state → 'active' (a live SessionStart
       // signal is the highest-confidence identification); a dormant/unmanaged row is thus
@@ -550,15 +564,26 @@ export class BrokerStore {
         .prepare(
           `UPDATE sessions SET management_state='active', source_last=?, identify_confidence='signal',
              transcript_path=COALESCE(?, transcript_path), agent_type=COALESCE(agent_type, ?),
+             cwd=COALESCE(?, cwd),
              first_seen_at=COALESCE(first_seen_at, ?), last_seen_source_at=?, updated_at=? WHERE session_id=?`,
         )
-        .run(source, input.transcriptPath ?? null, input.agentType ?? null, now, now, now, auth.sessionId);
+        .run(source, input.transcriptPath ?? null, input.agentType ?? null, input.cwd ?? null, now, now, now, auth.sessionId);
 
       this.audit('SESSION_ANNOUNCED', { sessionId: auth.sessionId, source, epoch: row.epoch, priorManagementState });
 
-      // Exactly one ledger event per genuine lifecycle signal. A repeated `startup` for an
-      // already-seen session is a meaningless second birth → deduped (state-only re-stamp).
-      const appended = !(source === 'startup' && !isFirstAnnounce);
+      // Exactly one ledger event per genuine lifecycle signal. Dedup a `startup` ONLY when a
+      // SESSION_STARTED has ALREADY been recorded for THIS session (a meaningless second
+      // birth) — keyed on the actual ledger history, NOT on first_seen_at (which is also set
+      // by import + by a first resume/clear/compact, so a first_seen_at test would wrongly
+      // suppress a genuine post-import/post-resume `startup`). resume/clear/compact always
+      // append — that repeatable lifecycle history is exactly what the audit ledger keeps.
+      let appended = true;
+      if (source === 'startup') {
+        const priorStart = this.db
+          .prepare(`SELECT 1 FROM ledger_events WHERE event_type='SESSION_STARTED' AND subject_json=? LIMIT 1`)
+          .get(JSON.stringify({ sessionId: auth.sessionId }));
+        if (priorStart) appended = false;
+      }
       if (appended) {
         this.ledger(lifecycleEvent, auth.sessionId, { sessionId: auth.sessionId }, {
           source, epoch: row.epoch, managementState: 'active', priorManagementState, confidence: 'signal',

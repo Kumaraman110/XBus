@@ -77,6 +77,48 @@ describe('announceSession — lifecycle + ledger coupling', () => {
     expect(row.identify_confidence).toBe('signal'); // upgraded from listing_only by the live signal
   });
 
+  // Adversarial-review fix #1: dedup must be keyed on the LEDGER (was: first_seen_at, which
+  // import + a first resume/clear/compact also set → a genuine post-import/post-resume
+  // `startup` was wrongly suppressed).
+  it('a genuine startup AFTER a dormant import still appends SESSION_STARTED (dedup keyed on ledger, not first_seen_at)', () => {
+    const sid = 'aaaa0007-0000-4000-8000-000000000007';
+    const auth = regHook(sid);
+    // Dormant import stamps first_seen_at + a SESSION_IMPORTED event (no SESSION_STARTED).
+    db.prepare(`UPDATE sessions SET management_state='dormant', identify_confidence='listing_only', first_seen_at=? WHERE session_id=?`).run(clock.nowIso(), sid);
+    store['ledger']('SESSION_IMPORTED', 'installer', { sessionId: sid }, { source: 'import' }); // mimic import event
+    // A genuine startup must NOT be deduped just because first_seen_at is set.
+    const r = store.announceSession(auth, { source: 'startup' });
+    expect(r.appended).toBe(true);
+    expect(ledgerTypes(sid)).toContain('SESSION_STARTED');
+    // A SECOND startup for the same session IS deduped (a SESSION_STARTED now exists).
+    expect(store.announceSession(auth, { source: 'startup' }).appended).toBe(false);
+    expect(ledgerTypes(sid).filter((t) => t === 'SESSION_STARTED')).toHaveLength(1);
+  });
+
+  it('a startup whose FIRST announce was a resume still records SESSION_STARTED', () => {
+    const sid = 'aaaa0008-0000-4000-8000-000000000008';
+    const auth = regHook(sid);
+    store.announceSession(auth, { source: 'resume' });  // first announce is resume (sets first_seen_at)
+    const r = store.announceSession(auth, { source: 'startup' });
+    expect(r.appended).toBe(true); // NOT suppressed — no SESSION_STARTED existed yet
+    expect(ledgerTypes(sid)).toEqual(['SESSION_RESUMED', 'SESSION_STARTED']);
+  });
+
+  // Adversarial-review fix #2: announce must NOT revive an EXPIRED (tombstoned) session.
+  it('an announce on an expired-but-not-re-registered session is a no-op (no tombstone revival)', () => {
+    const sid = 'aaaa0009-0000-4000-8000-000000000009';
+    const auth = regHook(sid);
+    store.announceSession(auth, { source: 'startup' });
+    // Simulate the reaper tombstoning the row while the connection stayed alive (no re-register).
+    db.prepare(`UPDATE sessions SET expired_at=?, management_state='active' WHERE session_id=?`).run(clock.nowIso(), sid);
+    const before = ledgerTypes(sid).length;
+    const r = store.announceSession(auth, { source: 'resume' });
+    expect(r.appended).toBe(false); // no lifecycle event claiming active
+    // expired_at NOT cleared (revival is register/rename's job, not announce's).
+    expect((db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(sid) as { expired_at: string | null }).expired_at).not.toBeNull();
+    expect(ledgerTypes(sid).length).toBe(before); // no new ledger event
+  });
+
   it('EXPIRED session resume announce → fresh epoch, tombstone cleared, NO message resurrection', () => {
     const recipient = 'aaaa0004-0000-4000-8000-000000000004';
     const sender = 'aaaa0005-0000-4000-8000-000000000005';
