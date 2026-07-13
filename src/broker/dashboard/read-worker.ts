@@ -92,6 +92,9 @@ export interface WorkerLike {
   on(event: 'error', cb: (e: Error) => void): void;
   on(event: 'exit', cb: (code: number) => void): void;
   terminate(): Promise<number> | void;
+  /** Real worker_threads expose unref(); the default factory calls it so the worker never
+   *  holds the event loop open on its own. Optional so a test fake need not implement it. */
+  unref?(): void;
 }
 
 export interface WorkerReadExecutorOpts {
@@ -127,7 +130,15 @@ export class WorkerReadExecutor implements ReadExecutor {
   constructor(private readonly dbPath: string, opts: WorkerReadExecutorOpts = {}) {
     this.timeoutMs = opts.requestTimeoutMs ?? 5000;
     this.maxInFlight = opts.maxInFlight ?? 64;
-    this.spawnWorker = opts.spawnWorker ?? ((dbPath) => new Worker(workerEntryPath(), { workerData: { dbPath } }));
+    this.spawnWorker = opts.spawnWorker ?? ((dbPath) => {
+      const w = new Worker(workerEntryPath(), { workerData: { dbPath } });
+      // UNREF the worker thread so it never by itself holds the parent's event loop open.
+      // The broker drives the worker; the worker must not keep a process (or a vitest run)
+      // alive after everything else has finished. It is still explicitly terminated on
+      // close()/timeout/replace. (Without this, an un-close()'d executor wedges process exit.)
+      if (typeof w.unref === 'function') w.unref();
+      return w;
+    });
   }
 
   private ensure(): { worker: WorkerLike; generation: number } {
