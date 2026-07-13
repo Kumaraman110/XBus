@@ -57,6 +57,10 @@ function onExpired() {
 function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function cell(row, value) { const td = document.createElement('td'); td.appendChild(text(value)); row.appendChild(td); return td; }
 
+function msgCell(m, who) {
+  if (!m) return '—';
+  return `${m[who]} · ${m.state} · ${m.at.slice(11, 19)}`;
+}
 function renderSessions(sessions) {
   const body = document.getElementById('sessions-body');
   body.replaceChildren();
@@ -70,12 +74,25 @@ function renderSessions(sessions) {
     label.appendChild(badge);
     r.appendChild(label);
     cell(r, s.label);
-    cell(r, s.source || '—');
-    cell(r, s.identifyConfidence);
+    cell(r, `${s.connection}/${s.readiness}`);
+    cell(r, msgCell(s.lastSent, 'to'));
+    cell(r, msgCell(s.lastReceived, 'from'));
+    const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
+    cell(r, `${d.queued}/${d.delivered}/${d.acknowledged}/${d.replied}/${d.failed}`);
     cell(r, s.project);
-    cell(r, s.queued);
-    cell(r, s.unacknowledged);
     body.appendChild(r);
+  }
+}
+
+function renderAudit(a) {
+  const el = document.getElementById('audit');
+  if (!a) { el.textContent = ''; el.className = 'audit'; return; }
+  if (a.ok) {
+    el.className = 'audit audit-ok';
+    el.textContent = `Audit ledger: chain OK (${a.checked} events verified${a.lastVerifiedAt ? ', last broker verify ' + a.lastVerifiedAt.slice(0, 19) : ''}).`;
+  } else {
+    el.className = 'audit audit-broken';
+    el.textContent = `Audit ledger: CHAIN BROKEN at seq ${a.firstBreakSeq}. Historical audit integrity is compromised — routing/delivery are unaffected, but investigate the ledger.`;
   }
 }
 
@@ -105,14 +122,16 @@ function renderBanner(banner) {
 }
 
 async function refresh() {
-  const [{ sessions }, ledger, banner] = await Promise.all([
+  const [{ sessions }, ledger, banner, audit] = await Promise.all([
     api('/api/sessions'),
     api('/api/ledger?limit=100'),
     api('/api/unmanaged').catch(() => null),
+    api('/api/audit').catch(() => null),
   ]);
   renderSessions(sessions);
   renderLedger(ledger.events || []);
   if (banner) renderBanner(banner);
+  renderAudit(audit);
   setStatus('Connected · ' + sessions.length + ' session(s)', 'ok');
 }
 

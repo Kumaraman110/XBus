@@ -174,3 +174,69 @@ async function getTokenFor(s: DashboardServer, a: DashboardAuth): Promise<string
   const res = await fetch(`${s.url}/auth/exchange`, { method: 'POST', body: JSON.stringify({ nonce }) });
   return (await res.json() as { token: string }).token;
 }
+
+// ── Beta.5 blocker #5: server-side stream/broadcast/overload bounds ─────────────
+describe('dashboard server — stream + broadcast + overload bounds', () => {
+  /** A reader that COUNTS calls per method + can be made to reject (overload sim). */
+  function countingReader(behavior: { overload?: boolean } = {}): { reader: ReadExecutor; calls: Record<string, number> } {
+    const calls: Record<string, number> = {};
+    const reader: ReadExecutor = {
+      run: (method) => { calls[method] = (calls[method] ?? 0) + 1; return behavior.overload ? Promise.reject(Object.assign(new Error('overloaded'), { name: 'ReadOverloadedError' })) : Promise.resolve(method === 'sessions' ? [] : { events: [] }); },
+      close: () => Promise.resolve(),
+    };
+    return { reader, calls };
+  }
+
+  it('notifyChange does ONE coalesced sessions read fanned out to ALL open streams (not one per stream)', async () => {
+    const { reader, calls } = countingReader();
+    const auth2 = new DashboardAuth(new FakeClock());
+    const s = new DashboardServer({ auth: auth2, reader });
+    await s.start();
+    try {
+      // Open 3 authenticated streams. Each does ONE initial read on open.
+      const tokens = await Promise.all([0, 1, 2].map(() => getTokenFor(s, auth2)));
+      const controllers = tokens.map(() => new AbortController());
+      await Promise.all(tokens.map((t, i) => fetch(`${s.url}/api/stream`, { headers: { Authorization: `Bearer ${t}` }, signal: controllers[i]!.signal }).then((r) => r.body!.getReader().read())));
+      const afterOpen = calls['sessions'] ?? 0;
+      expect(afterOpen).toBeGreaterThanOrEqual(3); // 3 initial per-stream snapshots
+      // A single mutation → notifyChange → ONE more sessions read total (coalesced), not +3.
+      s.notifyChange();
+      await new Promise((r) => setTimeout(r, 50));
+      expect((calls['sessions'] ?? 0) - afterOpen).toBe(1);
+      for (const c of controllers) c.abort();
+    } finally { await s.stop(); }
+  });
+
+  it('the authenticated stream count is CAPPED (maxStreams) → 503 beyond it', async () => {
+    const { reader } = countingReader();
+    const auth2 = new DashboardAuth(new FakeClock());
+    const s = new DashboardServer({ auth: auth2, reader, maxStreams: 2 });
+    await s.start();
+    try {
+      const ctrls: AbortController[] = [];
+      const open = async () => { const t = await getTokenFor(s, auth2); const c = new AbortController(); ctrls.push(c); return fetch(`${s.url}/api/stream`, { headers: { Authorization: `Bearer ${t}` }, signal: c.signal }); };
+      const r1 = await open(); const r2 = await open();
+      expect(r1.status).toBe(200); expect(r2.status).toBe(200);
+      void r1.body!.getReader().read(); void r2.body!.getReader().read();
+      await new Promise((r) => setTimeout(r, 20));
+      const r3 = await open(); // 3rd exceeds the cap
+      expect(r3.status).toBe(503);
+      expect((await r3.json() as { error: string }).error).toBe('too_many_streams');
+      for (const c of ctrls) c.abort();
+    } finally { await s.stop(); }
+  });
+
+  it('a ReadOverloadedError from the reader → 503 overloaded with Retry-After', async () => {
+    const { reader } = countingReader({ overload: true });
+    const auth2 = new DashboardAuth(new FakeClock());
+    const s = new DashboardServer({ auth: auth2, reader });
+    await s.start();
+    try {
+      const t = await getTokenFor(s, auth2);
+      const res = await fetch(`${s.url}/api/sessions`, { headers: { Authorization: `Bearer ${t}` } });
+      expect(res.status).toBe(503);
+      expect(res.headers.get('retry-after')).toBe('1');
+      expect((await res.json() as { error: string }).error).toBe('overloaded');
+    } finally { await s.stop(); }
+  });
+});

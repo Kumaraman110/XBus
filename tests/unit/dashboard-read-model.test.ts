@@ -86,4 +86,51 @@ describe('read-only handle + read model over a live DB', () => {
     // p2's seqs are strictly below p1's smallest.
     expect(Math.max(...p2.events.map((e) => e.seq))).toBeLessThan(p1.nextBeforeSeq!);
   });
+
+  // ── Beta.5 blocker #6: complete session visibility (last sent/received + delivery) ──────
+  it('exposes last message sent/received + delivery breakdown per session (bounded queries)', () => {
+    const A = 'dddd0003-0000-4000-8000-00000000000a';
+    const B = 'dddd0004-0000-4000-8000-00000000000b';
+    const aAuth = store.register({ sessionId: A, instanceId: 'ia', connectionId: 'ca', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    store.signalReadiness(aAuth, { ackAvailable: true, versionOk: true }); store.registerAlias(aAuth, 'archer');
+    const bAuth = store.register({ sessionId: B, instanceId: 'ib', connectionId: 'cb', processId: 2, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    store.signalReadiness(bAuth, { ackAvailable: true, versionOk: true }); store.registerAlias(bAuth, 'builder');
+    // A → B (two messages).
+    store.send(aAuth, { to: 'builder', text: 'first', kind: 'request', requiresAck: true, requiresReply: false });
+    clock.advance(1000);
+    store.send(aAuth, { to: 'builder', text: 'second', kind: 'request', requiresAck: true, requiresReply: false });
+    const model = new DashboardReadModel(ro);
+    const byId = new Map(model.sessions().map((s) => [s.sessionId, s]));
+    const a = byId.get(A)!; const b = byId.get(B)!;
+    // A's LAST SENT is to builder (the newest of its two sends).
+    expect(a.lastSent).not.toBeNull();
+    expect(a.lastSent!.to).toBe('builder');
+    expect(a.lastReceived).toBeNull(); // A received nothing
+    // B's LAST RECEIVED is from A (archer); B queued 2 deliveries.
+    expect(b.lastReceived).not.toBeNull();
+    expect(b.lastReceived!.from).toBe('archer');
+    expect(b.delivery.queued).toBe(2);
+    expect(b.delivery.acknowledged).toBe(0);
+    // B exposes connection + readiness.
+    expect(b.connection).toBe('connected');
+    expect(['ready_checkpoint', 'ready_live', 'initializing']).toContain(b.readiness);
+  });
+
+  // ── Beta.5 blocker #7: audit status (chain health + freshness) ──────────────────────────
+  it('auditStatus reports ok on a good chain, and localizes a break without masking it', () => {
+    const auth = store.register({ sessionId: 'dddd0005-0000-4000-8000-00000000000c', instanceId: 'i', connectionId: 'c', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    store.announceSession(auth, { source: 'startup' });
+    const model = new DashboardReadModel(ro);
+    const okStatus = model.auditStatus();
+    expect(okStatus.ok).toBe(true);
+    expect(okStatus.checked).toBeGreaterThanOrEqual(1);
+    expect(okStatus.firstBreakSeq).toBeNull();
+    // Tamper a ledger row out-of-band (drop/restore the update trigger) → status reports the break.
+    writer.exec('DROP TRIGGER ledger_no_update');
+    writer.prepare("UPDATE ledger_events SET payload_json='{\"x\":1}' WHERE seq=1").run();
+    writer.exec("CREATE TRIGGER ledger_no_update BEFORE UPDATE ON ledger_events BEGIN SELECT RAISE(ABORT,'ledger_events is append-only'); END");
+    const broken = model.auditStatus();
+    expect(broken.ok).toBe(false); // NOT masked
+    expect(broken.firstBreakSeq).toBe(1);
+  });
 });

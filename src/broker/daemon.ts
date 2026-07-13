@@ -23,6 +23,7 @@ import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../ide
 import { checkCompatibility, brokerHelloInfo, SCHEMA_VERSION, BUILD_ID, type HelloInfo } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, type Provenance } from '../shared/build-identity.js';
 import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../observability/metrics.js';
+import { verifyLedger } from './ledger.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
 import { TrustedEvidenceRegistry } from '../adapter-broker/trusted-evidence.js';
 import type { AwardedSupport } from '../adapter/evidence.js';
@@ -37,6 +38,9 @@ export interface DaemonOptions {
   /** Reaper sweep interval (ms). 0 disables the periodic timer (tests drive it
    *  explicitly via runReaperSweep). Default 30s. */
   reaperIntervalMs?: number;
+  /** Beta.5 blocker #7: audit-ledger verify interval (ms). 0 disables the periodic timer
+   *  (tests drive verifyLedgerNow explicitly). Default 1h. Startup verify always runs. */
+  ledgerVerifyIntervalMs?: number;
   /** IPC transport resource bounds (§3). Passed through to the IpcServer. */
   maxConnections?: number;
   idleTimeoutMs?: number;
@@ -56,6 +60,10 @@ export class BrokerDaemon {
   private readonly metrics: BrokerMetrics;
   private reaperTimer: NodeJS.Timeout | null = null;
   private readonly reaperIntervalMs: number;
+  private ledgerVerifyTimer: NodeJS.Timeout | null = null;
+  /** Beta.5 blocker #7: ledger-verify interval (ms). 0 disables the timer (tests drive it).
+   *  Default 1h (ADR 0020 Q4 tamper-detection latency bound). */
+  private readonly ledgerVerifyIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
   /** In-memory awarded support per connection (adapter-aware registrations only; never persisted).
@@ -107,6 +115,7 @@ export class BrokerDaemon {
     // the EXACT build id (this.identity.buildId) — provenance, not the compat tuple.
     this.metrics = new BrokerMetrics(brokerInstanceId, this.identity.buildId, SCHEMA_VERSION, opts.rootSecret !== undefined, () => clock.nowMs());
     this.reaperIntervalMs = opts.reaperIntervalMs ?? 30_000;
+    this.ledgerVerifyIntervalMs = opts.ledgerVerifyIntervalMs ?? 60 * 60_000;
     this.authSecret = opts.authSecret;
     this.rootSecret = opts.rootSecret;
     this.serverTuning = {
@@ -138,6 +147,38 @@ export class BrokerDaemon {
       }, this.reaperIntervalMs);
       if (typeof this.reaperTimer.unref === 'function') this.reaperTimer.unref();
     }
+    // Beta.5 blocker #7: audit-ledger verification on STARTUP + on a periodic interval, so
+    // an out-of-band tamper / bit-rot is caught within at most one interval (ADR 0020 Q4),
+    // not "next restart". A broken chain is LOGGED + recorded (LEDGER_CHAIN_BROKEN) but does
+    // NOT block delivery (the ledger is a projection). Records a LEDGER_VERIFIED audit row so
+    // the dashboard shows a freshness stamp. Best-effort — never throws into start().
+    this.verifyLedgerNow();
+    if (this.ledgerVerifyIntervalMs > 0) {
+      this.ledgerVerifyTimer = setInterval(() => this.verifyLedgerNow(), this.ledgerVerifyIntervalMs);
+      if (typeof this.ledgerVerifyTimer.unref === 'function') this.ledgerVerifyTimer.unref();
+    }
+  }
+
+  /**
+   * Verify the audit-ledger hash chain now (blocker #7). Records the outcome as a
+   * LEDGER_VERIFIED audit row (freshness stamp for the dashboard); on a break, logs +
+   * records LEDGER_CHAIN_BROKEN with the first bad seq. NEVER throws (verification failing
+   * must not crash the broker) and NEVER blocks delivery (the chain is a projection).
+   * Returns the verify result for tests/doctor.
+   */
+  verifyLedgerNow(): { ok: boolean; checked: number; firstBreakSeq: number | null } {
+    try {
+      const v = verifyLedger(this.db);
+      this.audit('LEDGER_VERIFIED', { ok: v.ok, checked: v.checked, ...(v.firstBreak ? { firstBreakSeq: v.firstBreak.seq } : {}) });
+      if (!v.ok) {
+        this.log(`AUDIT LEDGER CHAIN BROKEN at seq ${v.firstBreak?.seq ?? '?'} (delivery unaffected; audit history compromised)`);
+        this.audit('LEDGER_CHAIN_BROKEN', { firstBreakSeq: v.firstBreak?.seq ?? null });
+      }
+      return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null };
+    } catch (e) {
+      this.log(`ledger verify failed: ${(e as Error).message}`);
+      return { ok: false, checked: 0, firstBreakSeq: null };
+    }
   }
 
   /** Explicit reaper sweep — used by tests (with a FakeClock) and by `xbus doctor`.
@@ -152,6 +193,7 @@ export class BrokerDaemon {
 
   async stop(): Promise<void> {
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    if (this.ledgerVerifyTimer) { clearInterval(this.ledgerVerifyTimer); this.ledgerVerifyTimer = null; }
     await this.ipc?.close();
   }
 

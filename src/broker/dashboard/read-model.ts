@@ -11,6 +11,7 @@
  * and cannot stall delivery.
  */
 import type { SqliteDriver } from '../../database/connection.js';
+import { verifyLedger } from '../ledger.js';
 
 /** The dashboard-visible label for a session, derived top-down, first-match-wins from the
  *  FOUR real fields (ADR 0020 Q2 decision table). */
@@ -55,10 +56,19 @@ export interface DashboardSession {
   identifyConfidence: string;
   agentType: string | null;
   project: string;
+  connection: string;   // sessions.state {connected,disconnected}
+  readiness: string;    // readiness enum
   firstSeenAt: string | null;
   lastSeenSourceAt: string | null;
+  /** Delivery-state breakdown for messages addressed TO this session (blocker #6). */
+  delivery: { queued: number; delivered: number; acknowledged: number; replied: number; failed: number };
+  /** legacy fields kept for existing consumers/tests. */
   queued: number;
   unacknowledged: number;
+  /** Last message this session SENT (recipient + when + delivery state), or null. */
+  lastSent: { to: string; at: string; state: string } | null;
+  /** Last message this session RECEIVED (sender + when + delivery state), or null. */
+  lastReceived: { from: string; at: string; state: string } | null;
 }
 
 export interface UnmanagedBanner {
@@ -90,6 +100,36 @@ export class DashboardReadModel {
               first_seen_at AS firstSeenAt, last_seen_source_at AS lastSeenSourceAt
          FROM sessions ORDER BY COALESCE(first_seen_at, created_at) DESC`,
     ).all() as Array<Record<string, unknown>>;
+
+    // BOUNDED aggregates (blocker #6): a FIXED number of set-wide GROUP BY queries, NOT one
+    // query per session (no N+1). Each is backed by an existing index:
+    //  - delivery breakdown by (recipient, state)  → idx_deliveries_recipient (recipient, state)
+    //  - last message SENT per sender / RECEIVED per recipient → idx_msg_recipient + a max-created
+    //    correlated pick, computed once over the whole messages table and folded into maps.
+    const deliveryByState = new Map<string, Record<string, number>>();
+    for (const d of this.db.prepare(`SELECT recipient_session_id AS sid, state, COUNT(*) AS n FROM deliveries GROUP BY recipient_session_id, state`).all() as Array<{ sid: string; state: string; n: number }>) {
+      const m = deliveryByState.get(d.sid) ?? {}; m[d.state] = d.n; deliveryByState.set(d.sid, m);
+    }
+    // Last SENT per sender: the newest message row per sender_session_id, joined to its delivery
+    // state. `NOT EXISTS a newer row for the same sender` picks exactly the latest (index-assisted).
+    const lastSent = new Map<string, { to: string; at: string; state: string }>();
+    for (const m of this.db.prepare(
+      `SELECT m.sender_session_id AS sid, m.recipient_alias AS peer, m.created_at AS at, COALESCE(d.state,'queued') AS state
+         FROM messages m LEFT JOIN deliveries d ON d.message_id = m.message_id
+        WHERE NOT EXISTS (SELECT 1 FROM messages m2 WHERE m2.sender_session_id = m.sender_session_id AND (m2.created_at > m.created_at OR (m2.created_at = m.created_at AND m2.message_id > m.message_id)))`,
+    ).all() as Array<{ sid: string; peer: string; at: string; state: string }>) {
+      lastSent.set(m.sid, { to: m.peer, at: m.at, state: m.state });
+    }
+    // Last RECEIVED per recipient: newest message per recipient_session_id + its delivery state.
+    const lastReceived = new Map<string, { from: string; at: string; state: string }>();
+    for (const m of this.db.prepare(
+      `SELECT m.recipient_session_id AS sid, m.sender_alias AS peer, m.created_at AS at, COALESCE(d.state,'queued') AS state
+         FROM messages m LEFT JOIN deliveries d ON d.message_id = m.message_id
+        WHERE NOT EXISTS (SELECT 1 FROM messages m2 WHERE m2.recipient_session_id = m.recipient_session_id AND (m2.created_at > m.created_at OR (m2.created_at = m.created_at AND m2.message_id > m.message_id)))`,
+    ).all() as Array<{ sid: string; peer: string; at: string; state: string }>) {
+      lastReceived.set(m.sid, { from: m.peer, at: m.at, state: m.state });
+    }
+
     return rows.map((r) => {
       const sid = r.sessionId as string;
       const { label, routable } = deriveSessionLabel({
@@ -98,8 +138,15 @@ export class DashboardReadModel {
         readiness: (r.readiness as string) ?? 'disconnected',
         expiredAt: (r.expiredAt as string | null) ?? null,
       });
-      const queued = (this.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=? AND state IN ('queued','retry_wait')`).get(sid) as { n: number }).n;
-      const unacked = (this.db.prepare(`SELECT COUNT(*) AS n FROM deliveries WHERE recipient_session_id=? AND state='transport_written'`).get(sid) as { n: number }).n;
+      const st = deliveryByState.get(sid) ?? {};
+      // Map raw delivery states → the user-facing breakdown (queued/delivered/acked/replied/failed).
+      const delivery = {
+        queued: (st['queued'] ?? 0) + (st['retry_wait'] ?? 0),
+        delivered: st['transport_written'] ?? 0,
+        acknowledged: st['accepted'] ?? 0,
+        replied: st['completed'] ?? 0,
+        failed: (st['dead_letter'] ?? 0) + (st['rejected'] ?? 0) + (st['expired'] ?? 0),
+      };
       return {
         sessionId: sid,
         name: (r.name as string | null) ?? null,
@@ -110,9 +157,15 @@ export class DashboardReadModel {
         identifyConfidence: (r.conf as string) ?? 'signal',
         agentType: (r.agentType as string | null) ?? null,
         project: (r.projectAlias as string) ?? (r.projectId as string) ?? 'unknown',
+        connection: (r.connState as string) ?? 'disconnected',
+        readiness: (r.readiness as string) ?? 'disconnected',
         firstSeenAt: (r.firstSeenAt as string | null) ?? null,
         lastSeenSourceAt: (r.lastSeenSourceAt as string | null) ?? null,
-        queued, unacknowledged: unacked,
+        delivery,
+        queued: delivery.queued,
+        unacknowledged: delivery.delivered,
+        lastSent: lastSent.get(sid) ?? null,
+        lastReceived: lastReceived.get(sid) ?? null,
       };
     });
   }
@@ -154,6 +207,27 @@ export class DashboardReadModel {
   unmanagedBanner(): UnmanagedBanner {
     const managedOrDormant = (this.db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE management_state IN ('active','dormant') AND expired_at IS NULL`).get() as { n: number }).n;
     return { possibleUnmanaged: 0, managedOrDormant };
+  }
+
+  /**
+   * Audit-ledger chain health (blocker #7). Runs verifyLedger over the read-only handle and
+   * reports {ok, checked, firstBreak?}. `lastVerifiedAt` is the broker's most recent periodic/
+   * startup verify (read from `ledger_verify_state`), so the dashboard shows a freshness stamp;
+   * a broken historical chain is reported HONESTLY (ok:false + firstBreak) — never masked. This
+   * is a read of already-committed rows, off the broker loop (worker), so it never blocks delivery.
+   */
+  auditStatus(): { ok: boolean; checked: number; firstBreakSeq: number | null; lastVerifiedAt: string | null } {
+    const v = verifyLedger(this.db);
+    // `lastVerifiedAt` = the broker's most recent recorded verify. The broker writes a
+    // LEDGER_VERIFIED audit_events row on startup + each periodic verify (no schema bump —
+    // reuses the existing audit_events table), so the read worker reads the newest one for the
+    // freshness stamp. Absent (pre-first-verify) → null.
+    let lastVerifiedAt: string | null = null;
+    try {
+      const row = this.db.prepare(`SELECT created_at AS at FROM audit_events WHERE event_type='LEDGER_VERIFIED' ORDER BY created_at DESC LIMIT 1`).get() as { at: string } | undefined;
+      lastVerifiedAt = row?.at ?? null;
+    } catch { lastVerifiedAt = null; }
+    return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null, lastVerifiedAt };
   }
 }
 

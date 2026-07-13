@@ -21,7 +21,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { DashboardAuth } from './auth.js';
-import type { ReadExecutor } from './read-worker.js';
+import { ReadOverloadedError, type ReadExecutor } from './read-worker.js';
 
 /**
  * Resolve the packaged static UI dir (`<this-dir>/static`). Returns undefined if it isn't
@@ -66,6 +66,8 @@ export interface DashboardServerOptions {
   /** How the live stream learns of changes: a subscribe fn returning an unsubscribe. If
    *  absent, the stream sends periodic snapshots via the reader (still off-loop). */
   onChange?: (cb: () => void) => () => void;
+  /** Max concurrent authenticated streams (blocker #5). Beyond it, /api/stream → 503. Default 64. */
+  maxStreams?: number;
 }
 
 function isLoopback(host: string): boolean {
@@ -88,6 +90,7 @@ export class DashboardServer {
   private readonly wantPort: number;
   private readonly log: (line: string) => void;
   private readonly onChange: ((cb: () => void) => () => void) | undefined;
+  private readonly maxStreams: number;
   private streams = new Set<http.ServerResponse>();
 
   constructor(opts: DashboardServerOptions) {
@@ -100,6 +103,7 @@ export class DashboardServer {
     this.wantPort = opts.port ?? 0;
     this.log = opts.log ?? (() => {});
     this.onChange = opts.onChange;
+    this.maxStreams = opts.maxStreams ?? 64;
   }
 
   /** Actual bound port (after start). */
@@ -207,6 +211,7 @@ export class DashboardServer {
     try {
       if (p === '/api/sessions') return this.json(res, 200, { sessions: await this.reader.run('sessions') });
       if (p === '/api/unmanaged') return this.json(res, 200, await this.reader.run('unmanagedBanner'));
+      if (p === '/api/audit') return this.json(res, 200, await this.reader.run('auditStatus'));
       if (p === '/api/ledger') {
         const beforeSeq = u.searchParams.has('beforeSeq') ? Number(u.searchParams.get('beforeSeq')) : undefined;
         const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : undefined;
@@ -220,8 +225,14 @@ export class DashboardServer {
       if (p === '/api/stream') return this.handleStream(res);
       return this.json(res, 404, { error: 'not_found' });
     } catch (e) {
-      // A read timeout / worker crash → 503, loop unaffected (the read ran off-loop).
+      // A read timeout / worker crash / OVERLOAD → 503, loop unaffected (reads are off-loop).
+      // Overload gets a distinct body + a Retry-After so a client can back off cleanly.
       this.log(`dashboard read failed: ${(e as Error).message}`);
+      if (e instanceof ReadOverloadedError || (e as Error).name === 'ReadOverloadedError') {
+        res.writeHead(503, { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '1' });
+        res.end(JSON.stringify({ error: 'overloaded' }));
+        return;
+      }
       return this.json(res, 503, { error: 'read_unavailable' });
     }
   }
@@ -229,37 +240,54 @@ export class DashboardServer {
   /**
    * Live-update stream via fetch-streaming (NOT EventSource — EventSource can't carry an
    * Authorization header; ADR 0018 D2). Newline-delimited JSON of already-committed state
-   * snapshots. Authenticated (checked in handle()). A hung/slow client is simply dropped on
-   * socket close; nothing here runs a synchronous query on the broker loop (reads are
-   * off-loop via the reader).
+   * snapshots. Authenticated (checked in handle()). Blocker #5 bounds:
+   *  - the authenticated stream count is CAPPED (maxStreams); beyond it the request is
+   *    refused 503 and NOT added to the set (a stream flood cannot grow it without limit);
+   *  - a hung/slow client is dropped on socket close AND every resource (set entry, timer)
+   *    is removed in cleanup;
+   *  - a broadcast is ONE coalesced `sessions` read fanned out to all streams (broadcast()),
+   *    not one read per stream, so N streams don't cause N reads per mutation.
    */
   private handleStream(res: http.ServerResponse): void {
+    if (this.streams.size >= this.maxStreams) { this.json(res, 503, { error: 'too_many_streams' }); return; }
     res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Transfer-Encoding': 'chunked' });
     this.streams.add(res);
-    const push = () => {
-      void this.reader.run('sessions').then((sessions) => {
-        if (res.writableEnded) return;
-        try { res.write(JSON.stringify({ type: 'sessions', sessions }) + '\n'); } catch { /* dropped below */ }
-      }).catch(() => { /* off-loop read failed; skip this tick */ });
-    };
-    push(); // initial snapshot
-    const unsub = this.onChange ? this.onChange(push) : null;
-    // Fallback heartbeat if no change-feed wired: a bounded periodic snapshot (unref'd).
-    const timer = this.onChange ? null : setInterval(push, 2000);
+    // Fallback heartbeat ONLY when no change-feed is wired: a bounded coalesced broadcast.
+    const timer = this.onChange ? null : setInterval(() => this.broadcast(), 2000);
     if (timer && typeof timer.unref === 'function') timer.unref();
-    const cleanup = (): void => { this.streams.delete(res); if (unsub) unsub(); if (timer) clearInterval(timer); };
+    const cleanup = (): void => { this.streams.delete(res); if (timer) clearInterval(timer); };
     res.on('close', cleanup);
     res.on('error', cleanup);
+    // Send this new stream an initial snapshot (its own read; broadcasts thereafter are shared).
+    void this.reader.run('sessions').then((sessions) => {
+      if (!res.writableEnded) { try { res.write(JSON.stringify({ type: 'sessions', sessions }) + '\n'); } catch { /* dropped */ } }
+    }).catch(() => { /* off-loop read failed; skip */ });
   }
 
-  /** Notify all open streams that state changed (broker calls this after a mutation). */
-  notifyChange(): void {
-    for (const res of this.streams) {
-      void this.reader.run('sessions').then((sessions) => {
-        if (!res.writableEnded) { try { res.write(JSON.stringify({ type: 'sessions', sessions }) + '\n'); } catch { /* ignore */ } }
-      }).catch(() => { /* ignore */ });
-    }
+  /**
+   * Coalesced broadcast: do ONE `sessions` read and fan the SAME result out to every open
+   * stream (blocker #5). If a broadcast is already in flight, mark pending + collapse — so a
+   * burst of mutations yields at most one extra read, never one-per-stream-per-mutation. A
+   * failed off-loop read simply skips this tick; delivery is unaffected.
+   */
+  private broadcasting = false;
+  private broadcastPending = false;
+  private broadcast(): void {
+    if (this.streams.size === 0) return;
+    if (this.broadcasting) { this.broadcastPending = true; return; }
+    this.broadcasting = true;
+    void this.reader.run('sessions').then((sessions) => {
+      const line = JSON.stringify({ type: 'sessions', sessions }) + '\n';
+      for (const res of this.streams) { if (!res.writableEnded) { try { res.write(line); } catch { /* per-stream write failure; cleanup on close */ } } }
+    }).catch(() => { /* skip this tick */ }).finally(() => {
+      this.broadcasting = false;
+      if (this.broadcastPending) { this.broadcastPending = false; this.broadcast(); }
+    });
   }
+
+  /** Notify all open streams that state changed (broker calls this after a mutation) — one
+   *  coalesced read fanned out to all streams. */
+  notifyChange(): void { this.broadcast(); }
 
   private serveStatic(pathname: string, res: http.ServerResponse): void {
     if (!this.staticDir) {

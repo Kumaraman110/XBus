@@ -31,7 +31,7 @@ export function workerEntryPath(): string {
 }
 
 /** A read request the server sends to the worker. `method` names a DashboardReadModel op. */
-export interface ReadRequest { id: number; method: 'sessions' | 'session' | 'ledger' | 'unmanagedBanner'; args?: unknown; }
+export interface ReadRequest { id: number; method: 'sessions' | 'session' | 'ledger' | 'unmanagedBanner' | 'auditStatus'; args?: unknown; }
 export interface ReadResponse { id: number; ok: boolean; result?: unknown; error?: string; }
 
 /** The seam the HTTP server depends on — a bounded, cancelable read call. */
@@ -47,6 +47,7 @@ export function dispatchRead(model: DashboardReadModel, method: ReadRequest['met
     case 'session': return model.session(String((args as { sessionId?: string })?.sessionId ?? ''));
     case 'ledger': return model.ledger((args as { beforeSeq?: number; limit?: number }) ?? {});
     case 'unmanagedBanner': return model.unmanagedBanner();
+    case 'auditStatus': return model.auditStatus();
     default: throw new Error(`unknown read method ${String(method)}`);
   }
 }
@@ -76,56 +77,122 @@ export class InProcessReadExecutor implements ReadExecutor {
  * read can NEVER block the caller (the broker loop). A timed-out or crashed worker is
  * surfaced as a rejected promise; the server maps it to a 503 and the loop is unaffected.
  */
+/** Thrown when the bounded in-flight queue is full — the server maps it to a clean 503. */
+export class ReadOverloadedError extends Error {
+  constructor() { super('read worker overloaded'); this.name = 'ReadOverloadedError'; }
+}
+
+interface PendingCall { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout; generation: number; }
+
+/** Minimal worker surface WorkerReadExecutor depends on — lets tests inject a fake worker
+ *  (to drive message/error/exit/timeout deterministically) without spawning a real thread. */
+export interface WorkerLike {
+  postMessage(value: unknown): void;
+  on(event: 'message', cb: (m: ReadResponse) => void): void;
+  on(event: 'error', cb: (e: Error) => void): void;
+  on(event: 'exit', cb: (code: number) => void): void;
+  terminate(): Promise<number> | void;
+}
+
+export interface WorkerReadExecutorOpts {
+  requestTimeoutMs?: number;
+  /** Max concurrent in-flight reads before run() rejects with ReadOverloadedError → 503. */
+  maxInFlight?: number;
+  /** Injectable worker factory (tests). Default: spawn the real read-worker thread. */
+  spawnWorker?: (dbPath: string) => WorkerLike;
+}
+
+/**
+ * Worker-thread read executor with the beta.5 reliability bounds (blocker #5):
+ *  - GENERATION-tagged: every worker spawn increments `generation`; a pending call records
+ *    the generation it was issued on, and message/error/exit handlers close over the SPECIFIC
+ *    generation `g`. A stale worker's late `error`/`exit` can only fail calls from ITS OWN
+ *    generation — it can never reject a fresh worker's in-flight calls.
+ *  - TIMEOUT terminates + replaces: on a per-read timeout we terminate the wedged worker (its
+ *    generation's pending calls all reject) and drop it, so a pathological query cannot pin the
+ *    thread for later reads — the next run() spawns a clean worker.
+ *  - BOUNDED in-flight: at most `maxInFlight` concurrent reads; beyond that run() rejects with
+ *    ReadOverloadedError (503 backpressure), so a flood cannot grow `pending` without limit.
+ */
 export class WorkerReadExecutor implements ReadExecutor {
-  private worker: Worker | null = null;
+  private worker: WorkerLike | null = null;
+  private generation = 0;              // increments on every spawn; tags calls + handlers
   private seq = 0;
-  private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
-  private crashed: Error | null = null;
+  private readonly pending = new Map<number, PendingCall>();
+  private readonly timeoutMs: number;
+  private readonly maxInFlight: number;
+  private readonly spawnWorker: (dbPath: string) => WorkerLike;
+  private closed = false;
 
-  constructor(private readonly dbPath: string, private readonly opts: { requestTimeoutMs?: number } = {}) {}
+  constructor(private readonly dbPath: string, opts: WorkerReadExecutorOpts = {}) {
+    this.timeoutMs = opts.requestTimeoutMs ?? 5000;
+    this.maxInFlight = opts.maxInFlight ?? 64;
+    this.spawnWorker = opts.spawnWorker ?? ((dbPath) => new Worker(workerEntryPath(), { workerData: { dbPath } }));
+  }
 
-  private ensure(): Worker {
-    if (this.worker) return this.worker;
-    const w = new Worker(workerEntryPath(), { workerData: { dbPath: this.dbPath } });
+  private ensure(): { worker: WorkerLike; generation: number } {
+    if (this.worker) return { worker: this.worker, generation: this.generation };
+    const g = ++this.generation;
+    const w = this.spawnWorker(this.dbPath);
+    // Handlers close over THIS generation `g`. They no-op once the executor has moved past g
+    // (a newer worker spawned), so an old worker's late event can never touch newer calls.
     w.on('message', (m: ReadResponse) => {
+      if (g !== this.generation) return;          // stale worker's message — ignore
       const p = this.pending.get(m.id);
-      if (!p) return;
+      if (!p || p.generation !== g) return;
       clearTimeout(p.timer);
       this.pending.delete(m.id);
       if (m.ok) p.resolve(m.result);
       else p.reject(new Error(m.error ?? 'read failed'));
     });
-    const fail = (e: Error) => {
-      this.crashed = e;
-      for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error('read worker crashed')); }
-      this.pending.clear();
-      this.worker = null; // allow a fresh spawn on the next call (self-heal)
+    const fail = (reason: string) => {
+      if (g !== this.generation) return;          // an OLD worker's late error/exit — ignore
+      // Reject only THIS generation's calls, drop the worker so the next run() self-heals.
+      for (const [id, p] of this.pending) { if (p.generation === g) { clearTimeout(p.timer); this.pending.delete(id); p.reject(new Error(reason)); } }
+      this.worker = null;
     };
-    w.on('error', fail);
-    w.on('exit', (code) => { if (code !== 0) fail(new Error(`read worker exited ${code}`)); });
+    w.on('error', () => fail('read worker crashed'));
+    w.on('exit', (code) => { if (code !== 0) fail(`read worker exited ${code}`); });
     this.worker = w;
-    return w;
+    return { worker: w, generation: g };
+  }
+
+  /** Terminate the current worker (e.g. after a timeout wedged it) and drop it so the next
+   *  run() spawns a clean one. Bumps the generation so the dying worker's events are ignored. */
+  private replaceWorker(reason: string): void {
+    const dying = this.worker;
+    this.worker = null;
+    this.generation++;                            // invalidate the dying worker's handlers
+    for (const [id, p] of this.pending) { clearTimeout(p.timer); this.pending.delete(id); p.reject(new Error(reason)); }
+    if (dying) { try { void Promise.resolve(dying.terminate()).catch(() => { /* ignore */ }); } catch { /* ignore */ } }
   }
 
   run(method: ReadRequest['method'], args?: unknown): Promise<unknown> {
-    const w = this.ensure();
+    if (this.closed) return Promise.reject(new Error('read executor closed'));
+    // Bounded in-flight: shed load with a typed error the server maps to 503 backpressure.
+    if (this.pending.size >= this.maxInFlight) return Promise.reject(new ReadOverloadedError());
+    const { worker, generation } = this.ensure();
     const id = ++this.seq;
-    const timeoutMs = this.opts.requestTimeoutMs ?? 5000;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error('read timed out'));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      try { w.postMessage({ id, method, args } satisfies ReadRequest); }
+        // Timeout: the worker may be WEDGED on a pathological query — terminate + replace it
+        // so it can't pin the thread for subsequent reads. replaceWorker rejects this call.
+        if (this.pending.has(id)) this.replaceWorker('read timed out');
+      }, this.timeoutMs);
+      this.pending.set(id, { resolve, reject, timer, generation });
+      try { worker.postMessage({ id, method, args } satisfies ReadRequest); }
       catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e instanceof Error ? e : new Error(String(e))); }
     });
   }
 
+  /** Diagnostics: current in-flight count. */
+  inFlight(): number { return this.pending.size; }
+
   async close(): Promise<void> {
+    this.closed = true;
     for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error('closing')); }
     this.pending.clear();
-    const w = this.worker; this.worker = null;
+    const w = this.worker; this.worker = null; this.generation++;
     if (w) { try { await w.terminate(); } catch { /* ignore */ } }
   }
 }
