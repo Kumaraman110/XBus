@@ -6,6 +6,62 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.7] — Phase 3: frictionless runtime, professional console, session control, managed execution
+
+The adoption/control/execution milestone. Five areas, all same-machine:
+
+- **Bundled Node runtime** (ADR 0022): the Windows artifact ships an XBus-owned `runtime/node.exe`
+  (pinned 22.23.1, in the `[22.13,25)` floor). Installed XBus launches the broker/CLI/hooks via
+  the bundled runtime and **ignores system Node/PATH** — users never install/select/configure
+  Node. It rides the existing atomic install swap + DB-snapshot rollback; `doctor` + provenance
+  report the runtime version; the reproducible STORE zip stays byte-identical.
+- **Professional dashboard** (ADR 0023, built with the `dataviz` skill — the closest official
+  Anthropic design skill installed; the named `frontend-design` skill is not present, stated
+  honestly): delivery renders as **separate columns Queued | Delivered | ACK | Replied | Failed**
+  (no combined string) as validated colored state pills; an **Internal sessions** filter hides
+  `cli-*`/operator/installer sessions by default; friendly statuses + a keyboard drill-down;
+  responsive + focus-visible + loading/empty/error states. Strict CSP preserved.
+- **Title sync + session controls** (ADR 0024): the Claude-native `session_title` is captured
+  OBSERVE-ONLY (documented SessionStart field) into `claude_title`, stored **separately** from
+  the xbus alias (never routable, never claimed as a Claude-title change). Operator controls
+  (bearer-gated, ownership-bounded): rename alias, pause/DND, pin/archive, remove-record (keeps
+  the Claude transcript + audit history), stop managed sessions.
+- **Idle wake + scheduling** (ADR 0025, opt-in): a `schedules`/`schedule_runs` scheduler mirrors
+  the reaper with **exactly-once** execution across duplicate ticks and broker restart
+  (`UNIQUE(schedule_id, scheduled_for)` claim + `ux_idem`); quiet-hours, wake/fire limits,
+  concurrency, loop guards. A resident SessionStart **`asyncRewake`** rewaker accelerates
+  delivery to an idle session by firing the documented wake (a body-free reminder — never a
+  push, never keystrokes); the durable QUEUED delivery + pull path are the correctness floor.
+  A sandboxed **managed background session** launcher (`claude --bg`, plan mode, restricted
+  tools) is experimental + default-off, gated on a `--bg` spawn probe.
+- **Federation/enterprise skeleton** (ADR 0026): compile-tested TypeScript interfaces + honest
+  docs for a future LAN/relay/enterprise design — **experimental, unvalidated, not wired**;
+  `isFederationEnabled()` is a hard `false`.
+
+Additive **migration v9 (8 → 9)** — wire tuple `xbus-p1-stp1-s9`, a fail-closed whole-install
+upgrade; existing beta.6 data migrates in place. Peer messaging, operator threads, exactly-once
+delivery, dashboard auth, and ledger integrity are all preserved.
+
+Hardening from the pre-ship adversarial review:
+
+- **Scheduler `once` + quiet-hours no longer drops the message.** A one-time schedule blocked by
+  a quiet window (or wake-limit / concurrency gate) is now **deferred** past the block and retried,
+  never silently exhausted.
+- **`stop_managed` is pid-recycling-safe.** It SIGTERMs only a child the broker still holds a live
+  in-process handle for (pid + launch_key match); with no live handle it clears markers and does
+  not kill a bare pid. A managed child's exit clears its markers so no dead session retains a
+  killable pid (ADR 0024 §4 now describes the implemented guard).
+- **`doctor node_runtime`** detects the bundled-runtime `command` by installed entry **path**, so
+  it stays green after Claude Code strips the `_xbusOwner` tag on first run (no false-fail).
+- **Concurrency guard** counts only in-flight (`claimed`) runs, so a keyed schedule keeps firing
+  instead of wedging after its first fire.
+- **`schedule_runs` retention**: the reaper prunes old terminal run rows (default 7-day horizon,
+  exactly-once-safe) + covering indexes were added, so the run ledger can't grow unbounded.
+- **Successful upgrades reclaim the plugin backup** (no per-upgrade accumulation of the bundled
+  runtime on disk).
+- **Dashboard rename errors** (name taken / invalid) return **400** with the actionable message
+  instead of a suppressed 500.
+
 ## [0.1.0-beta.6] — Phase 2: threaded messaging + local-operator communication console
 
 The communication-console milestone. The authenticated localhost dashboard becomes a

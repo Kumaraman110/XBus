@@ -14,6 +14,7 @@ import { makeFrame, type Frame, type FrameType, type RegisterPayload, type Annou
 import { BrokerStore, type SessionAuthority } from './store.js';
 import { DeliveryOps, INJECTION_METADATA_KEY } from './delivery.js';
 import { Reaper, type SweepResult } from './reaper.js';
+import { Scheduler, type SchedulerTickResult } from './scheduler.js';
 import { DeadLetterStore } from './deadletter.js';
 import { ControlsStore, type ReceiveControl } from './controls.js';
 import type { ReadinessHints } from './readiness.js';
@@ -39,6 +40,9 @@ export interface DaemonOptions {
   /** Reaper sweep interval (ms). 0 disables the periodic timer (tests drive it
    *  explicitly via runReaperSweep). Default 30s. */
   reaperIntervalMs?: number;
+  /** Beta.7 (ADR 0025): scheduler tick interval (ms). 0 disables the periodic timer (tests
+   *  drive it explicitly via runSchedulerTick). Default 15s. */
+  schedulerIntervalMs?: number;
   /** Beta.5 blocker #7: audit-ledger verify interval (ms). 0 disables the periodic timer
    *  (tests drive verifyLedgerNow explicitly). Default 1h. Startup verify always runs. */
   ledgerVerifyIntervalMs?: number;
@@ -57,9 +61,12 @@ export class BrokerDaemon {
   private delivery: DeliveryOps;
   private controls: ControlsStore;
   private reaper: Reaper;
+  private scheduler: Scheduler;
   private deadLetters: DeadLetterStore;
   private readonly metrics: BrokerMetrics;
   private reaperTimer: NodeJS.Timeout | null = null;
+  private schedulerTimer: NodeJS.Timeout | null = null;
+  private readonly schedulerIntervalMs: number;
   private readonly reaperIntervalMs: number;
   private ledgerVerifyTimer: NodeJS.Timeout | null = null;
   /** Beta.5 blocker #7: ledger-verify interval (ms). 0 disables the timer (tests drive it).
@@ -67,6 +74,13 @@ export class BrokerDaemon {
   private readonly ledgerVerifyIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
+  /** Beta.7 (ADR 0025): live in-process handles to xbus-MANAGED background children THIS broker
+   *  spawned. stop_managed only SIGTERMs a pid backed by a live handle here — that is the sole
+   *  proof the pid is still OUR child and not an OS-recycled pid (ADR 0024 §4 liveness guard).
+   *  A handle is dropped when the child exits (which also clears the session's managed markers)
+   *  or when the broker restarts (a fresh process holds no handles → no unsafe kill). Keyed by
+   *  sessionId; value carries the pid + recorded launchKey for a defensive cross-check. */
+  private managedChildren = new Map<string, { pid: number; launchKey: string; kill: (signal?: NodeJS.Signals) => boolean }>();
   /** In-memory awarded support per connection (adapter-aware registrations only; never persisted).
    *  This is REGISTRATION-AWARD state: it records what the broker awarded at register time and is
    *  consulted at register time to enforce the requested receive mode. It is NOT yet an
@@ -100,6 +114,11 @@ export class BrokerDaemon {
     // Real process: jitter the retry backoff with Math.random (full jitter).
     // Deterministic tests construct Reaper directly with a fixed rng.
     this.reaper = new Reaper(db, clock, ids, { rng: () => Math.random() });
+    // Beta.7 (ADR 0025): the opt-in scheduler — mirrors the reaper (pure tick, unref'd timer,
+    // 0-disables, FakeClock-drivable). It ENQUEUES due schedules via store.operatorSend
+    // (exactly-once via schedule_runs UNIQUE + ux_idem); it never pushes to a session.
+    this.scheduler = new Scheduler(db, clock, ids, this.store);
+    this.schedulerIntervalMs = opts.schedulerIntervalMs ?? 15_000;
     // Dead-letter inspection store, surfaced via the admin-gated
     // `dead_letter` frame (read-only list/inspect — safe metadata only).
     this.deadLetters = new DeadLetterStore(db, clock, ids);
@@ -148,6 +167,14 @@ export class BrokerDaemon {
       }, this.reaperIntervalMs);
       if (typeof this.reaperTimer.unref === 'function') this.reaperTimer.unref();
     }
+    // Beta.7 (ADR 0025): scheduler tick — fire due schedules (enqueue exactly-once). unref'd
+    // so it never holds the process open; try/catch so a tick error never kills the loop.
+    if (this.schedulerIntervalMs > 0) {
+      this.schedulerTimer = setInterval(() => {
+        try { this.scheduler.tick(); } catch (e) { this.log(`scheduler tick failed: ${(e as Error).message}`); }
+      }, this.schedulerIntervalMs);
+      if (typeof this.schedulerTimer.unref === 'function') this.schedulerTimer.unref();
+    }
     // Beta.5 blocker #7: audit-ledger verification on STARTUP + on a periodic interval, so
     // an out-of-band tamper / bit-rot is caught within at most one interval (ADR 0020 Q4),
     // not "next restart". A broken chain is LOGGED + recorded (LEDGER_CHAIN_BROKEN) but does
@@ -192,8 +219,15 @@ export class BrokerDaemon {
     return r;
   }
 
+  /** Explicit scheduler tick — used by tests (FakeClock) + `xbus doctor`. Deterministic +
+   *  idempotent given a fixed clock (mirrors runReaperSweep). */
+  runSchedulerTick(): SchedulerTickResult {
+    return this.scheduler.tick();
+  }
+
   async stop(): Promise<void> {
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    if (this.schedulerTimer) { clearInterval(this.schedulerTimer); this.schedulerTimer = null; }
     if (this.ledgerVerifyTimer) { clearInterval(this.ledgerVerifyTimer); this.ledgerVerifyTimer = null; }
     await this.ipc?.close();
   }
@@ -319,6 +353,8 @@ export class BrokerDaemon {
           return this.onSetControl(conn, frame);
         case 'process_next':
           return this.onProcessNext(conn, frame);
+        case 'wake_poll':
+          return this.onWakePoll(conn, frame);
         case 'dead_letter':
           return this.onDeadLetter(conn, frame);
         case 'block_peer':
@@ -502,11 +538,13 @@ export class BrokerDaemon {
     const cwd = this.optString(p.cwd, 'cwd');
     const transcriptPath = this.optString(p.transcriptPath, 'transcriptPath');
     const agentType = this.optString(p.agentType, 'agentType');
+    const sessionTitle = this.optString(p.sessionTitle, 'sessionTitle'); // beta.7 (ADR 0024): documented SessionStart field
     const r = this.store.announceSession(auth, {
       source: p.source,
       ...(cwd !== undefined ? { cwd } : {}),
       ...(transcriptPath !== undefined ? { transcriptPath } : {}),
       ...(agentType !== undefined ? { agentType } : {}),
+      ...(sessionTitle !== undefined ? { sessionTitle } : {}),
     });
     // Beta.5: nudge any open dashboard streams that session state changed (best-effort,
     // off-loop read; never throws into the handler). No-op if no dashboard is wired.
@@ -702,6 +740,141 @@ export class BrokerDaemon {
     return r;
   }
 
+  /**
+   * Beta.7 (ADR 0024): operator session-control callbacks. Each validates the untrusted
+   * browser payload (a target sessionId + typed params), delegates to the OPERATOR-authority
+   * store method (which stamps 'local-operator' + appends one ledger event), then nudges the
+   * dashboard. A throw surfaces to the HTTP route as a clean 4xx/5xx; the broker is unaffected.
+   * `raw.action` selects the control so ONE injected callback (onOperatorControl) covers them.
+   */
+  operatorControl(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const action = this.optString(p.action, 'action');
+    const sessionId = this.optString(p.sessionId, 'sessionId');
+    if (!sessionId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'sessionId required');
+    let result: unknown;
+    switch (action) {
+      case 'rename_alias': {
+        const name = this.optString(p.name, 'name');
+        if (!name) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'name required');
+        result = this.store.operatorRenameAlias(sessionId, name);
+        break;
+      }
+      case 'set_control': {
+        const mode = this.optString(p.mode, 'mode');
+        if (mode !== 'active' && mode !== 'paused' && mode !== 'do_not_disturb' && mode !== 'manual_checkpoint') {
+          throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "mode must be active|paused|do_not_disturb|manual_checkpoint");
+        }
+        result = this.store.operatorSetControl(sessionId, mode);
+        break;
+      }
+      case 'pin': result = this.store.operatorSetPinned(sessionId, true); break;
+      case 'unpin': result = this.store.operatorSetPinned(sessionId, false); break;
+      case 'archive': result = this.store.operatorSetArchived(sessionId, true); break;
+      case 'unarchive': result = this.store.operatorSetArchived(sessionId, false); break;
+      case 'remove_record': result = this.store.operatorRemoveRecord(sessionId); break;
+      case 'stop_managed': {
+        // Clear the DB markers first (this also refuses a non-managed session and returns the
+        // recorded pid + launch_key). We then kill ONLY if we still hold a LIVE in-process handle
+        // to this exact child — the sole pid-recycling-safe liveness proof (ADR 0024 §4). Without
+        // a live handle (broker restarted since spawn, or the child already exited) we DO NOT
+        // SIGTERM a bare pid — it may have been recycled to an unrelated process; we clear markers
+        // and report killed=false so a stale record can never terminate an innocent process.
+        const cleared = this.store.clearManagedSession(sessionId);
+        const handle = this.managedChildren.get(sessionId);
+        let killed = false;
+        if (handle && cleared.pid !== null && handle.pid === cleared.pid &&
+            (cleared.launchKey === null || handle.launchKey === cleared.launchKey)) {
+          try { handle.kill('SIGTERM'); killed = true; } catch { /* already gone */ }
+        }
+        this.managedChildren.delete(sessionId);
+        result = { sessionId: cleared.sessionId, stopped: true, pid: cleared.pid, killed, killable: handle !== undefined };
+        break;
+      }
+      default:
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `unknown control action: ${String(action)}`);
+    }
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /**
+   * Beta.7 (ADR 0025): register a live in-process handle to a managed background child THIS
+   * broker just spawned, so a later stop_managed can SIGTERM it pid-recycling-safely. On the
+   * child's exit we clear the session's managed markers (so a dead session never retains a
+   * killable pid) and drop the handle. Called by the managed-spawn launch path after a
+   * successful spawn. `child` is the minimal surface we need (pid + on('exit') + kill).
+   */
+  registerManagedChild(sessionId: string, launchKey: string, child: { pid?: number; kill(signal?: NodeJS.Signals): boolean; once(event: 'exit', cb: () => void): unknown }): void {
+    if (child.pid === undefined) return; // never spawned a real process — nothing to track
+    this.managedChildren.set(sessionId, { pid: child.pid, launchKey, kill: (sig) => child.kill(sig) });
+    child.once('exit', () => {
+      this.managedChildren.delete(sessionId);
+      this.store.markManagedSessionExited(sessionId);
+      try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    });
+  }
+
+  /**
+   * Beta.7 (ADR 0025): operator schedule callback. `action`: 'create' | 'pause' | 'resume' |
+   * 'cancel'. Create validates the untrusted body + computes the first next_run (now for an
+   * immediately-due 'once'/'interval', or a caller-supplied ISO for a future 'once'). The
+   * schedule is created AS the operator (created_by_actor='local-operator'); its fires enqueue
+   * via operatorSend under the same exactly-once guarantees.
+   */
+  operatorSchedule(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const action = this.optString(p.action, 'action');
+    if (action === 'pause' || action === 'resume' || action === 'cancel') {
+      const scheduleId = this.optString(p.scheduleId, 'scheduleId');
+      if (!scheduleId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'scheduleId required');
+      const state = action === 'pause' ? 'paused' : action === 'resume' ? 'active' : 'cancelled';
+      const r = this.store.setScheduleState(scheduleId, state);
+      try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+      return r;
+    }
+    if (action !== 'create') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `unknown schedule action: ${String(action)}`);
+    const to = this.optString(p.to, 'to');
+    const text = this.optString(p.text, 'text');
+    const kind = this.optString(p.kind, 'kind');
+    if (!to) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'to required');
+    if (!text) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'text required');
+    if (kind !== 'once' && kind !== 'interval' && kind !== 'cron') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "kind must be once|interval|cron");
+    // Bound the untrusted body with the SAME size/reserved-key defenses as a send.
+    validateSendInput({ to, text });
+    const scheduleExpr = this.optString(p.scheduleExpr, 'scheduleExpr');
+    const nowMs = this.clock.nowMs();
+    // First run: an explicit future ISO 'firstRunAt', else now (immediately due).
+    const firstRunAt = this.optString(p.firstRunAt, 'firstRunAt');
+    let nextRunAtIso: string;
+    if (firstRunAt) {
+      const t = Date.parse(firstRunAt);
+      if (!Number.isFinite(t)) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'firstRunAt must be an ISO instant');
+      nextRunAtIso = new Date(t).toISOString();
+    } else {
+      nextRunAtIso = new Date(nowMs).toISOString();
+    }
+    const numOpt = (v: unknown, field: string): number | undefined => {
+      if (v === undefined) return undefined;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `${field} must be a non-negative number`);
+      return v;
+    };
+    const r = this.store.createSchedule({
+      createdByActor: 'local-operator', targetAddress: to, payloadText: text, kind,
+      ...(this.optString(p.title, 'title') !== undefined ? { title: this.optString(p.title, 'title')! } : {}),
+      ...(scheduleExpr !== undefined ? { scheduleExpr } : {}),
+      ...(p.requiresAck !== undefined ? { requiresAck: p.requiresAck === true } : {}),
+      ...(p.requiresReply !== undefined ? { requiresReply: p.requiresReply === true } : {}),
+      ...(this.optString(p.quietHoursJson, 'quietHoursJson') !== undefined ? { quietHoursJson: this.optString(p.quietHoursJson, 'quietHoursJson')! } : {}),
+      ...(numOpt(p.minIntervalMs, 'minIntervalMs') !== undefined ? { minIntervalMs: numOpt(p.minIntervalMs, 'minIntervalMs')! } : {}),
+      ...(numOpt(p.wakeLimitPerDay, 'wakeLimitPerDay') !== undefined ? { wakeLimitPerDay: numOpt(p.wakeLimitPerDay, 'wakeLimitPerDay')! } : {}),
+      ...(numOpt(p.maxFires, 'maxFires') !== undefined ? { maxFires: numOpt(p.maxFires, 'maxFires')! } : {}),
+      nextRunAtIso,
+    });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return r;
+  }
+
   /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time
    *  browser-open URL (nonce in the URL fragment) from the broker-owned DashboardServer.
    *  Returns null when no dashboard is running. The URL carries a live single-use nonce, so
@@ -740,6 +913,20 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const msgs = this.delivery.processNext(auth, this.ids.next());
     this.reply(conn, 'process_next_ack', { messages: msgs }, frame.requestId);
+  }
+
+  /**
+   * Beta.7 (ADR 0025): the resident rewaker hook polls this to decide whether to fire the
+   * documented asyncRewake (exit 2) that wakes an idle session. Identity is the AUTHENTICATED
+   * connection (auth.sessionId), never a payload field. Returns {eligible} = there is a queued
+   * delivery the next checkpoint would inject AND the session accepts injection. This is a PURE
+   * READ — it never injects a body (the body still drains on the pull path); the wake only
+   * accelerates that. So even if the wake never fires, delivery is unaffected (the durable floor).
+   */
+  private onWakePoll(conn: ServerConn, frame: Frame): void {
+    const auth = this.requireAuth(conn);
+    const eligible = this.store.hasEligibleDelivery(auth.sessionId);
+    this.reply(conn, 'wake_poll_ack', { eligible }, frame.requestId);
   }
 
   /**

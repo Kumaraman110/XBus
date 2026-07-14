@@ -30,6 +30,7 @@ export const PLUGIN_PAYLOAD_FILES = [
   'dist/channel/server.js',       // MCP server (spawned by .mcp.json)
   'dist/channel/hook-entry.js',   // checkpoint hook entry (UserPromptSubmit + Stop)
   'dist/channel/session-start-hook.js', // beta.5 SessionStart lifecycle hook (visibility)
+  'dist/channel/rewaker-entry.js', // beta.7 resident idle-wake rewaker (SessionStart asyncRewake)
   'dist/broker/dashboard/read-worker.js', // beta.5 off-loop read-only dashboard worker entry
   'dist/broker/dashboard/browser.js', // beta.5 default-browser launcher (xbus dashboard verb)
   'dist/broker/dashboard/static/index.html', // beta.5 dashboard UI (inert; no secrets/data)

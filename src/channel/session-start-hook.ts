@@ -82,6 +82,10 @@ export async function runSessionStart(
       cwd,
       ...(input.transcript_path !== undefined ? { transcriptPath: input.transcript_path } : {}),
       ...(input.agent_type !== undefined ? { agentType: input.agent_type } : {}),
+      // Beta.7 (ADR 0024): forward the DOCUMENTED SessionStart `session_title` stdin field so
+      // the broker records the Claude-native title separately from the xbus alias. Absent on
+      // most starts (only present once a title exists via --name/-n or /rename).
+      ...(input.session_title !== undefined ? { sessionTitle: input.session_title } : {}),
     });
     if (ack.frameType === 'error') {
       return { announced: false, reason: (ack.payload as { code?: string }).code ?? 'announce-error' };

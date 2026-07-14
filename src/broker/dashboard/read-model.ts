@@ -59,6 +59,11 @@ export interface DashboardSession {
   project: string;
   connection: string;   // sessions.state {connected,disconnected}
   readiness: string;    // readiness enum
+  /** Beta.7: is this an XBus-INTERNAL session (CLI admin/installer shells, the operator
+   *  principal) that the console hides by default behind the "Internal sessions" filter?
+   *  Derived (no schema change) from the session id prefix / project slug — a cli-* admin
+   *  session has id `cli-<pid>-<ts>` + project 'proj-cli'/'proj-install'/'proj-operator'. */
+  internal: boolean;
   firstSeenAt: string | null;
   lastSeenSourceAt: string | null;
   /** Delivery-state breakdown for messages addressed TO this session (blocker #6). */
@@ -137,6 +142,20 @@ export interface DashboardThread extends Omit<DashboardThreadSummary, 'turnCount
   rootMessageId: string;
   createdByActor: string;
   turns: DashboardThreadTurn[];
+}
+
+/**
+ * Beta.7: is this an XBus-INTERNAL session (not a user-facing Claude Code session)? The
+ * console hides these by default behind the "Internal sessions" filter. Internal = the
+ * reserved operator principal, or a short-lived CLI/admin/installer shell (id `cli-<pid>-<ts>`
+ * with a `proj-cli`/`proj-install`/`proj-operator` slug, or the `__xbus_operator__` slug).
+ * Derived from stable id/slug shape — no schema column, so it needs no migration.
+ */
+export function isInternalSession(sessionId: string, projectId: string): boolean {
+  if (sessionId === 'local-operator') return true;
+  if (sessionId.startsWith('cli-') || sessionId.startsWith('installer-')) return true;
+  const slug = projectId.toLowerCase();
+  return slug === 'proj-cli' || slug === 'proj-install' || slug === 'proj-operator' || slug === '__xbus_operator__';
 }
 
 /** Map a raw delivery state to the console's five user-facing states (queued/delivered/
@@ -224,6 +243,7 @@ export class DashboardReadModel {
         project: (r.projectAlias as string) ?? (r.projectId as string) ?? 'unknown',
         connection: (r.connState as string) ?? 'disconnected',
         readiness: (r.readiness as string) ?? 'disconnected',
+        internal: isInternalSession(sid, (r.projectId as string) ?? ''),
         firstSeenAt: (r.firstSeenAt as string | null) ?? null,
         lastSeenSourceAt: (r.lastSeenSourceAt as string | null) ?? null,
         delivery,

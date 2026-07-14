@@ -128,48 +128,61 @@ export function reestablishAccess(target: string): HardenResult {
  * Verify (read-only) that a Windows path's ACL grants no broad principals.
  * Returns the principals found. On Unix returns the mode. Used by tests + doctor.
  */
-export function describeAcl(target: string): { platform: string; principals?: string[]; mode?: string; broadAccess: boolean } {
+export function describeAcl(target: string): { platform: string; principals?: string[]; mode?: string; broadAccess: boolean; readError?: boolean } {
   if (process.platform !== 'win32') {
     const mode = (fs.statSync(target).mode & 0o777).toString(8);
     // group/other bits set => broad
     const m = fs.statSync(target).mode & 0o777;
     return { platform: 'posix', mode, broadAccess: (m & 0o077) !== 0 };
   }
-  try {
-    const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true, timeout: ICACLS_TIMEOUT_MS });
-    // icacls output: first line is "<path> PRINCIPAL:(perms)"; continuation lines
-    // are "<indent>PRINCIPAL:(perms)". Parse the ACE principals only.
-    const lines = out.split(/\r?\n/);
-    const principals: string[] = [];
-    let broad = false;
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i]!;
-      if (i === 0) {
-        // strip the leading path token (everything up to the first principal,
-        // which contains a backslash + ':')
-        const m = line.match(/(\S+\\[^:]+|[A-Za-z ]+):\([^)]*\)/);
-        if (!m) continue;
-        line = line.slice(line.indexOf(m[0]));
+  // The READ (icacls <target>) spawns a subprocess; under heavy concurrent load its spawn can
+  // time out. That is an INCONCLUSIVE read, NOT a detected broad principal — reporting it as
+  // broadAccess:true is a false positive (it conflates "couldn't read the ACL" with "the ACL is
+  // broad"). Retry the read a bounded number of times so a transient spawn-timeout resolves, and
+  // surface readError so callers can treat an all-attempts-failed read as inconclusive rather
+  // than as verified-broad. A GENUINE broad principal still returns broadAccess:true (fail-closed).
+  let lastErr = '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const out = execFileSync('icacls', [target], { encoding: 'utf8', windowsHide: true, timeout: ICACLS_TIMEOUT_MS });
+      // icacls output: first line is "<path> PRINCIPAL:(perms)"; continuation lines
+      // are "<indent>PRINCIPAL:(perms)". Parse the ACE principals only.
+      const lines = out.split(/\r?\n/);
+      const principals: string[] = [];
+      let broad = false;
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i]!;
+        if (i === 0) {
+          // strip the leading path token (everything up to the first principal,
+          // which contains a backslash + ':')
+          const m = line.match(/(\S+\\[^:]+|[A-Za-z ]+):\([^)]*\)/);
+          if (!m) continue;
+          line = line.slice(line.indexOf(m[0]));
+        }
+        const trimmed = line.trim();
+        if (!trimmed || /Successfully|Failed/.test(trimmed)) continue;
+        // ACE looks like  PRINCIPAL:(flags)  — principal may contain DOMAIN\name.
+        const ace = trimmed.match(/^(.+?):\(/);
+        if (!ace) continue;
+        const principal = ace[1]!.trim();
+        const shortName = principal.replace(/^.*\\/, '');
+        principals.push(shortName);
+        // Broad = well-known multi-user groups. Match on the SID-name precisely so
+        // a username like "...Users..." path fragment can't trip it.
+        if (/^(Everyone|Authenticated Users|Users|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users)$/i.test(principal) ||
+            /^(Everyone|Authenticated Users|Users)$/i.test(shortName)) {
+          broad = true;
+        }
       }
-      const trimmed = line.trim();
-      if (!trimmed || /Successfully|Failed/.test(trimmed)) continue;
-      // ACE looks like  PRINCIPAL:(flags)  — principal may contain DOMAIN\name.
-      const ace = trimmed.match(/^(.+?):\(/);
-      if (!ace) continue;
-      const principal = ace[1]!.trim();
-      const shortName = principal.replace(/^.*\\/, '');
-      principals.push(shortName);
-      // Broad = well-known multi-user groups. Match on the SID-name precisely so
-      // a username like "...Users..." path fragment can't trip it.
-      if (/^(Everyone|Authenticated Users|Users|BUILTIN\\Users|NT AUTHORITY\\Authenticated Users)$/i.test(principal) ||
-          /^(Everyone|Authenticated Users|Users)$/i.test(shortName)) {
-        broad = true;
-      }
+      return { platform: 'win32', principals, broadAccess: broad };
+    } catch (e) {
+      lastErr = (e as Error).message.slice(0, 60);
+      // fall through to retry (a transient spawn-timeout under load resolves on a retry)
     }
-    return { platform: 'win32', principals, broadAccess: broad };
-  } catch (e) {
-    return { platform: 'win32', broadAccess: true, principals: [`icacls-error:${(e as Error).message.slice(0, 60)}`] };
   }
+  // All read attempts failed → INCONCLUSIVE. Report readError:true and DO NOT assert broadAccess
+  // (a read timeout is not evidence of a broad ACL). The caller decides how strict to be.
+  return { platform: 'win32', broadAccess: false, readError: true, principals: [`icacls-error:${lastErr}`] };
 }
 
 /** Reject a path that is a symlink/junction/reparse point (where we expect a real dir/file). */

@@ -21,7 +21,7 @@ import { validateUserAlias, automaticAlias, parseRecipient, type NormalizedAlias
 import { validateSessionName, type NormalizedSessionName } from '../identity/session-name.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
-import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
+import { resolveReadiness, isReadiness, acceptsInjection, type Readiness, type ReadinessHints } from './readiness.js';
 import { ledgerAppend, type LedgerSubject } from './ledger.js';
 import type { ImportedSessionMeta } from './session-import.js';
 import { OPERATOR_SESSION_ID, OPERATOR_ALIAS, OPERATOR_ACTOR_KIND, OPERATOR_LEDGER_ACTOR } from './operator.js';
@@ -538,7 +538,7 @@ export class BrokerStore {
    */
   announceSession(
     auth: SessionAuthority,
-    input: { source: string; cwd?: string; transcriptPath?: string; agentType?: string },
+    input: { source: string; cwd?: string; transcriptPath?: string; agentType?: string; sessionTitle?: string },
   ): { managementState: string; priorManagementState: string; source: string; lifecycleEvent: string; epoch: number; appended: boolean } {
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
@@ -579,6 +579,19 @@ export class BrokerStore {
              first_seen_at=COALESCE(first_seen_at, ?), last_seen_source_at=?, updated_at=? WHERE session_id=?`,
         )
         .run(source, input.transcriptPath ?? null, input.agentType ?? null, input.cwd ?? null, now, now, now, auth.sessionId);
+
+      // Beta.7 (ADR 0024): capture the Claude Code NATIVE session title from the documented
+      // SessionStart 'session_title' stdin field, stored SEPARATELY from the xbus alias/name
+      // pools (claude_title is display-only; never normalized/unique/reserved/routing-read).
+      // The title can change mid-lifecycle (/rename), so a PRESENT value overwrites (latest
+      // observation wins) with its source + timestamp; an ABSENT field never clears a prior
+      // title. This is OBSERVE-ONLY — XBus never claims it changed the Claude title (it only
+      // records what Claude reported), and it never edits any undocumented Claude file.
+      if (typeof input.sessionTitle === 'string' && input.sessionTitle.length > 0) {
+        const title = input.sessionTitle.slice(0, 512); // bound untrusted display text
+        this.db.prepare(`UPDATE sessions SET claude_title=?, claude_title_source=?, claude_title_at=? WHERE session_id=?`)
+          .run(title, source, now, auth.sessionId);
+      }
 
       this.audit('SESSION_ANNOUNCED', { sessionId: auth.sessionId, source, epoch: row.epoch, priorManagementState });
 
@@ -1112,5 +1125,235 @@ export class BrokerStore {
       this.ledger('THREAD_READ', OPERATOR_LEDGER_ACTOR, { threadId }, { lastReadThreadSeq: target });
       return { threadId, lastReadThreadSeq: target };
     });
+  }
+
+  // ─────────────────────── beta.7 operator session controls (ADR 0024) ───────────────────────
+  // These are OPERATOR-authority ops that target a session by id (distinct from the self-only
+  // onSetControl/renameSession which act on the caller's own auth.sessionId). They stamp
+  // actor='local-operator' and append one ledger event; they NEVER touch an undocumented Claude
+  // file, NEVER claim the Claude title changed (only the xbus alias), and NEVER delete a
+  // transcript. A target must exist; a non-existent target throws MESSAGE_NOT_FOUND.
+
+  private requireSession(sessionId: string): { active_epoch: number; expired_at: string | null; managed_by_xbus: number; managed_pid: number | null } {
+    const s = this.db.prepare('SELECT active_epoch, expired_at, managed_by_xbus, managed_pid FROM sessions WHERE session_id=?').get(sessionId) as { active_epoch: number; expired_at: string | null; managed_by_xbus: number; managed_pid: number | null } | undefined;
+    if (!s) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such session');
+    return s;
+  }
+
+  /** Operator-driven rename of a session's XBUS ALIAS (the routable session_name pool) — NOT
+   *  the Claude-native title. Reuses the proven name-claim path (unique index race guard),
+   *  bypassing the mcp-role gate because the operator is a first-class control principal. */
+  operatorRenameAlias(sessionId: string, rawName: string): SessionNameStatus {
+    return this.db.transaction(() => {
+      this.requireSession(sessionId);
+      const norm = validateSessionName(rawName); // throws INVALID_SESSION_NAME
+      const now = this.clock.nowIso();
+      const taken = this.db.prepare(`SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`).get(norm.normalized, sessionId) as { session_id: string } | undefined;
+      if (taken) throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      try {
+        this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, updated_at=? WHERE session_id=?`)
+          .run(norm.display, norm.normalized, now, sessionId);
+      } catch { throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display }); }
+      this.ledger('OPERATOR_ALIAS_RENAMED', OPERATOR_LEDGER_ACTOR, { sessionId }, { alias: norm.display });
+      return { state: 'active', name: norm.display };
+    });
+  }
+
+  /** Operator-driven receive control on a TARGET session (pause / do_not_disturb / active /
+   *  manual_checkpoint). Distinct from onSetControl (self-only). */
+  operatorSetControl(sessionId: string, mode: 'active' | 'paused' | 'do_not_disturb' | 'manual_checkpoint'): { sessionId: string; mode: string } {
+    return this.db.transaction(() => {
+      this.requireSession(sessionId);
+      this.controls.setControl(sessionId, mode);
+      this.ledger('OPERATOR_CONTROL_SET', OPERATOR_LEDGER_ACTOR, { sessionId }, { mode });
+      return { sessionId, mode };
+    });
+  }
+
+  /** Pin / unpin a session (keep it surfaced in the console). Orthogonal to state/lifecycle. */
+  operatorSetPinned(sessionId: string, pinned: boolean): { sessionId: string; pinned: boolean } {
+    return this.db.transaction(() => {
+      this.requireSession(sessionId);
+      this.db.prepare('UPDATE sessions SET pinned=?, updated_at=? WHERE session_id=?').run(pinned ? 1 : 0, this.clock.nowIso(), sessionId);
+      this.ledger(pinned ? 'OPERATOR_SESSION_PINNED' : 'OPERATOR_SESSION_UNPINNED', OPERATOR_LEDGER_ACTOR, { sessionId }, {});
+      return { sessionId, pinned };
+    });
+  }
+
+  /** Archive / unarchive a stale session RECORD. Hides it from the default console view; does
+   *  NOT delete the row or the Claude transcript. */
+  operatorSetArchived(sessionId: string, archived: boolean): { sessionId: string; archived: boolean } {
+    return this.db.transaction(() => {
+      this.requireSession(sessionId);
+      const now = this.clock.nowIso();
+      this.db.prepare('UPDATE sessions SET archived=?, archived_at=?, updated_at=? WHERE session_id=?').run(archived ? 1 : 0, archived ? now : null, now, sessionId);
+      this.ledger(archived ? 'OPERATOR_SESSION_ARCHIVED' : 'OPERATOR_SESSION_UNARCHIVED', OPERATOR_LEDGER_ACTOR, { sessionId }, {});
+      return { sessionId, archived };
+    });
+  }
+
+  /**
+   * Remove a stale session RECORD (the sessions row + its routing projections). NEVER deletes
+   * the Claude transcript file (transcript_path is only ever READ, never unlinked) and NEVER
+   * prunes the append-only ledger history. Refuses to remove a LIVE (connected) session or the
+   * reserved operator principal. Returns whether a row was removed.
+   */
+  operatorRemoveRecord(sessionId: string): { sessionId: string; removed: boolean } {
+    if (sessionId === OPERATOR_SESSION_ID) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'the reserved operator principal cannot be removed');
+    return this.db.transaction(() => {
+      const s = this.db.prepare('SELECT state FROM sessions WHERE session_id=?').get(sessionId) as { state: string } | undefined;
+      if (!s) return { sessionId, removed: false };
+      if (s.state === 'connected') throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, 'refusing to remove a connected session; disconnect or archive it first');
+      // Remove the row + every table that FK-references sessions(session_id) — aliases,
+      // session_instances, recipient_sequences — plus the thread_participants projection, in
+      // dependency order so the final sessions DELETE doesn't trip a FOREIGN KEY constraint.
+      // Deliberately KEEP messages/deliveries/ledger (audit history is append-only + references
+      // the id by value, not FK) and NEVER touch the transcript file on disk (transcript_path is
+      // read-only here). component_instances/session_epochs carry no FK, but prune them too so a
+      // removed session leaves no dangling per-session rows.
+      this.db.prepare('DELETE FROM aliases WHERE session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM session_instances WHERE session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM recipient_sequences WHERE recipient_session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM component_instances WHERE session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM session_epochs WHERE session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM thread_participants WHERE session_id=?').run(sessionId);
+      this.db.prepare('DELETE FROM sessions WHERE session_id=?').run(sessionId);
+      this.ledger('OPERATOR_SESSION_RECORD_REMOVED', OPERATOR_LEDGER_ACTOR, { sessionId }, { transcriptPreserved: true });
+      return { sessionId, removed: true };
+    });
+  }
+
+  /** Record an xbus-MANAGED background session (ADR 0025): mark managed + pid + launch key, so
+   *  stop/restart can target ONLY xbus-launched sessions and validate liveness by started_at +
+   *  launch_key (not pid alone — OS pid recycling). Called by the managed-spawn launcher. */
+  recordManagedSession(sessionId: string, pid: number, launchKey: string): void {
+    this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      // The session row may not exist yet (preminted id, registered by its own SessionStart);
+      // upsert the managed fields so the launcher can premint BEFORE the child registers.
+      const exists = this.db.prepare('SELECT session_id FROM sessions WHERE session_id=?').get(sessionId) as { session_id: string } | undefined;
+      if (exists) {
+        this.db.prepare('UPDATE sessions SET managed_by_xbus=1, managed_pid=?, managed_started_at=?, managed_launch_key=?, updated_at=? WHERE session_id=?').run(pid, now, launchKey, now, sessionId);
+      } else {
+        const auto = automaticAlias(sessionId);
+        this.db.prepare(
+          `INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, receive_mode, state, last_seen_at, created_at, updated_at, management_state, source_last, identify_confidence, managed_by_xbus, managed_pid, managed_started_at, managed_launch_key)
+           VALUES (?,?,?,?,?, '[]', 'hook_checkpoint', 'disconnected', ?,?,?, 'active', 'managed_launch', 'signal', 1, ?, ?, ?)`,
+        ).run(sessionId, auto.display, 'proj-managed', '/', XBUS_VERSION, now, now, now, pid, now, launchKey);
+        this.db.prepare('INSERT OR IGNORE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, 1)').run(sessionId);
+      }
+      this.ledger('MANAGED_SESSION_LAUNCHED', OPERATOR_LEDGER_ACTOR, { sessionId }, { launchKey });
+    });
+  }
+
+  /**
+   * Beta.7 (ADR 0025): does this session have an ELIGIBLE queued delivery right now — i.e. a
+   * message the NEXT checkpoint would inject? True iff (a) a queued/retry_wait delivery exists
+   * whose next_attempt_at is due and whose message hasn't expired, AND (b) the session accepts
+   * injection (ready_checkpoint|ready_live) AND auto-delivery isn't paused/dnd/manual. Used by
+   * the resident rewaker hook to decide whether to fire the documented asyncRewake (exit 2).
+   * PURE READ — no mutation, no injection; the actual body still drains on the pull path.
+   */
+  hasEligibleDelivery(sessionId: string): boolean {
+    const rd = this.readinessOf(sessionId);
+    if (!acceptsInjection(rd)) return false;
+    if (!this.controls.autoDeliveryEnabled(sessionId)) return false;
+    const now = this.clock.nowIso();
+    const row = this.db.prepare(
+      `SELECT 1 FROM deliveries d JOIN messages m ON m.message_id=d.message_id
+        WHERE d.recipient_session_id=? AND d.state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+          AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
+        LIMIT 1`,
+    ).get(sessionId, now, now) as { 1: number } | undefined;
+    return row !== undefined;
+  }
+
+  // ─────────────────────── beta.7 schedules (ADR 0025) ───────────────────────
+
+  /**
+   * Create a schedule (opt-in managed execution). Validates the loop-floor (min_interval_ms)
+   * and computes the first next_run. Appends a SCHEDULE_CREATED ledger event. The scheduler
+   * tick fires it exactly-once. `nextRunAtIso` is the first fire instant (caller-computed for
+   * 'once', or now for an immediately-due interval). Returns the schedule id.
+   */
+  createSchedule(input: {
+    createdByActor: string; title?: string; targetAddress: string; payloadText: string; payloadKind?: string;
+    requiresAck?: boolean; requiresReply?: boolean; kind: 'once' | 'interval' | 'cron'; scheduleExpr?: string;
+    timezone?: string; quietHoursJson?: string; deliveryMode?: 'enqueue_only' | 'wake_if_running' | 'managed_spawn';
+    managedBudgetJson?: string; concurrencyKey?: string; minIntervalMs?: number; wakeLimitPerDay?: number;
+    maxFires?: number; originGuard?: boolean; nextRunAtIso: string;
+  }): { scheduleId: string; nextRun: string } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const scheduleId = this.ids.next();
+      const minInterval = input.minIntervalMs ?? 60000;
+      if (minInterval < 1000) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'min_interval_ms floor is 1000 (loop guard)');
+      if (input.kind === 'interval') {
+        const iv = Number(input.scheduleExpr ?? '');
+        if (!Number.isFinite(iv) || iv < minInterval) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `interval schedule_expr must be >= min_interval_ms (${minInterval})`);
+      }
+      this.db.prepare(
+        `INSERT INTO schedules (schedule_id, created_by_actor, title, target_address, payload_kind, payload_text,
+           requires_ack, requires_reply, kind, schedule_expr, timezone, quiet_hours_json, delivery_mode,
+           managed_budget_json, concurrency_key, min_interval_ms, wake_limit_per_day, next_run, max_fires,
+           origin_guard, state, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?)`,
+      ).run(
+        scheduleId, input.createdByActor, input.title ?? null, input.targetAddress, input.payloadKind ?? 'request', input.payloadText,
+        input.requiresAck === false ? 0 : 1, input.requiresReply === false ? 0 : 1, input.kind, input.scheduleExpr ?? null,
+        input.timezone ?? 'UTC', input.quietHoursJson ?? null, input.deliveryMode ?? 'enqueue_only',
+        input.managedBudgetJson ?? null, input.concurrencyKey ?? null, minInterval, input.wakeLimitPerDay ?? null,
+        input.nextRunAtIso, input.maxFires ?? null, input.originGuard === false ? 0 : 1, now, now,
+      );
+      this.ledger('SCHEDULE_CREATED', input.createdByActor === OPERATOR_SESSION_ID ? OPERATOR_LEDGER_ACTOR : input.createdByActor, {}, { scheduleId, kind: input.kind, target: input.targetAddress, deliveryMode: input.deliveryMode ?? 'enqueue_only' });
+      return { scheduleId, nextRun: input.nextRunAtIso };
+    });
+  }
+
+  /** Pause or resume a schedule (CAS on active/paused). */
+  setScheduleState(scheduleId: string, state: 'paused' | 'active' | 'cancelled'): { scheduleId: string; state: string } {
+    return this.db.transaction(() => {
+      const s = this.db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string } | undefined;
+      if (!s) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such schedule');
+      // Never revive a terminal (exhausted/cancelled) schedule via pause/resume.
+      if (s.state === 'cancelled' || s.state === 'exhausted') {
+        if (state === 'cancelled') return { scheduleId, state: s.state };
+        throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `schedule is ${s.state}`);
+      }
+      this.db.prepare('UPDATE schedules SET state=?, updated_at=? WHERE schedule_id=?').run(state, this.clock.nowIso(), scheduleId);
+      this.ledger(state === 'cancelled' ? 'SCHEDULE_CANCELLED' : state === 'paused' ? 'SCHEDULE_PAUSED' : 'SCHEDULE_RESUMED', OPERATOR_LEDGER_ACTOR, {}, { scheduleId });
+      return { scheduleId, state };
+    });
+  }
+
+  /** Clear the managed markers when a managed session is stopped. Returns the pid + the recorded
+   *  started_at + launch_key so the caller can validate LIVENESS before any kill (pid alone is
+   *  unsafe — the OS recycles pids). Refuses a non-managed session (ADR 0024 §4). */
+  clearManagedSession(sessionId: string): { sessionId: string; pid: number | null; startedAt: string | null; launchKey: string | null } {
+    return this.db.transaction(() => {
+      const s = this.db.prepare('SELECT managed_by_xbus, managed_pid, managed_started_at, managed_launch_key FROM sessions WHERE session_id=?').get(sessionId) as { managed_by_xbus: number; managed_pid: number | null; managed_started_at: string | null; managed_launch_key: string | null } | undefined;
+      if (!s) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such session');
+      if (!s.managed_by_xbus) throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'not an xbus-managed session; refusing to stop/restart it');
+      const { managed_pid: pid, managed_started_at: startedAt, managed_launch_key: launchKey } = s;
+      this.db.prepare('UPDATE sessions SET managed_by_xbus=0, managed_pid=NULL, managed_started_at=NULL, managed_launch_key=NULL, updated_at=? WHERE session_id=?').run(this.clock.nowIso(), sessionId);
+      this.ledger('MANAGED_SESSION_STOPPED', OPERATOR_LEDGER_ACTOR, { sessionId }, { pid: pid ?? 0 });
+      return { sessionId, pid, startedAt, launchKey };
+    });
+  }
+
+  /** Idempotently clear a managed session's markers when its child process EXITS (natural or
+   *  crash). Unlike clearManagedSession this never throws (the session may already be cleared or
+   *  never have been managed) — it just ensures a dead session can't retain a killable pid, so a
+   *  later stop can never SIGTERM a recycled pid. Best-effort ledger note. */
+  markManagedSessionExited(sessionId: string): void {
+    try {
+      this.db.transaction(() => {
+        const s = this.db.prepare('SELECT managed_by_xbus, managed_pid FROM sessions WHERE session_id=?').get(sessionId) as { managed_by_xbus: number; managed_pid: number | null } | undefined;
+        if (!s || !s.managed_by_xbus) return; // already cleared / not managed — nothing to do
+        this.db.prepare('UPDATE sessions SET managed_by_xbus=0, managed_pid=NULL, managed_started_at=NULL, managed_launch_key=NULL, updated_at=? WHERE session_id=?').run(this.clock.nowIso(), sessionId);
+        this.ledger('MANAGED_SESSION_EXITED', OPERATOR_LEDGER_ACTOR, { sessionId }, { pid: s.managed_pid ?? 0 });
+      });
+    } catch { /* best-effort: never let exit bookkeeping crash the broker */ }
   }
 }

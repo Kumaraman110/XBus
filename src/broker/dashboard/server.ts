@@ -80,6 +80,11 @@ export interface DashboardServerOptions {
    */
   onOperatorSend?: (payload: unknown) => unknown;
   onMarkThreadRead?: (payload: unknown) => unknown;
+  /** Beta.7 (ADR 0024): operator session-control callback (rename alias / pause-DND / pin /
+   *  archive / remove-record / stop-managed). Payload carries {action, sessionId, ...}. */
+  onOperatorControl?: (payload: unknown) => unknown;
+  /** Beta.7 (ADR 0025): operator schedule callback (create / pause / resume / cancel). */
+  onOperatorSchedule?: (payload: unknown) => unknown;
   /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
   maxWriteBodyBytes?: number;
 }
@@ -107,6 +112,8 @@ export class DashboardServer {
   private readonly maxStreams: number;
   private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
   private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorControl: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorSchedule: ((payload: unknown) => unknown) | undefined;
   private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
 
@@ -123,6 +130,8 @@ export class DashboardServer {
     this.maxStreams = opts.maxStreams ?? 64;
     this.onOperatorSend = opts.onOperatorSend;
     this.onMarkThreadRead = opts.onMarkThreadRead;
+    this.onOperatorControl = opts.onOperatorControl;
+    this.onOperatorSchedule = opts.onOperatorSchedule;
     this.maxWriteBodyBytes = opts.maxWriteBodyBytes ?? 96 * 1024;
   }
 
@@ -284,7 +293,10 @@ export class DashboardServer {
     const sendNew = p === '/api/thread';
     const sendFollow = /^\/api\/thread\/([^/]+)\/send$/.exec(p);
     const markRead = /^\/api\/thread\/([^/]+)\/read$/.exec(p);
-    if (!sendNew && !sendFollow && !markRead) return this.json(res, 404, { error: 'not_found' });
+    const control = /^\/api\/session\/([^/]+)\/control$/.exec(p); // beta.7 operator controls
+    const scheduleNew = p === '/api/schedule';                    // beta.7 create schedule
+    const scheduleState = /^\/api\/schedule\/([^/]+)\/state$/.exec(p); // pause/resume/cancel
+    if (!sendNew && !sendFollow && !markRead && !control && !scheduleNew && !scheduleState) return this.json(res, 404, { error: 'not_found' });
 
     const body = await this.readJsonBody(req, res, this.maxWriteBodyBytes);
     if (body === null) return; // already responded (413/400)
@@ -299,6 +311,21 @@ export class DashboardServer {
         const result = await this.onOperatorSend(payload);
         return this.json(res, 200, result);
       }
+      if (control) {
+        if (!this.onOperatorControl) return this.json(res, 503, { error: 'write_unavailable' });
+        // The target sessionId comes from the PATH (not a spoofable body field); action + params from the body.
+        const result = await this.onOperatorControl({ ...body, sessionId: decodeURIComponent(control[1]!) });
+        return this.json(res, 200, result);
+      }
+      if (scheduleNew || scheduleState) {
+        if (!this.onOperatorSchedule) return this.json(res, 503, { error: 'write_unavailable' });
+        // Create: action defaults to 'create'. State-change: scheduleId + action from the PATH/body.
+        const payload = scheduleState
+          ? { ...body, scheduleId: decodeURIComponent(scheduleState[1]!) }
+          : { action: 'create', ...body };
+        const result = await this.onOperatorSchedule(payload);
+        return this.json(res, 200, result);
+      }
       // markRead
       if (!this.onMarkThreadRead) return this.json(res, 503, { error: 'write_unavailable' });
       const result = await this.onMarkThreadRead({ ...body, threadId: decodeURIComponent(markRead![1]!) });
@@ -307,7 +334,7 @@ export class DashboardServer {
       // Map a typed XBusError to a clean 4xx; anything else to 500. Never leak a stack.
       const err = e as { code?: string; message?: string };
       const code = typeof err.code === 'string' ? err.code : undefined;
-      const status = code && /VALIDATION|PROTOCOL|RESERVED|PAYLOAD|NOT_FOUND|UNKNOWN_RECIPIENT|EXPIRED|BLOCKED|ILLEGAL_STATE|FORBIDDEN/i.test(code) ? 400 : 500;
+      const status = code && /VALIDATION|PROTOCOL|RESERVED|PAYLOAD|NOT_FOUND|UNKNOWN_RECIPIENT|EXPIRED|BLOCKED|ILLEGAL_STATE|FORBIDDEN|TAKEN|INVALID_SESSION/i.test(code) ? 400 : 500;
       this.log(`dashboard write failed: ${err.message ?? 'error'}`);
       return this.json(res, status, { error: code ?? 'internal', message: status === 400 ? (err.message ?? 'invalid request') : 'internal' });
     }

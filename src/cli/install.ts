@@ -28,6 +28,7 @@ import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaul
 import { SCHEMA_VERSION } from '../protocol/handshake.js';
 import { snapshotDbCheckpointed, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
 import { openDatabase } from '../database/connection.js';
+import { bundledNodePath } from '../shared/bundled-runtime.js';
 import { classifyShutdown, readStateFile, stateFilePath, pidIsAlive } from '../broker/state-file.js';
 
 /**
@@ -154,7 +155,11 @@ export interface InstallResult {
 /** The payload directories/files that constitute the installable plugin.
  *  provenance.json travels with the install so installed binaries report the exact
  *  build identity (ADR 0011) with no git / no source checkout. */
-const PAYLOAD = ['.claude-plugin', '.mcp.json', 'hooks', 'dist', 'package.json', 'provenance.json'];
+// Beta.7 (ADR 0022): 'runtime' carries the XBus-owned node.exe into the installed plugin dir
+// (present in a packaged artifact; absent in a dev/source install — enumeratePayload skips a
+// missing entry). It is walked, checksum-verified during staging, recorded in manifest.files[]
+// for clean uninstall, and swapped atomically by the existing stage->rename install path.
+const PAYLOAD = ['.claude-plugin', '.mcp.json', 'hooks', 'dist', 'package.json', 'provenance.json', 'runtime'];
 const PAYLOAD_DEPS = ['uuid', 'zod'];
 
 function sha256(file: string): string {
@@ -412,10 +417,16 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       const installId = `xbus-${now.replace(/[:.]/g, '-')}-${process.pid}`;
       const configPath = opts.claudeConfigPath ?? defaultClaudeConfigPath();
       const settingsPath = opts.claudeSettingsPath ?? defaultClaudeSettingsPath();
+      // Beta.7 (ADR 0022): the MCP server + hooks are launched by the XBus-OWNED bundled
+      // runtime when the installed plugin dir ships one, so installed XBus IGNORES system
+      // Node/PATH. Precedence: explicit opts.nodePath (tests) → bundled runtime/node.exe (real
+      // Windows install) → process.execPath (dev/source install with no bundled runtime).
+      const installedRuntime = bundledNodePath(pluginDir);
+      const nodePath = opts.nodePath ?? (fs.existsSync(installedRuntime) ? installedRuntime : process.execPath);
       const usrOpts = {
         configPath,
         settingsPath,
-        nodePath: opts.nodePath ?? process.execPath,
+        nodePath,
         serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
         // Beta.5: SessionStart gets its OWN handler (control-plane visibility), distinct
@@ -459,6 +470,12 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     // FULL SUCCESS: every post-migration step committed. Only NOW discard the pre-upgrade
     // snapshot — it protected the DB across health/user-scope/manifest/marker (blocker #4).
     if (dbSnapshot) discardSnapshot(dbSnapshot.dir);
+    // Reclaim the pre-swap plugin backup(s): they exist ONLY to roll back a FAILED install, so on
+    // full success they are dead weight. beta.7 grew the plugin dir to tens of MB (the bundled
+    // node.exe), so leaving one behind per upgrade would accumulate unbounded disk until
+    // uninstall. Remove the backups we created this run (best-effort — a stale backup is
+    // reclaimable but should not be retained silently).
+    for (const b of backups) { try { if (fs.existsSync(b.backup)) fs.rmSync(b.backup, { recursive: true, force: true }); } catch { /* best effort */ } }
     return { ok: true, dryRun: false, plan, manifestPath: manifestPath(installRoot), health, migrated };
   } catch (e) {
     // Full rollback on ANY failure (incl. post-swap errors + post-migration fault boundaries).
@@ -497,11 +514,14 @@ function readCommit(source: string): string {
 async function healthCheck(dataDir: string): Promise<{ ok: boolean; detail: string }> {
   try {
     const broker = await startBrokerHost({ dataDir, reaperIntervalMs: 0 });
-    // ACL of the secret must be owner-only.
+    // ACL of the secret must be owner-only. A GENUINE broad principal fails closed; an
+    // INCONCLUSIVE read (the icacls read subprocess timed out under load — readError) is not
+    // evidence of a broad ACL, so it does not fail the install (the hardening step already
+    // ran/was skipped by policy; a read-timeout must not falsely condemn an owner-only secret).
     const acl = describeAcl(secretPath(dataDir));
     await broker.stop();
-    if (acl.broadAccess) return { ok: false, detail: 'root secret has broad ACL' };
-    return { ok: true, detail: 'broker started + stopped cleanly; secret ACL owner-only' };
+    if (acl.broadAccess && !acl.readError) return { ok: false, detail: 'root secret has broad ACL' };
+    return { ok: true, detail: acl.readError ? 'broker started + stopped cleanly; secret ACL read inconclusive (icacls timeout)' : 'broker started + stopped cleanly; secret ACL owner-only' };
   } catch (e) {
     return { ok: false, detail: (e as Error).message };
   }

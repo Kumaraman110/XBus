@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { install } from '../../src/cli/install.js';
 import { openDatabase, type SqliteDriver } from '../../src/database/connection.js';
 import { MIGRATIONS } from '../../src/database/migrations.js';
+import { SCHEMA_VERSION } from '../../src/protocol/handshake.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 let root: string; let dataDir: string; let dbPath: string; let prevLegacy: string | undefined;
@@ -98,6 +99,22 @@ describe('install DB rollback — fault injection after every post-migration bou
     expect(leftover).toHaveLength(0);
   }, 60_000);
 
+  it('a SUCCESSFUL upgrade reclaims the pre-swap plugin backup (no unbounded backup accumulation)', async () => {
+    // Regression (beta.7): the bundled runtime made the plugin dir tens of MB, so a plugin
+    // backup left behind per successful upgrade accumulates unbounded disk. On full success the
+    // installer must reclaim the backup it created (it exists only to roll back a FAILED install).
+    const pluginDir = path.join(root, 'plugin');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'OLD.txt'), 'prior install'); // pre-existing plugin → forces a backup
+    const r = await install(baseOpts());
+    expect(r.ok, r.error).toBe(true);
+    // No `.plugin.backup-*` dir remains after a clean success.
+    const backups = fs.readdirSync(root).filter((n) => n.startsWith('.plugin.backup-'));
+    expect(backups, `plugin backups must be reclaimed on success, found: ${backups.join(', ')}`).toHaveLength(0);
+    // The new plugin is in place (the backup's removal didn't touch the live dir).
+    expect(fs.existsSync(path.join(pluginDir, 'dist', 'cli', 'main.js'))).toBe(true);
+  }, 60_000);
+
   it('restore FAILURE: the recovery snapshot is RETAINED and its path is reported (never deleted)', async () => {
     expect(schemaVersion(dbPath)).toBe(6);
     // Force a boundary fault AND force the DB restore itself to fail. The DB is left
@@ -116,9 +133,12 @@ describe('install DB rollback — fault injection after every post-migration bou
     expect(hasArchive, 'retained snapshot contains the main-DB archive').toBe(true);
   }, 60_000);
 
-  it('beta.6 s7→s8: a CLEAN upgrade migrates in place, preserving messages + backfilling threads', async () => {
+  it('beta.6 s7→head: a CLEAN upgrade migrates in place, preserving messages + backfilling threads (v8)', async () => {
     // Seed a pre-existing s7 (beta.5.1) DB with a real message so we can prove the v8 backfill
-    // runs on live user data during the health-check migration and preserves it.
+    // runs on live user data during the health-check migration and preserves it. The install
+    // forward-migrates to the CURRENT head schema (beta.7 = s9; v9 is additive over v8), so we
+    // assert SCHEMA_VERSION, not a frozen literal — the v8 backfill effects below are unchanged
+    // by later additive migrations.
     const s7root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-s7up-'));
     const s7data = path.join(s7root, 'data'); const s7db = path.join(s7data, 'xbus.sqlite');
     fs.mkdirSync(s7data, { recursive: true });
@@ -132,7 +152,7 @@ describe('install DB rollback — fault injection after every post-migration bou
     try {
       const r = await install({ source: REPO, installRoot: s7root, dataDir: s7data, registerUserScope: true, claudeConfigPath: path.join(s7root, '.claude.json'), claudeSettingsPath: path.join(s7root, '.claude', 'settings.json'), stopRunningBroker: false });
       expect(r.ok, r.error).toBe(true);
-      expect(schemaVersion(s7db)).toBe(8); // migrated in place
+      expect(schemaVersion(s7db)).toBe(SCHEMA_VERSION); // migrated in place to head (>= 8; beta.7 = 9)
       const ro = openDatabase(s7db, { readOnly: true });
       try {
         // The legacy message survived and was backfilled into a coherent degenerate thread.

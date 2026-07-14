@@ -25,6 +25,7 @@ import { BUILD_ID, SCHEMA_VERSION, WIRE_COMPATIBILITY_ID } from '../protocol/han
 import { PROTOCOL_VERSION, XBUS_VERSION } from '../protocol/version.js';
 import { exactBuildId, SECURE_TRANSPORT_VERSION } from '../shared/build-identity.js';
 import { validateArtifact, validateChecksumCoverage, type ContractViolation } from '../shared/artifact-contract.js';
+import { BUNDLED_NODE_VERSION, BUNDLED_NODE_SHA256, assertPinnedRuntimeInRange } from '../shared/bundled-runtime.js';
 
 // Repo root: npm sets cwd to the package root for `npm run`; allow an override
 // for tests. (NOT derived from import.meta.url, which is unreliable under some
@@ -182,6 +183,27 @@ export function buildPackage(stagingDir: string): PackageResult {
     copyDir(src, path.join(stagingDir, 'node_modules', dep));
   }
 
+  // 2b) Beta.7 (ADR 0022): the XBus-OWNED bundled Node runtime. The builder supplies a
+  //     vetted `node.exe` via XBUS_BUNDLED_NODE; we assert the PINNED version is in the
+  //     supported floor [22.13,25) and (when a SHA is pinned) that the bytes match, then copy
+  //     it to runtime/node.exe. It is a plain interpreter binary (.exe, not a .node addon), so
+  //     assertNoBuildToolchain still passes and buildToolchainRequiredAtRuntime stays false.
+  //     The whole-tree SHA256SUMS (step 6) checksums it automatically; the fixed binary keeps
+  //     the STORE zip byte-reproducible. Skipped only when XBUS_BUNDLED_NODE is unset (a
+  //     dev/source package without the runtime — the contract check will flag the missing file).
+  const bundledNodeSrc = process.env.XBUS_BUNDLED_NODE;
+  if (bundledNodeSrc) {
+    assertPinnedRuntimeInRange();
+    if (!fs.existsSync(bundledNodeSrc)) throw new Error(`XBUS_BUNDLED_NODE points at a missing file: ${bundledNodeSrc}`);
+    const actualSha = sha256(bundledNodeSrc);
+    if (BUNDLED_NODE_SHA256 && actualSha !== BUNDLED_NODE_SHA256) {
+      throw new Error(`bundled node.exe SHA mismatch: expected ${BUNDLED_NODE_SHA256} (pinned for ${BUNDLED_NODE_VERSION}), got ${actualSha}. Supply the exact vetted binary via XBUS_BUNDLED_NODE.`);
+    }
+    const runtimeDir = path.join(stagingDir, 'runtime');
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.copyFileSync(bundledNodeSrc, path.join(runtimeDir, 'node.exe'));
+  }
+
   // 3) Runtime package.json (prod deps + pinned runtime; no dev deps, no scripts).
   const stagedPkg = {
     name: repoPkg.name,
@@ -204,7 +226,10 @@ export function buildPackage(stagingDir: string): PackageResult {
     version: repoPkg.version,
     commit,
     buildId: BUILD_ID,
-    notes: 'node:sqlite is a Node built-in (ADR 0002); all deps are pure-JS and pre-installed. No npm/Bun/node-gyp/compiler needed after install.',
+    // Beta.7 (ADR 0022): the PINNED bundled runtime version (deterministic constant, NOT the
+    // builder's process.version). Present only when the artifact ships runtime/node.exe.
+    ...(bundledNodeSrc ? { bundledNodeVersion: BUNDLED_NODE_VERSION, bundledRuntime: 'runtime/node.exe' } : {}),
+    notes: 'node:sqlite is a Node built-in (ADR 0002); all deps are pure-JS and pre-installed. No npm/Bun/node-gyp/compiler needed after install. The bundled runtime is an interpreter binary, not a build tool or native addon.',
   }, null, 2) + '\n');
 
   // 4b) Build manifest — provenance of THIS artifact. NOTE: `buildId`
@@ -236,6 +261,10 @@ export function buildPackage(stagingDir: string): PackageResult {
     applicationProtocolVersion: PROTOCOL_VERSION,
     secureTransportProtocolVersion: SECURE_TRANSPORT_VERSION,
     schemaVersion: SCHEMA_VERSION,
+    // Beta.7 (ADR 0022): the deterministic pinned bundled-runtime version, present only when
+    // the artifact ships runtime/node.exe. doctor/version report it so the user sees the
+    // XBus-owned Node, not whatever system Node happens to be on PATH.
+    ...(bundledNodeSrc ? { bundledNodeVersion: BUNDLED_NODE_VERSION } : {}),
   };
   fs.writeFileSync(path.join(stagingDir, 'provenance.json'), JSON.stringify(provenance, null, 2) + '\n');
 
@@ -269,7 +298,7 @@ export function buildPackage(stagingDir: string): PackageResult {
   // 9) Verify EXPECTED outputs are present — never report success on an empty/
   //    partial dir. (Superseded by the contract validator below, kept
   //    as a fast fail-fast.)
-  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'INSTALL.txt', 'install.ps1', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod'];
+  const expected = ['package.json', 'runtime.json', 'build-manifest.json', 'sbom.json', 'SHA256SUMS', 'INSTALL.txt', 'install.ps1', 'dist/cli/main.js', 'dist/launcher/xclaude.js', 'node_modules/uuid', 'node_modules/zod', ...(bundledNodeSrc ? ['runtime/node.exe'] : [])];
   const missingOutputs = expected.filter((e) => !fs.existsSync(path.join(stagingDir, e)));
 
   // 8b) NORMATIVE artifact-contract validation: the SAME validator the

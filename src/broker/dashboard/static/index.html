@@ -58,13 +58,33 @@
       </div>
     </section>
 
-    <h2>Sessions</h2>
-    <table id="sessions">
-      <thead>
-        <tr><th>Session</th><th>State</th><th>Conn/Ready</th><th>Last sent</th><th>Last received</th><th>Delivery (q/d/ack/reply/fail)</th><th>Project</th></tr>
-      </thead>
-      <tbody id="sessions-body"><tr><td colspan="7">Loading…</td></tr></tbody>
-    </table>
+    <section class="sessions-section" aria-labelledby="sessions-heading">
+      <div class="section-head">
+        <h2 id="sessions-heading">Sessions</h2>
+        <label class="toggle">
+          <input type="checkbox" id="show-internal"> <span>Internal sessions</span>
+        </label>
+      </div>
+      <div class="table-scroll">
+        <table id="sessions">
+          <thead>
+            <tr>
+              <th scope="col">Session</th>
+              <th scope="col">Status</th>
+              <th scope="col">Queued</th>
+              <th scope="col">Delivered</th>
+              <th scope="col">ACK</th>
+              <th scope="col">Replied</th>
+              <th scope="col">Failed</th>
+              <th scope="col">Project</th>
+              <th scope="col"><span class="sr-only">Details</span></th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body"><tr><td colspan="9" class="state-cell">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <p id="sessions-hidden-note" class="muted hidden-note" aria-live="polite"></p>
+    </section>
 
     <h2>Audit ledger <span class="muted">(append-only, hash-chained)</span></h2>
     <table id="ledger">
