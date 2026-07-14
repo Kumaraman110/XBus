@@ -116,6 +116,66 @@ describe('install DB rollback — fault injection after every post-migration bou
     expect(hasArchive, 'retained snapshot contains the main-DB archive').toBe(true);
   }, 60_000);
 
+  it('beta.6 s7→s8: a CLEAN upgrade migrates in place, preserving messages + backfilling threads', async () => {
+    // Seed a pre-existing s7 (beta.5.1) DB with a real message so we can prove the v8 backfill
+    // runs on live user data during the health-check migration and preserves it.
+    const s7root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-s7up-'));
+    const s7data = path.join(s7root, 'data'); const s7db = path.join(s7data, 'xbus.sqlite');
+    fs.mkdirSync(s7data, { recursive: true });
+    migrateTo(s7db, 7);
+    const w = openDatabase(s7db, { applyPragmas: true });
+    w.exec("INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, state, last_seen_at, created_at, updated_at) VALUES ('s7-sess','session-s7','p','/','0.1.0-beta.5.1','[]','connected','t','t','t')");
+    w.exec("INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, recipient_sequence, body_text, body_hash, requires_ack, requires_reply, created_at, trace_id) VALUES ('m7','1','s7-sess','a','s7-sess','a','request','m7',1,'legacy body','h',1,0,'2026-01-01T00:00:00.000Z','tr')");
+    w.close();
+    expect(schemaVersion(s7db)).toBe(7);
+    const prev = process.env.XBUS_LEGACY_DATA_DIR; process.env.XBUS_LEGACY_DATA_DIR = path.join(s7root, 'iso');
+    try {
+      const r = await install({ source: REPO, installRoot: s7root, dataDir: s7data, registerUserScope: true, claudeConfigPath: path.join(s7root, '.claude.json'), claudeSettingsPath: path.join(s7root, '.claude', 'settings.json'), stopRunningBroker: false });
+      expect(r.ok, r.error).toBe(true);
+      expect(schemaVersion(s7db)).toBe(8); // migrated in place
+      const ro = openDatabase(s7db, { readOnly: true });
+      try {
+        // The legacy message survived and was backfilled into a coherent degenerate thread.
+        const m = ro.prepare("SELECT thread_id, thread_sequence, author_type, body_text FROM messages WHERE message_id='m7'").get() as { thread_id: string; thread_sequence: number; author_type: string; body_text: string };
+        expect(m.body_text).toBe('legacy body'); // not lost
+        expect(m.thread_id).toBe('m7');           // thread_id = correlation_id
+        expect(m.thread_sequence).toBe(1);
+        expect(m.author_type).toBe('claude');
+        expect((ro.prepare("SELECT COUNT(*) n FROM threads WHERE thread_id='m7'").get() as { n: number }).n).toBe(1);
+      } finally { ro.close(); }
+    } finally {
+      if (prev === undefined) delete process.env.XBUS_LEGACY_DATA_DIR; else process.env.XBUS_LEGACY_DATA_DIR = prev;
+      try { fs.rmSync(s7root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 60_000);
+
+  it('beta.6 s7→s8: a failed upgrade RESTORES the s7 DB (never left forward-migrated at s8)', async () => {
+    const s7root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-s7fault-'));
+    const s7data = path.join(s7root, 'data'); const s7db = path.join(s7data, 'xbus.sqlite');
+    fs.mkdirSync(s7data, { recursive: true });
+    migrateTo(s7db, 7);
+    const w = openDatabase(s7db, { applyPragmas: true });
+    w.exec("INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, state, last_seen_at, created_at, updated_at) VALUES ('s7-sess','session-s7','p','/','0.1.0-beta.5.1','[]','connected','t','t','t')");
+    w.close();
+    const prev = process.env.XBUS_LEGACY_DATA_DIR; process.env.XBUS_LEGACY_DATA_DIR = path.join(s7root, 'iso');
+    try {
+      const r = await install({ source: REPO, installRoot: s7root, dataDir: s7data, registerUserScope: true, claudeConfigPath: path.join(s7root, '.claude.json'), claudeSettingsPath: path.join(s7root, '.claude', 'settings.json'), stopRunningBroker: false, faultAfter: 'after-health' });
+      expect(r.ok).toBe(false);
+      expect(r.rolledBack).toBe(true);
+      // Restored to s7 — the v8 thread tables are gone; the session survived.
+      expect(schemaVersion(s7db), 'restored to s7 after a failed beta.6 upgrade').toBe(7);
+      const ro = openDatabase(s7db, { readOnly: true });
+      try {
+        expect((ro.prepare("SELECT COUNT(*) n FROM sessions WHERE session_id='s7-sess'").get() as { n: number }).n).toBe(1);
+        expect(ro.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='threads'`).get(), 'no v8 thread table after restore').toBeUndefined();
+      } finally { ro.close(); }
+      expect(r.error ?? '').toMatch(/db restored to pre-upgrade snapshot/);
+    } finally {
+      if (prev === undefined) delete process.env.XBUS_LEGACY_DATA_DIR; else process.env.XBUS_LEGACY_DATA_DIR = prev;
+      try { fs.rmSync(s7root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 60_000);
+
   it('aborts the upgrade when a FOREIGN broker holds the DB (never snapshot/migrate under a writer we do not own)', async () => {
     // Write a broker state file owned by a DIFFERENT OS user (a foreign owner hash). The
     // installer's pre-migration writer-free gate (stopOwnedBrokerForUpgrade → classifyShutdown)

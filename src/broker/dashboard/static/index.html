@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>XBus control plane</title>
+  <title>XBus communication console</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
-    <h1>XBus <span class="tag">control plane</span></h1>
+    <h1>XBus <span class="tag">communication console</span></h1>
     <p id="status" class="status">Connecting…</p>
   </header>
 
@@ -16,6 +16,48 @@
   <section id="audit" class="audit"></section>
 
   <main>
+    <!-- Communication console (beta.6 Phase 2): operator ↔ session threads. -->
+    <section class="console">
+      <div class="console-grid">
+        <!-- Left: thread list + "new thread" composer target. -->
+        <aside class="threads-pane">
+          <h2>Threads</h2>
+          <div class="new-thread">
+            <label class="field">
+              <span>New thread to</span>
+              <select id="session-select" aria-label="Select a session"></select>
+            </label>
+            <button id="new-thread-btn" type="button" disabled>Start a thread</button>
+          </div>
+          <ul id="thread-list" class="thread-list" aria-label="Threads">
+            <li class="empty" id="threads-empty">No threads yet. Select a session and start one.</li>
+          </ul>
+        </aside>
+
+        <!-- Right: the selected thread's ordered timeline + composer. -->
+        <section class="thread-pane">
+          <div id="thread-header" class="thread-header" hidden>
+            <div>
+              <span id="thread-peer" class="thread-peer"></span>
+              <span id="thread-subject" class="muted"></span>
+            </div>
+            <span id="thread-state" class="muted"></span>
+          </div>
+          <div id="timeline" class="timeline" aria-live="polite">
+            <p class="empty" id="timeline-empty">Select a thread to see its timeline, or start a new one.</p>
+          </div>
+          <form id="composer" class="composer" hidden>
+            <textarea id="composer-text" rows="2" placeholder="Message the session as local-operator…" aria-label="Message text"></textarea>
+            <div class="composer-row">
+              <label class="check"><input type="checkbox" id="req-reply" checked> expect a reply</label>
+              <button id="send-btn" type="submit">Send</button>
+            </div>
+            <p id="composer-error" class="composer-error" hidden></p>
+          </form>
+        </section>
+      </div>
+    </section>
+
     <h2>Sessions</h2>
     <table id="sessions">
       <thead>

@@ -20,6 +20,7 @@ import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import { DeliveryState } from '../protocol/states.js';
 import { DEFAULT_BACKOFF, nextBackoffMs, type BackoffConfig } from './retry.js';
+import { OPERATOR_SESSION_ID } from './operator.js';
 
 export interface SweepResult {
   /** transport_written deliveries whose ack deadline passed -> retry_wait. */
@@ -124,9 +125,13 @@ export class Reaper {
    */
   private reapExpiredSessions(): number {
     const now = this.clock.nowIso();
+    // The reserved `local-operator` principal (ADR 0021) is NEVER expired: it keeps
+    // expires_at NULL (so it should not appear here), but guard by id too so no path can
+    // tombstone it — an expired operator would bounce every peer reply
+    // (RECIPIENT_SESSION_EXPIRED) and dead-letter its inbound.
     const due = this.db.prepare(
-      `SELECT session_id FROM sessions WHERE expired_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC`,
-    ).all(now) as Array<{ session_id: string }>;
+      `SELECT session_id FROM sessions WHERE expired_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ? AND session_id <> ? ORDER BY expires_at ASC`,
+    ).all(now, OPERATOR_SESSION_ID) as Array<{ session_id: string }>;
     let sessionsExpired = 0;
     for (const s of due) {
       // CAS on expired_at IS NULL → idempotent (a second sweep sees expired_at set).

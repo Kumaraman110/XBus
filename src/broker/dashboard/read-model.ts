@@ -12,6 +12,7 @@
  */
 import type { SqliteDriver } from '../../database/connection.js';
 import { verifyLedger } from '../ledger.js';
+import { OPERATOR_SESSION_ID } from '../operator.js';
 
 /** The dashboard-visible label for a session, derived top-down, first-match-wins from the
  *  FOUR real fields (ADR 0020 Q2 decision table). */
@@ -85,6 +86,70 @@ export interface UnmanagedBanner {
 export interface LedgerPage {
   events: Array<{ seq: number; eventType: string; actor: string; subject: unknown; payload: unknown; createdAt: string; entryHash: string }>;
   nextBeforeSeq: number | null;
+}
+
+/** Beta.6 (ADR 0021): a thread as shown in the console list — ids/counts/labels, NO bodies. */
+export interface DashboardThreadSummary {
+  threadId: string;
+  subject: string | null;
+  state: string;                 // 'open' | 'closed'
+  createdAt: string;
+  updatedAt: string;
+  lastMessageAt: string;
+  lastThreadSequence: number;
+  lastReadThreadSequence: number;
+  unreadCount: number;           // derived: turns after the operator's cursor not sent by the operator
+  peerSessionId: string | null;  // the session this thread is with
+  peerName: string | null;
+  turnCount: number;
+  lastTurnState: string;         // mapped delivery state of the latest turn
+}
+
+/** A single ordered turn in a thread timeline (BODY included — the operator's own thread). */
+export interface DashboardThreadTurn {
+  messageId: string;
+  threadSequence: number;
+  kind: string;
+  authorType: string;            // 'operator' | 'claude'
+  senderName: string;
+  senderSessionId: string;
+  recipientName: string;
+  recipientSessionId: string;
+  correlationId: string;
+  causationId: string | null;
+  parentMessageId: string | null;
+  text: string;
+  requiresAck: boolean;
+  requiresReply: boolean;
+  createdAt: string;
+  expiresAt: string | null;
+  deliveryState: string;         // queued | delivered | acknowledged | replied | failed
+  ackStatus: string | null;      // 'accepted' | 'rejected' | null
+  ackAttempts: number;
+  failureCategory: string | null;
+  deliveredAt: string | null;
+  acceptedAt: string | null;
+  completedAt: string | null;
+}
+
+/** One thread's full ordered timeline for the console. */
+export interface DashboardThread extends Omit<DashboardThreadSummary, 'turnCount' | 'lastTurnState'> {
+  rootMessageId: string;
+  createdByActor: string;
+  turns: DashboardThreadTurn[];
+}
+
+/** Map a raw delivery state to the console's five user-facing states (queued/delivered/
+ *  acknowledged/replied/failed) — the same rollup the session read model uses. */
+function mapDeliveryState(state: string): string {
+  switch (state) {
+    case 'queued': case 'retry_wait': case 'dispatching': return 'queued';
+    case 'transport_written': return 'delivered';
+    case 'accepted': return 'acknowledged';
+    case 'completed': return 'replied';
+    case 'dead_letter': case 'rejected': case 'expired': case 'cancelled': return 'failed';
+    default: return state;
+  }
 }
 
 export class DashboardReadModel {
@@ -199,6 +264,132 @@ export class DashboardReadModel {
     }));
     const nextBeforeSeq = events.length === limit ? events[events.length - 1]!.seq : null;
     return { events, nextBeforeSeq };
+  }
+
+  /**
+   * Beta.6 Phase 2 (ADR 0021): the operator's thread list, newest-activity first. A thread
+   * is surfaced to the console when the operator is a participant (i.e. an operator-initiated
+   * or operator-involved conversation). unreadCount is DERIVED from committed rows: turns with
+   * thread_sequence > the operator's last_read_thread_seq that the operator did not itself send.
+   * Bodies are NOT included here (list view) — only ids/counts/labels/peer. `limit` clamped.
+   */
+  threads(opts: { limit?: number } = {}): { threads: DashboardThreadSummary[] } {
+    const rawLimit = opts.limit;
+    const want = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 100;
+    const limit = Math.min(Math.max(want, 1), 200);
+    // Threads the operator participates in, with the operator's read cursor.
+    const rows = this.db.prepare(
+      `SELECT t.thread_id AS threadId, t.subject AS subject, t.state AS state, t.created_at AS createdAt,
+              t.updated_at AS updatedAt, t.last_message_at AS lastMessageAt, t.last_thread_sequence AS lastSeq,
+              p.last_read_thread_seq AS lastReadSeq
+         FROM threads t
+         JOIN thread_participants p ON p.thread_id = t.thread_id AND p.session_id = ?
+        ORDER BY t.last_message_at DESC, t.thread_id DESC
+        LIMIT ?`,
+    ).all(OPERATOR_SESSION_ID, limit) as Array<{ threadId: string; subject: string | null; state: string; createdAt: string; updatedAt: string; lastMessageAt: string; lastSeq: number; lastReadSeq: number }>;
+
+    return {
+      threads: rows.map((r) => {
+        // unread = turns after the operator's cursor NOT sent by the operator.
+        const unread = (this.db.prepare(
+          `SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND thread_sequence > ? AND sender_session_id <> ?`,
+        ).get(r.threadId, r.lastReadSeq, OPERATOR_SESSION_ID) as { n: number }).n;
+        // The peer (the non-operator participant) — the session this thread is "with".
+        const peer = this.db.prepare(
+          `SELECT session_id AS sid FROM thread_participants WHERE thread_id=? AND session_id <> ? ORDER BY joined_at ASC LIMIT 1`,
+        ).get(r.threadId, OPERATOR_SESSION_ID) as { sid: string } | undefined;
+        const peerName = peer ? this.sessionDisplay(peer.sid) : null;
+        // The latest turn's delivery state (for the list's at-a-glance status).
+        const lastState = this.latestTurnState(r.threadId);
+        return {
+          threadId: r.threadId, subject: r.subject, state: r.state,
+          createdAt: r.createdAt, updatedAt: r.updatedAt, lastMessageAt: r.lastMessageAt,
+          lastThreadSequence: r.lastSeq, lastReadThreadSequence: r.lastReadSeq, unreadCount: unread,
+          peerSessionId: peer?.sid ?? null, peerName, turnCount: r.lastSeq, lastTurnState: lastState,
+        };
+      }),
+    };
+  }
+
+  /**
+   * One thread's ordered timeline for the console. Includes each turn's BODY (the console
+   * must render message text — a deliberate, ADR-0021-scoped exposure of the OPERATOR's own
+   * threads, distinct from the body-free ledger/session projections) plus the full delivery
+   * lifecycle (queued/delivered/acked/replied/failed) + receipts, so requests, ACKs, replies,
+   * retries and failures render in one ordered timeline. Returns null if the thread is unknown
+   * or the operator is not a participant (participant-access check). Turns are ordered by
+   * thread_sequence (the single monotonic per-thread order). `limit` clamps the turn count.
+   */
+  thread(threadId: string, opts: { limit?: number } = {}): DashboardThread | null {
+    if (typeof threadId !== 'string' || threadId.length === 0) return null;
+    const t = this.db.prepare(
+      `SELECT thread_id AS threadId, root_message_id AS rootMessageId, subject, state, created_by_actor AS createdByActor,
+              created_at AS createdAt, updated_at AS updatedAt, last_message_at AS lastMessageAt, last_thread_sequence AS lastSeq
+         FROM threads WHERE thread_id=?`,
+    ).get(threadId) as { threadId: string; rootMessageId: string; subject: string | null; state: string; createdByActor: string; createdAt: string; updatedAt: string; lastMessageAt: string; lastSeq: number } | undefined;
+    if (!t) return null;
+    const opPart = this.db.prepare(`SELECT last_read_thread_seq AS lastReadSeq FROM thread_participants WHERE thread_id=? AND session_id=?`).get(threadId, OPERATOR_SESSION_ID) as { lastReadSeq: number } | undefined;
+    if (!opPart) return null; // participant-access: the operator is not in this thread
+
+    const rawLimit = opts.limit;
+    const want = typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 500;
+    const limit = Math.min(Math.max(want, 1), 1000);
+    const msgs = this.db.prepare(
+      `SELECT m.message_id AS messageId, m.thread_sequence AS seq, m.kind, m.author_type AS authorType,
+              m.sender_session_id AS senderSessionId, m.sender_alias AS senderAlias,
+              m.recipient_session_id AS recipientSessionId, m.recipient_alias AS recipientAlias,
+              m.correlation_id AS correlationId, m.causation_id AS causationId, m.parent_message_id AS parentMessageId,
+              m.body_text AS text, m.requires_ack AS requiresAck, m.requires_reply AS requiresReply,
+              m.created_at AS createdAt, m.expires_at AS expiresAt,
+              d.state AS deliveryState, d.attempt_ack_timeout AS ackAttempts, d.failure_category AS failureCategory,
+              d.transport_written_at AS deliveredAt, d.application_accepted_at AS acceptedAt, d.application_completed_at AS completedAt
+         FROM messages m LEFT JOIN deliveries d ON d.message_id = m.message_id
+        WHERE m.thread_id=?
+        ORDER BY m.thread_sequence ASC LIMIT ?`,
+    ).all(threadId, limit) as Array<Record<string, unknown>>;
+
+    const turns: DashboardThreadTurn[] = msgs.map((m) => {
+      const messageId = m.messageId as string;
+      // Receipts (ack + reply outcome) recorded for this turn — surfaces the ACK explicitly.
+      const ackReceipt = this.db.prepare(`SELECT status FROM receipts WHERE message_id=? AND receipt_type='ack' LIMIT 1`).get(messageId) as { status: string } | undefined;
+      return {
+        messageId, threadSequence: m.seq as number, kind: m.kind as string, authorType: m.authorType as string,
+        senderName: this.sessionDisplay(m.senderSessionId as string), senderSessionId: m.senderSessionId as string,
+        recipientName: this.sessionDisplay(m.recipientSessionId as string), recipientSessionId: m.recipientSessionId as string,
+        correlationId: m.correlationId as string, causationId: (m.causationId as string) ?? null, parentMessageId: (m.parentMessageId as string) ?? null,
+        text: m.text as string, requiresAck: (m.requiresAck as number) === 1, requiresReply: (m.requiresReply as number) === 1,
+        createdAt: m.createdAt as string, expiresAt: (m.expiresAt as string) ?? null,
+        deliveryState: mapDeliveryState((m.deliveryState as string) ?? 'queued'),
+        ackStatus: ackReceipt?.status ?? null,
+        ackAttempts: (m.ackAttempts as number) ?? 0, failureCategory: (m.failureCategory as string) ?? null,
+        deliveredAt: (m.deliveredAt as string) ?? null, acceptedAt: (m.acceptedAt as string) ?? null, completedAt: (m.completedAt as string) ?? null,
+      };
+    });
+    const peer = this.db.prepare(`SELECT session_id AS sid FROM thread_participants WHERE thread_id=? AND session_id <> ? ORDER BY joined_at ASC LIMIT 1`).get(threadId, OPERATOR_SESSION_ID) as { sid: string } | undefined;
+    const unread = (this.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE thread_id=? AND thread_sequence > ? AND sender_session_id <> ?`).get(threadId, opPart.lastReadSeq, OPERATOR_SESSION_ID) as { n: number }).n;
+    return {
+      threadId: t.threadId, rootMessageId: t.rootMessageId, subject: t.subject, state: t.state, createdByActor: t.createdByActor,
+      createdAt: t.createdAt, updatedAt: t.updatedAt, lastMessageAt: t.lastMessageAt,
+      lastThreadSequence: t.lastSeq, lastReadThreadSequence: opPart.lastReadSeq, unreadCount: unread,
+      peerSessionId: peer?.sid ?? null, peerName: peer ? this.sessionDisplay(peer.sid) : null,
+      turns,
+    };
+  }
+
+  /** Best-effort display name for a session id (active name → alias → short id → 'local-operator'). */
+  private sessionDisplay(sessionId: string): string {
+    if (sessionId === OPERATOR_SESSION_ID) return 'local-operator';
+    const r = this.db.prepare(`SELECT session_name AS name, automatic_alias AS alias FROM sessions WHERE session_id=?`).get(sessionId) as { name: string | null; alias: string | null } | undefined;
+    return r?.name ?? r?.alias ?? sessionId.slice(0, 8);
+  }
+
+  /** The latest turn's mapped delivery state in a thread (for the list summary). */
+  private latestTurnState(threadId: string): string {
+    const r = this.db.prepare(
+      `SELECT COALESCE(d.state,'queued') AS state FROM messages m LEFT JOIN deliveries d ON d.message_id=m.message_id
+        WHERE m.thread_id=? ORDER BY m.thread_sequence DESC LIMIT 1`,
+    ).get(threadId) as { state: string } | undefined;
+    return mapDeliveryState(r?.state ?? 'queued');
   }
 
   /** Aggregate banner data (ADR 0013 D6). The read-only worker cannot spawn a process

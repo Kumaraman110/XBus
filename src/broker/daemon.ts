@@ -26,6 +26,7 @@ import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../obse
 import { verifyLedger } from './ledger.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
 import { TrustedEvidenceRegistry } from '../adapter-broker/trusted-evidence.js';
+import { isOperatorSession } from './operator.js';
 import type { AwardedSupport } from '../adapter/evidence.js';
 
 export interface DaemonOptions {
@@ -387,6 +388,14 @@ export class BrokerDaemon {
         throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session requires a non-empty ${field}`, { field });
       }
     }
+    // Beta.6 (ADR 0021): the reserved `local-operator` principal is broker-provisioned and
+    // must NEVER be registerable as a live session — a peer registering with this id would
+    // hijack the operator into a routable/injectable actor + bind a component to it. Reject
+    // it fail-closed BEFORE store.register (a caller-supplied sessionId is untrusted).
+    if (isOperatorSession(p.sessionId)) {
+      this.audit('RESERVED_SESSION_REGISTER_REJECTED', { sessionId: p.sessionId });
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'this session id is reserved and cannot be registered', { sessionId: p.sessionId });
+    }
     if (typeof p.processId !== 'number') {
       throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session requires a numeric processId');
     }
@@ -624,6 +633,74 @@ export class BrokerDaemon {
   /** Beta.5: set by the host when a dashboard is running — called after a session-state
    *  mutation (e.g. announce) so open dashboard streams get a fresh snapshot. Best-effort. */
   onSessionStateChanged?: () => void;
+
+  /**
+   * Beta.6 Phase 2 (ADR 0021): the dashboard communication console's write path. These run
+   * IN-PROCESS on the broker loop (the single writer) — the browser reaches them via the
+   * authenticated loopback POST routes on the read-only DashboardServer, which forward to
+   * these callbacks (wired in host.ts, exactly like onSessionStateChanged/dashboardUrlMinter).
+   * Identity is ALWAYS the reserved 'local-operator' principal, stamped server-side; the
+   * browser never supplies a sender/actor. After each mutation we nudge open dashboard
+   * streams so the timeline/unread refresh live. A throw here surfaces to the HTTP route as
+   * a clean 4xx/5xx and NEVER crashes the broker loop (the store op is transactional).
+   */
+
+  /** Operator sends a message (opens a new thread when threadId is absent, else continues
+   *  it). `raw` is the untrusted browser payload; the send fields go through validateSendInput
+   *  (reserved-metadata + size + kind defenses) exactly like a peer send. */
+  operatorSend(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    // Validate the SEND surface (to/text/kind/requiresAck/requiresReply/ttl/idempotencyKey/
+    // metadata) with the SAME trust-boundary validator peers use — reserved keys, prototype
+    // pollution, size limits, kind allow-list. The browser cannot smuggle a sender/actor: we
+    // stamp 'local-operator' in the store; any such field here is simply not read.
+    const input = validateSendInput({
+      to: p.to, text: p.text,
+      ...(p.kind !== undefined ? { kind: p.kind } : {}),
+      ...(p.requiresAck !== undefined ? { requiresAck: p.requiresAck } : {}),
+      ...(p.requiresReply !== undefined ? { requiresReply: p.requiresReply } : {}),
+      ...(p.ttlSeconds !== undefined ? { ttlSeconds: p.ttlSeconds } : {}),
+      ...(p.idempotencyKey !== undefined ? { idempotencyKey: p.idempotencyKey } : {}),
+      ...(p.metadata !== undefined ? { metadata: p.metadata } : {}),
+    });
+    // Thread-routing fields are validated here (optional strings; length-bounded subject).
+    const threadId = this.optString(p.threadId, 'threadId');
+    const parentMessageId = this.optString(p.parentMessageId, 'parentMessageId');
+    const subject = this.optString(p.subject, 'subject');
+    if (subject !== undefined && Buffer.byteLength(subject, 'utf8') > 256) {
+      throw new XBusError(XBusErrorCode.PAYLOAD_TOO_LARGE, 'subject exceeds 256 bytes');
+    }
+    const result = this.store.operatorSend({
+      ...input,
+      ...(threadId !== undefined ? { threadId } : {}),
+      ...(parentMessageId !== undefined ? { parentMessageId } : {}),
+      ...(subject !== undefined ? { subject } : {}),
+    });
+    // Reflect the recipient's real acceptance state honestly (same mapping as onSend), so the
+    // console can show 'queued — waiting for recipient checkpoint' rather than 'delivered'.
+    const recvMode = this.receiveModeOf(result.recipientSessionId);
+    const readiness = this.store.readinessOf(result.recipientSessionId);
+    let state = result.state;
+    if (!result.deduplicated) {
+      if (readiness === 'initializing') state = 'queued_receiver_initializing';
+      else if (readiness === 'degraded_ack_unavailable' || readiness === 'degraded_hook_unavailable') state = 'queued_receiver_degraded';
+      else if (recvMode === 'hook_checkpoint') state = 'queued_until_checkpoint';
+    }
+    try { this.onSessionStateChanged?.(); } catch { /* dashboard notify is best-effort */ }
+    return { ...result, state, recipientReceiveMode: recvMode, recipientReadiness: readiness };
+  }
+
+  /** Operator marks a thread read up to a sequence. */
+  operatorMarkThreadRead(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const threadId = this.optString(p.threadId, 'threadId');
+    if (threadId === undefined || threadId.length === 0) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'threadId required');
+    const up = p.upToSequence;
+    if (typeof up !== 'number' || !Number.isInteger(up) || up < 0) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'upToSequence must be a non-negative integer');
+    const r = this.store.markThreadRead(threadId, up);
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return r;
+  }
 
   /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time
    *  browser-open URL (nonce in the URL fragment) from the broker-owned DashboardServer.

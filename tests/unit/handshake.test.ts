@@ -55,12 +55,12 @@ describe('checkCompatibility (mixed-version matrix)', () => {
   });
 
   it('ADR 0012/0019 §3: an older-schema client (s5) is rejected upgrade_component by the current broker', () => {
-    // Beta.5 Phase 1 bumped SCHEMA_VERSION to 7 (control-plane visibility + audit
-    // ledger, migration v7). A still-installed older plugin advertising a lower schema
-    // MUST be told to upgrade rather than be allowed to write against a schema it does
-    // not understand. This is the fail-closed guard the bump buys (ADR 0019 — no
+    // Beta.6 Phase 2 bumped SCHEMA_VERSION to 8 (threaded messaging + operator console,
+    // migration v8). A still-installed older plugin advertising a lower schema MUST be
+    // told to upgrade rather than be allowed to write against a schema it does not
+    // understand. This is the fail-closed guard the bump buys (ADR 0019 — no
     // mixed-version operation).
-    expect(SCHEMA_VERSION).toBe(7);
+    expect(SCHEMA_VERSION).toBe(8);
     const beta3 = client({ schemaVersion: 5 });
     const v = checkCompatibility(beta3, broker);
     expect(v.result).toBe('upgrade_component');

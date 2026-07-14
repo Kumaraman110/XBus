@@ -6,6 +6,44 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.6] — Phase 2: threaded messaging + local-operator communication console
+
+The communication-console milestone. The authenticated localhost dashboard becomes a
+two-way console: from the browser you can select a routable Claude Code session, open or
+reopen a **thread**, and send as the reserved **`local-operator`** actor — then watch the
+request, acknowledgement, reply, retries and failures land in one ordered timeline, and
+continue the conversation over multiple turns without copying message ids. Unread counts,
+delivery state, and safe (idempotent) retry are all surfaced; a thread survives browser
+reload, broker restart, and Claude-session restart because it is reconstructed from SQLite.
+
+This is an **additive schema step (migration v8, 7 → 8)** — the wire compatibility tuple
+moves to `xbus-p1-stp1-s8` (protocol + STP stay `1`) and, per ADR 0019, it is a controlled
+whole-install upgrade: an s7 (beta.5.1) component meeting a v8 broker is fail-closed at the
+handshake. Existing beta.5 data migrates in place (every legacy message is backfilled into a
+coherent degenerate thread keyed on its `correlation_id`); install snapshots and restores the
+DB on any failed upgrade, so a failed beta.6 install leaves a working s7 install.
+
+- **Threads are first-class** (ADR 0017): new `threads` / `thread_participants` (an
+  extensible N-party join-table) / `thread_sequences` tables + `thread_id` / `thread_sequence`
+  / `author_type` on `messages`. `thread_id == correlation_id`; `parent_message_id` points at
+  the exact turn answered; `thread_sequence` gives a single monotonic order across both
+  directions. Peer send/ack/reply and exactly-once visible delivery are **unchanged** — a
+  thread turn flows through the same lifecycle and injects identically to a peer message.
+- **The `local-operator` principal** (ADR 0021): a single reserved, unmanaged, non-routable,
+  **non-expiring** `sessions` row provisioned at broker start. It satisfies the
+  `recipient_sequences → sessions` FK so a Claude reply routes back to the operator, holds
+  no session authority (so it can never pull/ack/reply or impersonate a session), and is
+  never surfaced as a routable target. Browser messages are **broker-stamped**
+  `author_type='operator'` / `sender_session_id='local-operator'` — the browser never sets a
+  sender/actor. `local-operator` is reserved so no real session can claim the name.
+- **Console API + UI**: new bearer-token-gated `POST /api/thread`, `POST /api/thread/:id/send`,
+  `POST /api/thread/:id/read` routes (forwarded to the single-writer broker loop — the
+  dashboard's own DB handle stays physically read-only) and `GET /api/threads`,
+  `/api/thread/:id` read projections, with live timeline/unread updates over the existing
+  authenticated NDJSON fetch-stream. The static console UI ships as external assets under a
+  strict CSP (no inline JS). Message text stays untrusted-peer content to the recipient
+  (same fenced injection, same reserved-metadata rejection).
+
 ## [0.1.0-beta.5.1] — fix: doctor false-fails hook detection after first `claude` run
 
 A detection-only patch; **no protocol, schema, wire, or messaging change** — the compatibility

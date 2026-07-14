@@ -68,6 +68,20 @@ export interface DashboardServerOptions {
   onChange?: (cb: () => void) => () => void;
   /** Max concurrent authenticated streams (blocker #5). Beyond it, /api/stream → 503. Default 64. */
   maxStreams?: number;
+  /**
+   * Beta.6 Phase 2 (ADR 0021): the operator console's WRITE callbacks. These run on the
+   * broker loop (the single writer) — the dashboard's own DB handle is read-only, so a write
+   * route CANNOT touch SQLite; it forwards the (already authenticated) payload here. Wired in
+   * host.ts to the daemon's in-process operator methods, exactly like onChange. When absent
+   * (headless API before the console ships, or a construction failure), the write routes
+   * return 503 and the read-only dashboard is unaffected. A callback may throw a typed error
+   * (mapped to a 4xx) or resolve a JSON result. The browser NEVER supplies a sender/actor —
+   * identity is stamped server-side to 'local-operator'.
+   */
+  onOperatorSend?: (payload: unknown) => unknown;
+  onMarkThreadRead?: (payload: unknown) => unknown;
+  /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
+  maxWriteBodyBytes?: number;
 }
 
 function isLoopback(host: string): boolean {
@@ -91,6 +105,9 @@ export class DashboardServer {
   private readonly log: (line: string) => void;
   private readonly onChange: ((cb: () => void) => () => void) | undefined;
   private readonly maxStreams: number;
+  private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
+  private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
+  private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
 
   constructor(opts: DashboardServerOptions) {
@@ -104,6 +121,9 @@ export class DashboardServer {
     this.log = opts.log ?? (() => {});
     this.onChange = opts.onChange;
     this.maxStreams = opts.maxStreams ?? 64;
+    this.onOperatorSend = opts.onOperatorSend;
+    this.onMarkThreadRead = opts.onMarkThreadRead;
+    this.maxWriteBodyBytes = opts.maxWriteBodyBytes ?? 96 * 1024;
   }
 
   /** Actual bound port (after start). */
@@ -165,11 +185,15 @@ export class DashboardServer {
         return this.handleExchange(req, res);
       }
 
-      // Authenticated data API (every /api/* incl. reads + the stream). AWAIT it so a read
-      // rejection is caught by this try/catch (handleApi also maps read failure to 503).
+      // Authenticated data API (every /api/* incl. reads, writes + the stream). The BEARER
+      // TOKEN CHECK RUNS FIRST for every /api/* request regardless of method — a write route
+      // never bypasses auth (ADR 0018/0021). AWAIT so a read/write rejection is caught here.
       if (p.startsWith('/api/')) {
-        if (method !== 'GET' && method !== 'HEAD') return this.json(res, 405, { error: 'method_not_allowed' });
         if (!this.auth.validateToken(bearer(req))) return this.json(res, 401, { error: 'unauthorized' });
+        // Beta.6 write routes (POST): operator-send + mark-read. These forward to the broker
+        // loop via the injected callbacks (the dashboard handle is read-only).
+        if (method === 'POST') return await this.handleWrite(p, req, res);
+        if (method !== 'GET' && method !== 'HEAD') return this.json(res, 405, { error: 'method_not_allowed' });
         return await this.handleApi(p, u, res);
       }
 
@@ -207,6 +231,88 @@ export class DashboardServer {
     req.on('error', () => { try { done(400, { error: 'bad_request' }); } catch { /* ignore */ } });
   }
 
+  /**
+   * Read a bounded JSON request body. Resolves the parsed object, or null after having
+   * ALREADY responded (413 too-large / 400 bad-JSON) — callers must check for null and stop.
+   * Mirrors handleExchange's discipline: cap bytes, respond 413 once + req.pause (never
+   * destroy the socket), 400 on parse failure. maxBytes defaults to the write-body cap.
+   */
+  private readJsonBody(req: http.IncomingMessage, res: http.ServerResponse, maxBytes: number): Promise<Record<string, unknown> | null> {
+    return new Promise((resolve) => {
+      let body = '';
+      let done = false;
+      const finish = (v: Record<string, unknown> | null): void => { if (!done) { done = true; resolve(v); } };
+      req.on('data', (c: Buffer) => {
+        if (done) return;
+        body += c.toString('utf8');
+        if (body.length > maxBytes) {
+          // Respond 413 once. The request still has unread body bytes; on a keep-alive
+          // connection those would wedge the socket and reset the NEXT request. Close the
+          // connection cleanly (Connection: close) rather than pause-and-leak, so the client
+          // sees a clean 413 and opens a fresh connection for its next request.
+          if (!res.headersSent) {
+            res.writeHead(413, { ...SECURITY_HEADERS, 'Content-Type': 'application/json; charset=utf-8', 'Connection': 'close' });
+            res.end(JSON.stringify({ error: 'payload_too_large' }));
+          }
+          finish(null);
+        }
+      });
+      req.on('end', () => {
+        if (done) return;
+        let parsed: unknown;
+        try { parsed = JSON.parse(body || '{}'); } catch { this.json(res, 400, { error: 'bad_request' }); return finish(null); }
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) { this.json(res, 400, { error: 'bad_request' }); return finish(null); }
+        finish(parsed as Record<string, unknown>);
+      });
+      req.on('error', () => { try { this.json(res, 400, { error: 'bad_request' }); } catch { /* ignore */ } finish(null); });
+    });
+  }
+
+  /**
+   * Beta.6 Phase 2 (ADR 0021): the operator console's WRITE routes. Auth already validated
+   * by the caller (handle()). Routes:
+   *   POST /api/thread                 — open a new thread + send its first operator turn
+   *   POST /api/thread/:id/send        — send a follow-up operator turn in an existing thread
+   *   POST /api/thread/:id/read        — mark the thread read up to a sequence
+   * All forward to the injected broker-loop callback (the dashboard handle is read-only).
+   * A missing callback → 503 (dashboard write path not wired). A callback throw is mapped to
+   * a typed 4xx (validation/expiry) or 500, and NEVER crashes the broker (the callback runs a
+   * transactional store op on the broker loop). The browser never supplies a sender/actor.
+   */
+  private async handleWrite(p: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Route match first (so an unknown POST path 404s without reading a body).
+    const sendNew = p === '/api/thread';
+    const sendFollow = /^\/api\/thread\/([^/]+)\/send$/.exec(p);
+    const markRead = /^\/api\/thread\/([^/]+)\/read$/.exec(p);
+    if (!sendNew && !sendFollow && !markRead) return this.json(res, 404, { error: 'not_found' });
+
+    const body = await this.readJsonBody(req, res, this.maxWriteBodyBytes);
+    if (body === null) return; // already responded (413/400)
+
+    try {
+      if (sendNew || sendFollow) {
+        if (!this.onOperatorSend) return this.json(res, 503, { error: 'write_unavailable' });
+        // For a follow-up, the thread id comes from the PATH (not a spoofable body field).
+        const payload = sendFollow ? { ...body, threadId: decodeURIComponent(sendFollow[1]!) } : { ...body };
+        // A NEW-thread POST must NOT carry a threadId (that is the follow-up route's job).
+        if (sendNew && 'threadId' in payload) delete (payload as { threadId?: unknown }).threadId;
+        const result = await this.onOperatorSend(payload);
+        return this.json(res, 200, result);
+      }
+      // markRead
+      if (!this.onMarkThreadRead) return this.json(res, 503, { error: 'write_unavailable' });
+      const result = await this.onMarkThreadRead({ ...body, threadId: decodeURIComponent(markRead![1]!) });
+      return this.json(res, 200, result);
+    } catch (e) {
+      // Map a typed XBusError to a clean 4xx; anything else to 500. Never leak a stack.
+      const err = e as { code?: string; message?: string };
+      const code = typeof err.code === 'string' ? err.code : undefined;
+      const status = code && /VALIDATION|PROTOCOL|RESERVED|PAYLOAD|NOT_FOUND|UNKNOWN_RECIPIENT|EXPIRED|BLOCKED|ILLEGAL_STATE|FORBIDDEN/i.test(code) ? 400 : 500;
+      this.log(`dashboard write failed: ${err.message ?? 'error'}`);
+      return this.json(res, status, { error: code ?? 'internal', message: status === 400 ? (err.message ?? 'invalid request') : 'internal' });
+    }
+  }
+
   private async handleApi(p: string, u: URL, res: http.ServerResponse): Promise<void> {
     try {
       if (p === '/api/sessions') return this.json(res, 200, { sessions: await this.reader.run('sessions') });
@@ -221,6 +327,17 @@ export class DashboardServer {
       if (sm) {
         const s = await this.reader.run('session', { sessionId: decodeURIComponent(sm[1]!) });
         return s ? this.json(res, 200, s) : this.json(res, 404, { error: 'not_found' });
+      }
+      // Beta.6 (ADR 0021): operator thread projections (read-only, off-loop). List + detail.
+      if (p === '/api/threads') {
+        const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : undefined;
+        return this.json(res, 200, await this.reader.run('threads', { limit }));
+      }
+      const tm = /^\/api\/thread\/([^/]+)$/.exec(p);
+      if (tm) {
+        const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : undefined;
+        const t = await this.reader.run('thread', { threadId: decodeURIComponent(tm[1]!), limit });
+        return t ? this.json(res, 200, t) : this.json(res, 404, { error: 'not_found' });
       }
       if (p === '/api/stream') return this.handleStream(res);
       return this.json(res, 404, { error: 'not_found' });
@@ -258,9 +375,13 @@ export class DashboardServer {
     const cleanup = (): void => { this.streams.delete(res); if (timer) clearInterval(timer); };
     res.on('close', cleanup);
     res.on('error', cleanup);
-    // Send this new stream an initial snapshot (its own read; broadcasts thereafter are shared).
+    // Send this new stream an initial snapshot (its own reads; broadcasts thereafter are shared):
+    // sessions (selector) + threads (list + unread) so the console populates immediately.
     void this.reader.run('sessions').then((sessions) => {
       if (!res.writableEnded) { try { res.write(JSON.stringify({ type: 'sessions', sessions }) + '\n'); } catch { /* dropped */ } }
+    }).catch(() => { /* off-loop read failed; skip */ });
+    void this.reader.run('threads').then((threads) => {
+      if (threads && typeof threads === 'object' && !res.writableEnded) { try { res.write(JSON.stringify({ type: 'threads', ...(threads as Record<string, unknown>) }) + '\n'); } catch { /* dropped */ } }
     }).catch(() => { /* off-loop read failed; skip */ });
   }
 
@@ -284,12 +405,18 @@ export class DashboardServer {
     // would escape BEFORE .finally attaches and leave `broadcasting` wedged true forever —
     // permanently disabling live updates. Wrap in try/catch so the flag is ALWAYS reset, then
     // coalesce via .finally on the async path. (D2 fix.)
-    let p: Promise<unknown>;
-    try { p = this.reader.run('sessions'); }
+    let p: Promise<unknown[]>;
+    // Coalesced fan-out of BOTH a sessions snapshot (selector) AND a threads snapshot (list +
+    // unread badges), so the console's session picker and thread list refresh live on any
+    // mutation. Each is ONE off-loop read fanned to all streams (not per-stream). A failure in
+    // either read simply skips that line this tick; delivery is unaffected.
+    try { p = Promise.all([this.reader.run('sessions'), this.reader.run('threads').catch(() => null)]); }
     catch { done(); return; }
-    void p.then((sessions) => {
-      const line = JSON.stringify({ type: 'sessions', sessions }) + '\n';
-      for (const res of this.streams) { if (!res.writableEnded) { try { res.write(line); } catch { /* per-stream write failure; cleanup on close */ } } }
+    void p.then(([sessions, threads]) => {
+      const lines = [JSON.stringify({ type: 'sessions', sessions }) + '\n'];
+      if (threads && typeof threads === 'object') lines.push(JSON.stringify({ type: 'threads', ...(threads as Record<string, unknown>) }) + '\n');
+      const blob = lines.join('');
+      for (const res of this.streams) { if (!res.writableEnded) { try { res.write(blob); } catch { /* per-stream write failure; cleanup on close */ } } }
     }).catch(() => { /* skip this tick */ }).finally(done);
   }
 
