@@ -14,6 +14,7 @@ import { openDatabase, type SqliteDriver } from '../../src/database/connection.j
 import { runMigrations } from '../../src/database/migrations.js';
 import { BrokerStore, type SessionAuthority } from '../../src/broker/store.js';
 import { Scheduler, inQuietHours, computeNextRun } from '../../src/broker/scheduler.js';
+import { Reaper } from '../../src/broker/reaper.js';
 import { ensureOperatorSession } from '../../src/broker/operator.js';
 import { FakeClock, SeqIdGen } from '../../src/shared/clock.js';
 
@@ -142,5 +143,74 @@ describe('scheduler gates', () => {
     const run = db.prepare('SELECT state, skip_reason FROM schedule_runs WHERE schedule_id=?').get(scheduleId) as { state: string; skip_reason: string | null };
     expect(run.state).toBe('failed');
     expect(run.skip_reason).toBe('recipient_error');
+  });
+
+  it('a "once" schedule blocked by quiet-hours is DEFERRED past the window (not dropped) and later fires exactly once', () => {
+    // Regression: a one-time schedule whose only slot is inside a quiet window must be
+    // retried past the window, never silently exhausted (message loss). Clock 23:30, quiet
+    // 22:00-06:00 → the fire is blocked.
+    clock.set(Date.parse('2026-01-01T23:30:00.000Z'));
+    const quiet = JSON.stringify({ windows: [{ start: '22:00', end: '06:00' }] });
+    const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'target-svc', payloadText: 'q-once', kind: 'once', quietHoursJson: quiet, requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    const r1 = scheduler.tick();
+    expect(r1.fired).toBe(0);
+    expect(msgCount()).toBe(0); // suppressed, NOT dropped
+    // Still ALIVE (active), with next_run pushed OUT of the quiet window — never exhausted.
+    const sched = db.prepare('SELECT state, next_run FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string; next_run: string | null };
+    expect(sched.state).toBe('active');
+    expect(sched.next_run).not.toBeNull();
+    expect(inQuietHours(sched.next_run!, quiet)).toBe(false);
+    // Advance to the deferred slot (past 06:00) and tick: the once schedule fires exactly one
+    // message, then exhausts.
+    clock.set(Date.parse(sched.next_run!));
+    const r2 = scheduler.tick();
+    expect(r2.fired).toBe(1);
+    expect(msgCount()).toBe(1);
+    expect((db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string }).state).toBe('exhausted');
+  });
+
+  it('the reaper prunes OLD terminal schedule_runs (retention) but keeps recent + in-flight rows (exactly-once safe)', () => {
+    // A long-lived interval schedule accumulates run rows; the reaper must prune terminal rows
+    // whose fire-slot is past the retention horizon (they can never be re-selected) without
+    // touching recent rows or the exactly-once CAS. Use a short 1h retention for the test.
+    const reaper = new Reaper(db, clock, ids, { scheduleRunRetentionMs: 60 * 60_000 });
+    // OLD schedule: fire 3 slots (all near t0), then never tick it again.
+    const oldSched = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'target-svc', payloadText: 'old', kind: 'interval', scheduleExpr: '60000', minIntervalMs: 60000, requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    scheduler.tick(); clock.advance(60_000);
+    scheduler.tick(); clock.advance(60_000);
+    scheduler.tick();
+    expect(runCount(oldSched.scheduleId)).toBe(3); // 3 old terminal 'sent' rows near t0
+    // Cancel it so the post-jump tick doesn't fire its (now-overdue) backlog slot — we want
+    // exactly its 3 old rows frozen in the run ledger.
+    store.setScheduleState(oldSched.scheduleId, 'cancelled');
+    // Jump 2h forward so those 3 fire-slots are now past the 1h retention horizon.
+    clock.advance(2 * 60 * 60_000);
+    // RECENT schedule: created + fired AFTER the jump → its run row is well within retention.
+    const newSched = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'target-svc', payloadText: 'new', kind: 'once', requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    scheduler.tick();
+    expect(runCount(newSched.scheduleId)).toBe(1); // 1 recent terminal row
+    const r = reaper.sweep();
+    expect(r.scheduleRunsPruned).toBe(3);                    // the 3 OLD rows pruned
+    expect(runCount(oldSched.scheduleId)).toBe(0);           // old run ledger reclaimed
+    expect(runCount(newSched.scheduleId)).toBe(1);           // recent run survived (exactly-once safe)
+    // Exactly-once intact: re-ticking at the same clock creates no duplicate for the recent slot.
+    const msgsBefore = msgCount();
+    scheduler.tick();
+    expect(msgCount()).toBe(msgsBefore);
+  });
+
+  it('a concurrency_key schedule keeps firing across slots (the terminal "sent" run never wedges it as in-flight)', () => {
+    // Regression: the in-flight guard must count only 'claimed' (not the terminal 'sent'), else
+    // a keyed schedule fires once then is skipped forever. createSchedule accepts concurrencyKey.
+    const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'target-svc', payloadText: 'c', kind: 'interval', scheduleExpr: '60000', minIntervalMs: 60000, concurrencyKey: 'k1', requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    scheduler.tick(); // slot 1 fires
+    expect(msgCount()).toBe(1);
+    clock.advance(60_000);
+    scheduler.tick(); // slot 2 must ALSO fire (prior 'sent' run does not count as in-flight)
+    expect(msgCount()).toBe(2);
+    clock.advance(60_000);
+    scheduler.tick(); // slot 3
+    expect(msgCount()).toBe(3);
+    expect(runCount(scheduleId)).toBe(3);
   });
 });

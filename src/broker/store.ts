@@ -1327,16 +1327,33 @@ export class BrokerStore {
     });
   }
 
-  /** Clear the managed markers when a managed session is stopped. Returns the pid it had (for
-   *  the caller to kill), or null if it was not managed. Refuses a non-managed session. */
-  clearManagedSession(sessionId: string): { sessionId: string; pid: number | null } {
+  /** Clear the managed markers when a managed session is stopped. Returns the pid + the recorded
+   *  started_at + launch_key so the caller can validate LIVENESS before any kill (pid alone is
+   *  unsafe — the OS recycles pids). Refuses a non-managed session (ADR 0024 §4). */
+  clearManagedSession(sessionId: string): { sessionId: string; pid: number | null; startedAt: string | null; launchKey: string | null } {
     return this.db.transaction(() => {
-      const s = this.requireSession(sessionId);
+      const s = this.db.prepare('SELECT managed_by_xbus, managed_pid, managed_started_at, managed_launch_key FROM sessions WHERE session_id=?').get(sessionId) as { managed_by_xbus: number; managed_pid: number | null; managed_started_at: string | null; managed_launch_key: string | null } | undefined;
+      if (!s) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such session');
       if (!s.managed_by_xbus) throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'not an xbus-managed session; refusing to stop/restart it');
-      const pid = s.managed_pid;
-      this.db.prepare('UPDATE sessions SET managed_by_xbus=0, managed_pid=NULL, updated_at=? WHERE session_id=?').run(this.clock.nowIso(), sessionId);
+      const { managed_pid: pid, managed_started_at: startedAt, managed_launch_key: launchKey } = s;
+      this.db.prepare('UPDATE sessions SET managed_by_xbus=0, managed_pid=NULL, managed_started_at=NULL, managed_launch_key=NULL, updated_at=? WHERE session_id=?').run(this.clock.nowIso(), sessionId);
       this.ledger('MANAGED_SESSION_STOPPED', OPERATOR_LEDGER_ACTOR, { sessionId }, { pid: pid ?? 0 });
-      return { sessionId, pid };
+      return { sessionId, pid, startedAt, launchKey };
     });
+  }
+
+  /** Idempotently clear a managed session's markers when its child process EXITS (natural or
+   *  crash). Unlike clearManagedSession this never throws (the session may already be cleared or
+   *  never have been managed) — it just ensures a dead session can't retain a killable pid, so a
+   *  later stop can never SIGTERM a recycled pid. Best-effort ledger note. */
+  markManagedSessionExited(sessionId: string): void {
+    try {
+      this.db.transaction(() => {
+        const s = this.db.prepare('SELECT managed_by_xbus, managed_pid FROM sessions WHERE session_id=?').get(sessionId) as { managed_by_xbus: number; managed_pid: number | null } | undefined;
+        if (!s || !s.managed_by_xbus) return; // already cleared / not managed — nothing to do
+        this.db.prepare('UPDATE sessions SET managed_by_xbus=0, managed_pid=NULL, managed_started_at=NULL, managed_launch_key=NULL, updated_at=? WHERE session_id=?').run(this.clock.nowIso(), sessionId);
+        this.ledger('MANAGED_SESSION_EXITED', OPERATOR_LEDGER_ACTOR, { sessionId }, { pid: s.managed_pid ?? 0 });
+      });
+    } catch { /* best-effort: never let exit bookkeeping crash the broker */ }
   }
 }

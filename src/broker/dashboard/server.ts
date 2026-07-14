@@ -334,7 +334,7 @@ export class DashboardServer {
       // Map a typed XBusError to a clean 4xx; anything else to 500. Never leak a stack.
       const err = e as { code?: string; message?: string };
       const code = typeof err.code === 'string' ? err.code : undefined;
-      const status = code && /VALIDATION|PROTOCOL|RESERVED|PAYLOAD|NOT_FOUND|UNKNOWN_RECIPIENT|EXPIRED|BLOCKED|ILLEGAL_STATE|FORBIDDEN/i.test(code) ? 400 : 500;
+      const status = code && /VALIDATION|PROTOCOL|RESERVED|PAYLOAD|NOT_FOUND|UNKNOWN_RECIPIENT|EXPIRED|BLOCKED|ILLEGAL_STATE|FORBIDDEN|TAKEN|INVALID_SESSION/i.test(code) ? 400 : 500;
       this.log(`dashboard write failed: ${err.message ?? 'error'}`);
       return this.json(res, status, { error: code ?? 'internal', message: status === 400 ? (err.message ?? 'invalid request') : 'internal' });
     }

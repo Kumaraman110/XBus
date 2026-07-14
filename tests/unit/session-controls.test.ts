@@ -135,7 +135,7 @@ describe('operator session controls (ADR 0024)', () => {
     void auth;
   });
 
-  it('stop-managed refuses a non-managed session; succeeds + clears markers for a managed one', () => {
+  it('stop-managed refuses a non-managed session; succeeds + returns liveness anchors + clears ALL managed markers', () => {
     register();
     // Not managed → refused.
     expect(() => store.clearManagedSession(S)).toThrow();
@@ -144,6 +144,28 @@ describe('operator session controls (ADR 0024)', () => {
     expect((db.prepare('SELECT managed_by_xbus FROM sessions WHERE session_id=?').get(S) as { managed_by_xbus: number }).managed_by_xbus).toBe(1);
     const r = store.clearManagedSession(S);
     expect(r.pid).toBe(999999);
-    expect((db.prepare('SELECT managed_by_xbus, managed_pid FROM sessions WHERE session_id=?').get(S) as { managed_by_xbus: number; managed_pid: number | null }).managed_by_xbus).toBe(0);
+    // The liveness anchors are returned so the daemon can validate before any kill (ADR 0024 §4).
+    expect(r.launchKey).toBe('sched:x:1');
+    expect(r.startedAt).not.toBeNull();
+    // ALL managed markers cleared (not just pid) — a stale started_at/launch_key can't linger.
+    const after = db.prepare('SELECT managed_by_xbus, managed_pid, managed_started_at, managed_launch_key FROM sessions WHERE session_id=?').get(S) as { managed_by_xbus: number; managed_pid: number | null; managed_started_at: string | null; managed_launch_key: string | null };
+    expect(after.managed_by_xbus).toBe(0);
+    expect(after.managed_pid).toBeNull();
+    expect(after.managed_started_at).toBeNull();
+    expect(after.managed_launch_key).toBeNull();
+  });
+
+  it('markManagedSessionExited clears markers so a dead session retains NO killable pid; idempotent + safe on non-managed', () => {
+    register();
+    // Safe no-op on a non-managed session (never throws).
+    expect(() => store.markManagedSessionExited(S)).not.toThrow();
+    store.recordManagedSession(S, 424242, 'sched:y:2');
+    store.markManagedSessionExited(S);
+    const after = db.prepare('SELECT managed_by_xbus, managed_pid FROM sessions WHERE session_id=?').get(S) as { managed_by_xbus: number; managed_pid: number | null };
+    expect(after.managed_by_xbus).toBe(0);
+    expect(after.managed_pid).toBeNull(); // no killable pid left → a later stop can't SIGTERM a recycled pid
+    // Idempotent: a second call is a harmless no-op.
+    expect(() => store.markManagedSessionExited(S)).not.toThrow();
+    expect(ledgerCount('MANAGED_SESSION_EXITED')).toBe(1);
   });
 });

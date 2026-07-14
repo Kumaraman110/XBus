@@ -42,6 +42,26 @@ Additive **migration v9 (8 → 9)** — wire tuple `xbus-p1-stp1-s9`, a fail-clo
 upgrade; existing beta.6 data migrates in place. Peer messaging, operator threads, exactly-once
 delivery, dashboard auth, and ledger integrity are all preserved.
 
+Hardening from the pre-ship adversarial review:
+
+- **Scheduler `once` + quiet-hours no longer drops the message.** A one-time schedule blocked by
+  a quiet window (or wake-limit / concurrency gate) is now **deferred** past the block and retried,
+  never silently exhausted.
+- **`stop_managed` is pid-recycling-safe.** It SIGTERMs only a child the broker still holds a live
+  in-process handle for (pid + launch_key match); with no live handle it clears markers and does
+  not kill a bare pid. A managed child's exit clears its markers so no dead session retains a
+  killable pid (ADR 0024 §4 now describes the implemented guard).
+- **`doctor node_runtime`** detects the bundled-runtime `command` by installed entry **path**, so
+  it stays green after Claude Code strips the `_xbusOwner` tag on first run (no false-fail).
+- **Concurrency guard** counts only in-flight (`claimed`) runs, so a keyed schedule keeps firing
+  instead of wedging after its first fire.
+- **`schedule_runs` retention**: the reaper prunes old terminal run rows (default 7-day horizon,
+  exactly-once-safe) + covering indexes were added, so the run ledger can't grow unbounded.
+- **Successful upgrades reclaim the plugin backup** (no per-upgrade accumulation of the bundled
+  runtime on disk).
+- **Dashboard rename errors** (name taken / invalid) return **400** with the actionable message
+  instead of a suppressed 500.
+
 ## [0.1.0-beta.6] — Phase 2: threaded messaging + local-operator communication console
 
 The communication-console milestone. The authenticated localhost dashboard becomes a

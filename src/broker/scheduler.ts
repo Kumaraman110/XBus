@@ -149,8 +149,9 @@ export class Scheduler {
       ).run(this.ids.next(), s.schedule_id, scheduledFor, idemKey, now, now, now);
       if (claim.changes === 0) {
         // Already claimed by a prior/concurrent tick — advance next_run so we stop re-selecting
-        // this slot, then no-op. (The winning claim owns the send.)
-        this.advance(s, now);
+        // this slot, then no-op. (The winning claim owns the send.) 'terminal': the winner has
+        // handled this slot; a 'once' whose slot was already claimed is done.
+        this.advance(s, now, 'terminal');
         return 'skipped';
       }
 
@@ -161,11 +162,13 @@ export class Scheduler {
           .run(state, now, ...cols.map((c) => extra[c] ?? null), s.schedule_id, scheduledFor);
       };
 
-      // STEP 2 — GATES. A blocked fire records a skip + advances PAST the block so the tick
-      // doesn't busy-loop re-selecting the same due slot.
+      // STEP 2 — GATES. A blocked fire records a skip + DEFERS past the block so the tick
+      // doesn't busy-loop re-selecting the same due slot. Deferral (mode 'deferred') keeps a
+      // 'once' schedule ALIVE with a new future next_run — a transiently-blocked one-time task
+      // must be retried, never dropped (a fired=false advance would exhaust it → message loss).
       if (inQuietHours(now, s.quiet_hours_json)) {
         setRun('skipped', { skip_reason: 'quiet_hours' });
-        this.advance(s, now);
+        this.advance(s, now, 'deferred');
         this.audit('SCHEDULE_SKIPPED_QUIET_HOURS', { scheduleId: s.schedule_id });
         return 'skipped';
       }
@@ -174,33 +177,39 @@ export class Scheduler {
       const wakesToday = s.wakes_today_date === today ? s.wakes_today : 0;
       if (s.wake_limit_per_day !== null && wakesToday >= s.wake_limit_per_day) {
         setRun('skipped', { skip_reason: 'wake_limit' });
-        this.advance(s, now);
+        this.advance(s, now, 'deferred');
         this.audit('SCHEDULE_SKIPPED_WAKE_LIMIT', { scheduleId: s.schedule_id });
         return 'skipped';
       }
       // Per-session cross-schedule wake cap (loop-storm guard): count TODAY's fires to any
-      // schedule targeting the same address.
+      // schedule targeting the same address. A run is "counted" once it is enqueued ('sent') —
+      // that is the schedule_runs terminal success state (setRun only ever writes
+      // skipped/sent/failed), so we count 'sent' alone here (see the concurrency guard note).
       if (this.perSessionWakeCapPerDay > 0) {
         const perSession = (this.db.prepare(
           `SELECT COUNT(*) n FROM schedule_runs sr JOIN schedules sc ON sc.schedule_id=sr.schedule_id
-            WHERE sc.target_address=? AND sr.state IN ('sent','delivered','completed') AND substr(sr.scheduled_for,1,10)=?`,
+            WHERE sc.target_address=? AND sr.state='sent' AND substr(sr.scheduled_for,1,10)=?`,
         ).get(s.target_address, today) as { n: number }).n;
         if (perSession >= this.perSessionWakeCapPerDay) {
           setRun('skipped', { skip_reason: 'session_wake_cap' });
-          this.advance(s, now);
+          this.advance(s, now, 'deferred');
           this.audit('SCHEDULE_SKIPPED_SESSION_CAP', { scheduleId: s.schedule_id });
           return 'skipped';
         }
       }
-      // Concurrency: at most one in-flight (non-terminal delivery) run per concurrency_key.
+      // Concurrency: at most one OUTSTANDING (not-yet-enqueued) run per concurrency_key. Only
+      // 'claimed' counts as in-flight — 'sent' is the terminal success state for a run (nothing
+      // ever advances a run from 'sent' to delivered/completed), so counting 'sent' would wedge
+      // every keyed schedule after its first fire (the stale 'sent' row would look perpetually
+      // in-flight). Our own just-claimed row is the 1 we allow.
       if (s.concurrency_key) {
         const inflight = (this.db.prepare(
           `SELECT COUNT(*) n FROM schedule_runs sr JOIN schedules sc ON sc.schedule_id=sr.schedule_id
-            WHERE sc.concurrency_key=? AND sr.state IN ('claimed','sent')`,
+            WHERE sc.concurrency_key=? AND sr.state='claimed'`,
         ).get(s.concurrency_key) as { n: number }).n;
         if (inflight > 1) { // >1 because our own just-claimed row counts
           setRun('skipped', { skip_reason: 'concurrency' });
-          this.advance(s, now);
+          this.advance(s, now, 'deferred');
           this.audit('SCHEDULE_SKIPPED_CONCURRENCY', { scheduleId: s.schedule_id });
           return 'skipped';
         }
@@ -222,32 +231,55 @@ export class Scheduler {
       } catch (e) {
         const code = isXBusError(e) ? e.code : 'internal';
         setRun('failed', { skip_reason: 'recipient_error', error_code: code });
-        this.advance(s, now);
+        // A hard recipient error (expired/unknown/self) is terminal for THIS slot — advance
+        // normally (a 'once' exhausts; an interval moves to its next slot). We don't infinitely
+        // retry a permanently-bad address.
+        this.advance(s, now, 'terminal');
         this.audit('SCHEDULE_FIRE_FAILED', { scheduleId: s.schedule_id, code });
         return 'skipped';
       }
 
       // STEP 4 — ADVANCE (fires_used++, next_run, exhausted).
-      this.advance(s, now, true);
+      this.advance(s, now, 'fired');
       this.audit('SCHEDULE_FIRED', { scheduleId: s.schedule_id, scheduledFor });
       return 'fired';
     });
   }
 
-  /** Advance a schedule's next_run/last_run (+fires_used when `fired`), marking exhausted when
-   *  max_fires reached or kind='once'. Deterministic; RNG-free. */
-  private advance(s: DueSchedule, now: string, fired = false): void {
+  /**
+   * Advance a schedule's next_run/last_run after handling one due slot. `mode`:
+   *   - 'fired'    — a message was enqueued: fires_used++, advance to the next slot, exhaust a
+   *                  'once' or a max_fires-reached schedule.
+   *   - 'terminal' — this slot is permanently handled without a live retry (claim-loser, hard
+   *                  recipient error): advance/exhaust exactly like a fire but WITHOUT fires_used++.
+   *   - 'deferred' — a transient GATE blocked this slot (quiet-hours / wake-limit / concurrency):
+   *                  keep the schedule ALIVE with a future next_run, even for 'once'. A one-time
+   *                  task blocked by quiet-hours MUST be retried past the window, never dropped.
+   * Deterministic; RNG-free.
+   */
+  private advance(s: DueSchedule, now: string, mode: 'fired' | 'terminal' | 'deferred'): void {
     const nowMs = Date.parse(now);
+    const fired = mode === 'fired';
     const firesUsed = s.fires_used + (fired ? 1 : 0);
+
+    const step = Math.max(s.min_interval_ms, 15 * 60_000);
+    // The next candidate instant. A recurrence kind ('interval'/'cron') yields a strictly-future
+    // slot from computeNextRun. A 'once' yields null; when we're DEFERRING a 'once' (transient
+    // gate) it must still be retried, so seed the candidate one step past `now` (strictly after
+    // the current, blocked instant) and let the quiet-hours push-loop move it out of the window.
     let nextRunMs = computeNextRun(s.kind, s.schedule_expr, nowMs, s.min_interval_ms);
-    // If quiet-hours would still block the computed next_run, keep pushing by min_interval_ms
-    // (bounded) so we never schedule INTO a quiet window (advance PAST it).
+    if (mode === 'deferred' && nextRunMs === null) nextRunMs = nowMs + step;
+    // If quiet-hours would still block the candidate next_run, keep pushing by a bounded number
+    // of steps so we never schedule INTO a quiet window (advance PAST it).
     if (nextRunMs !== null && s.quiet_hours_json) {
       for (let i = 0; i < 96 && inQuietHours(new Date(nextRunMs).toISOString(), s.quiet_hours_json); i++) {
-        nextRunMs += Math.max(s.min_interval_ms, 15 * 60_000);
+        nextRunMs += step;
       }
     }
-    const exhausted = (s.max_fires !== null && firesUsed >= s.max_fires) || s.kind === 'once';
+
+    // A deferral NEVER exhausts (the task still owes a delivery). A fire/terminal exhausts a
+    // 'once' or a max_fires-reached schedule as before.
+    const exhausted = mode !== 'deferred' && ((s.max_fires !== null && firesUsed >= s.max_fires) || s.kind === 'once');
     const nextRun = exhausted ? null : (nextRunMs !== null ? new Date(nextRunMs).toISOString() : null);
     this.db.prepare(
       `UPDATE schedules SET fires_used=?, last_run=?, next_run=?, state=CASE WHEN ? THEN 'exhausted' ELSE state END, updated_at=? WHERE schedule_id=?`,

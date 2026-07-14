@@ -167,6 +167,28 @@ describe('dashboard read isolation — off-loop failure does not surface as a cr
       expect(body.sessions).toHaveLength(1);
     } finally { await s.stop(); }
   });
+
+  it('a rename to a TAKEN/INVALID name maps to 400 with the actionable message (not a 500 "internal")', async () => {
+    // Regression (beta.7): operatorRenameAlias throws XBUS_SESSION_NAME_TAKEN /
+    // XBUS_INVALID_SESSION_NAME — user-input rejections that must surface as 400 with the reason,
+    // not a suppressed 500 'internal'. The control route feeds through the write error-mapper.
+    for (const code of ['XBUS_SESSION_NAME_TAKEN', 'XBUS_INVALID_SESSION_NAME']) {
+      const onOperatorControl = (): unknown => { throw Object.assign(new Error('session name already in use'), { code }); };
+      const s = new DashboardServer({ auth, reader, onOperatorControl });
+      await s.start();
+      try {
+        const token = await getTokenFor(s, auth);
+        const res = await fetch(`${s.url}/api/session/cccc0001-0000-4000-8000-000000000001/control`, {
+          method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'rename_alias', name: 'x' }),
+        });
+        expect(res.status, code).toBe(400); // NOT 500
+        const body = await res.json() as { error: string; message: string };
+        expect(body.error).toBe(code);
+        expect(body.message).toBe('session name already in use'); // actionable reason preserved, not 'internal'
+      } finally { await s.stop(); }
+    }
+  });
 });
 
 async function getTokenFor(s: DashboardServer, a: DashboardAuth): Promise<string> {

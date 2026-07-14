@@ -74,6 +74,13 @@ export class BrokerDaemon {
   private readonly ledgerVerifyIntervalMs: number;
   private connAuth = new Map<string, SessionAuthority>();
   private connHello = new Set<string>();
+  /** Beta.7 (ADR 0025): live in-process handles to xbus-MANAGED background children THIS broker
+   *  spawned. stop_managed only SIGTERMs a pid backed by a live handle here — that is the sole
+   *  proof the pid is still OUR child and not an OS-recycled pid (ADR 0024 §4 liveness guard).
+   *  A handle is dropped when the child exits (which also clears the session's managed markers)
+   *  or when the broker restarts (a fresh process holds no handles → no unsafe kill). Keyed by
+   *  sessionId; value carries the pid + recorded launchKey for a defensive cross-check. */
+  private managedChildren = new Map<string, { pid: number; launchKey: string; kill: (signal?: NodeJS.Signals) => boolean }>();
   /** In-memory awarded support per connection (adapter-aware registrations only; never persisted).
    *  This is REGISTRATION-AWARD state: it records what the broker awarded at register time and is
    *  consulted at register time to enforce the requested receive mode. It is NOT yet an
@@ -767,10 +774,21 @@ export class BrokerDaemon {
       case 'unarchive': result = this.store.operatorSetArchived(sessionId, false); break;
       case 'remove_record': result = this.store.operatorRemoveRecord(sessionId); break;
       case 'stop_managed': {
+        // Clear the DB markers first (this also refuses a non-managed session and returns the
+        // recorded pid + launch_key). We then kill ONLY if we still hold a LIVE in-process handle
+        // to this exact child — the sole pid-recycling-safe liveness proof (ADR 0024 §4). Without
+        // a live handle (broker restarted since spawn, or the child already exited) we DO NOT
+        // SIGTERM a bare pid — it may have been recycled to an unrelated process; we clear markers
+        // and report killed=false so a stale record can never terminate an innocent process.
         const cleared = this.store.clearManagedSession(sessionId);
-        // Kill the managed child by pid (best-effort; the store already refused non-managed).
-        if (cleared.pid && cleared.pid > 0) { try { process.kill(cleared.pid, 'SIGTERM'); } catch { /* already gone */ } }
-        result = { sessionId: cleared.sessionId, stopped: true, pid: cleared.pid };
+        const handle = this.managedChildren.get(sessionId);
+        let killed = false;
+        if (handle && cleared.pid !== null && handle.pid === cleared.pid &&
+            (cleared.launchKey === null || handle.launchKey === cleared.launchKey)) {
+          try { handle.kill('SIGTERM'); killed = true; } catch { /* already gone */ }
+        }
+        this.managedChildren.delete(sessionId);
+        result = { sessionId: cleared.sessionId, stopped: true, pid: cleared.pid, killed, killable: handle !== undefined };
         break;
       }
       default:
@@ -778,6 +796,23 @@ export class BrokerDaemon {
     }
     try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
     return result;
+  }
+
+  /**
+   * Beta.7 (ADR 0025): register a live in-process handle to a managed background child THIS
+   * broker just spawned, so a later stop_managed can SIGTERM it pid-recycling-safely. On the
+   * child's exit we clear the session's managed markers (so a dead session never retains a
+   * killable pid) and drop the handle. Called by the managed-spawn launch path after a
+   * successful spawn. `child` is the minimal surface we need (pid + on('exit') + kill).
+   */
+  registerManagedChild(sessionId: string, launchKey: string, child: { pid?: number; kill(signal?: NodeJS.Signals): boolean; once(event: 'exit', cb: () => void): unknown }): void {
+    if (child.pid === undefined) return; // never spawned a real process — nothing to track
+    this.managedChildren.set(sessionId, { pid: child.pid, launchKey, kill: (sig) => child.kill(sig) });
+    child.once('exit', () => {
+      this.managedChildren.delete(sessionId);
+      this.store.markManagedSessionExited(sessionId);
+      try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    });
   }
 
   /**

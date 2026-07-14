@@ -647,6 +647,8 @@ export const MIGRATIONS: readonly Migration[] = [
         updated_at         TEXT NOT NULL
       );
       CREATE INDEX idx_schedules_due ON schedules(state, next_run);
+      -- Wake-cap / concurrency lookups filter schedules by target_address / concurrency_key.
+      CREATE INDEX idx_schedules_target ON schedules(target_address);
 
       -- ===== Area 4b: schedule_runs — the exactly-once run ledger (ADR 0025) =====
       -- UNIQUE(schedule_id, scheduled_for) is the CAS: one claim per fire-slot, EVER. Combined
@@ -674,6 +676,9 @@ export const MIGRATIONS: readonly Migration[] = [
         FOREIGN KEY(schedule_id) REFERENCES schedules(schedule_id)
       );
       CREATE INDEX idx_schedule_runs_state ON schedule_runs(state, schedule_id);
+      -- Covers the per-day wake-cap COUNT (state + scheduled_for) and the retention prune
+      -- (terminal state + scheduled_for < cutoff) so neither is an ever-growing full scan.
+      CREATE INDEX idx_schedule_runs_slot ON schedule_runs(state, scheduled_for);
     `,
   },
 ];

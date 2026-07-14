@@ -235,10 +235,20 @@ async function cmdDoctor(): Promise<CliResult> {
         versionOk = assertSupportedNode({ version: rtVersion, exit: () => undefined as never, warn: () => {} }).ok;
       } catch (e) { rtVersion = `probe failed: ${(e as Error).message}`; }
       // Is the user-scope config command actually the bundled runtime? Read it back.
+      // Detection MUST be by installed ENTRY PATH (expectedEntries), not the `_xbusOwner` tag:
+      // Claude Code strips the non-standard tag when it re-serializes settings.json on the first
+      // `claude` run, so a tag-only read would return command=null and false-fail a perfectly
+      // wired install (matches the beta.5.1 session_start_hook fix just below). We build the same
+      // expectedEntries the SessionStart check uses so a path-matched hook still yields `command`.
       let wired = false;
       try {
         const settingsPath = manifest?.userScope?.settingsPath ?? defaultClaudeSettingsPath();
-        const hk = inspectUserScopeHooks(settingsPath);
+        const expectedEntries = {
+          SessionStart: path.join(pluginDir, 'dist', 'channel', 'session-start-hook.js'),
+          UserPromptSubmit: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+          Stop: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
+        };
+        const hk = inspectUserScopeHooks(settingsPath, expectedEntries);
         const cmd = hk.events.SessionStart.command ?? '';
         wired = cmd.replace(/\\/g, '/').toLowerCase() === runtime.replace(/\\/g, '/').toLowerCase();
       } catch { /* best-effort */ }

@@ -17,6 +17,7 @@ import { runMigrations, MIGRATIONS, type Migration } from '../../src/database/mi
 import { startBrokerHost, type RunningBroker } from '../../src/broker/host.js';
 import { loadOrCreateRootSecret, secretPath } from '../../src/ipc/root-secret.js';
 import { stateFilePath } from '../../src/broker/state-file.js';
+import { OPERATOR_SESSION_ID } from '../../src/broker/operator.js';
 import { systemClock } from '../../src/shared/clock.js';
 import { createHash } from 'node:crypto';
 
@@ -118,10 +119,15 @@ describe('§8 clean-profile lifecycle', () => {
     // Uninstall = remove the data dir.
     fs.rmSync(profile, { recursive: true, force: true });
     expect(fs.existsSync(profile)).toBe(false);
-    // Re-install into the same path starts completely fresh (no leftover state).
+    // Re-install into the same path starts completely fresh (no leftover USER state). The only
+    // row a clean broker provisions is the reserved `local-operator` infrastructure principal
+    // (ADR 0021 — created idempotently on every start, before the daemon binds), so a truly
+    // clean slate is exactly that one reserved row and zero real sessions.
     const broker2 = await startBrokerHost({ dataDir: profile, reaperIntervalMs: 0 });
-    const sessions = broker2.db.prepare('SELECT COUNT(*) n FROM sessions').get() as { n: number };
-    expect(sessions.n).toBe(0); // clean slate
+    const userSessions = broker2.db.prepare('SELECT COUNT(*) n FROM sessions WHERE session_id<>?').get(OPERATOR_SESSION_ID) as { n: number };
+    expect(userSessions.n).toBe(0); // clean slate — no leftover user session
+    const operatorRows = broker2.db.prepare('SELECT COUNT(*) n FROM sessions WHERE session_id=?').get(OPERATOR_SESSION_ID) as { n: number };
+    expect(operatorRows.n).toBe(1); // exactly the reserved operator infra row, freshly provisioned
     await broker2.stop();
   });
 

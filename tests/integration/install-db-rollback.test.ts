@@ -99,6 +99,22 @@ describe('install DB rollback — fault injection after every post-migration bou
     expect(leftover).toHaveLength(0);
   }, 60_000);
 
+  it('a SUCCESSFUL upgrade reclaims the pre-swap plugin backup (no unbounded backup accumulation)', async () => {
+    // Regression (beta.7): the bundled runtime made the plugin dir tens of MB, so a plugin
+    // backup left behind per successful upgrade accumulates unbounded disk. On full success the
+    // installer must reclaim the backup it created (it exists only to roll back a FAILED install).
+    const pluginDir = path.join(root, 'plugin');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'OLD.txt'), 'prior install'); // pre-existing plugin → forces a backup
+    const r = await install(baseOpts());
+    expect(r.ok, r.error).toBe(true);
+    // No `.plugin.backup-*` dir remains after a clean success.
+    const backups = fs.readdirSync(root).filter((n) => n.startsWith('.plugin.backup-'));
+    expect(backups, `plugin backups must be reclaimed on success, found: ${backups.join(', ')}`).toHaveLength(0);
+    // The new plugin is in place (the backup's removal didn't touch the live dir).
+    expect(fs.existsSync(path.join(pluginDir, 'dist', 'cli', 'main.js'))).toBe(true);
+  }, 60_000);
+
   it('restore FAILURE: the recovery snapshot is RETAINED and its path is reported (never deleted)', async () => {
     expect(schemaVersion(dbPath)).toBe(6);
     // Force a boundary fault AND force the DB restore itself to fail. The DB is left

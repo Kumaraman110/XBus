@@ -33,6 +33,8 @@ export interface SweepResult {
   leasesReclaimed: number;
   /** sessions with no meaningful activity for >15 days -> expired (beta.4). */
   sessionsExpired: number;
+  /** terminal schedule_runs rows past the retention horizon that were pruned (beta.7). */
+  scheduleRunsPruned: number;
 }
 
 export interface ReaperOptions {
@@ -40,6 +42,12 @@ export interface ReaperOptions {
   /** Max deliveries one recipient session may have reaped in a single sweep
    *  (anti-starvation). 0 = unbounded. Default 256. */
   perSessionCap?: number;
+  /** Beta.7 (ADR 0025): retention horizon (ms) for TERMINAL schedule_runs rows. A run row
+   *  whose scheduled_for is older than (now - this) and whose state is terminal is pruned — its
+   *  fire-slot can never be re-selected (next_run only advances forward), so deleting it is
+   *  exactly-once-safe and stops the run ledger growing without bound. 0 disables pruning.
+   *  Default 7 days (well past any restart/replay window). */
+  scheduleRunRetentionMs?: number;
   /** Jitter RNG for backoff (injected for deterministic tests). Default Math.random
    *  is NOT used (it's unavailable in workflow scripts) — production passes a real
    *  source; if omitted, jitter is disabled (full backoff, no randomization). */
@@ -49,6 +57,7 @@ export interface ReaperOptions {
 export class Reaper {
   private readonly backoff: BackoffConfig;
   private readonly perSessionCap: number;
+  private readonly scheduleRunRetentionMs: number;
   private readonly rng: () => number;
   constructor(
     private readonly db: SqliteDriver,
@@ -58,6 +67,7 @@ export class Reaper {
   ) {
     this.backoff = opts.backoff ?? DEFAULT_BACKOFF;
     this.perSessionCap = opts.perSessionCap ?? 256;
+    this.scheduleRunRetentionMs = opts.scheduleRunRetentionMs ?? 7 * 24 * 60 * 60 * 1000;
     // Default: deterministic full-backoff ceiling (rng()=1 ⇒ delay = ceil). A
     // caller that wants jitter injects an rng; tests inject a fixed value.
     this.rng = opts.rng ?? (() => 1);
@@ -76,6 +86,7 @@ export class Reaper {
         expired: this.reapAcceptanceTtl(),
         leasesReclaimed: this.reclaimLeases(),
         sessionsExpired: this.reapExpiredSessions(),
+        scheduleRunsPruned: this.reapOldScheduleRuns(),
       };
       this.reapStalePendingNames();
       return r;
@@ -261,5 +272,25 @@ export class Reaper {
     ).run(now, now);
     if (res.changes > 0) this.audit('LEASES_RECLAIMED', null, { count: res.changes });
     return res.changes;
+  }
+
+  /**
+   * Beta.7 (ADR 0025): prune TERMINAL schedule_runs rows older than the retention horizon so the
+   * exactly-once run ledger doesn't grow without bound (an interval schedule at the floor makes
+   * ~1440 rows/day forever). Only terminal states are pruned (sent/skipped/failed) and only rows
+   * whose scheduled_for is older than (now - retention) — such a fire-slot can NEVER be
+   * re-selected, because a schedule's next_run only advances forward, so the claim-UNIQUE it
+   * anchored is no longer needed. Never touches a 'claimed' (in-flight) row. Idempotent.
+   */
+  private reapOldScheduleRuns(): number {
+    if (this.scheduleRunRetentionMs <= 0) return 0;
+    const cutoff = new Date(this.clock.nowMs() - this.scheduleRunRetentionMs).toISOString();
+    try {
+      const res = this.db.prepare(
+        `DELETE FROM schedule_runs WHERE state IN ('sent','skipped','failed') AND scheduled_for < ?`,
+      ).run(cutoff);
+      if (res.changes > 0) this.audit('SCHEDULE_RUNS_PRUNED', null, { count: res.changes, cutoff });
+      return res.changes;
+    } catch { return 0; } // schedule_runs absent on a pre-v9 DB (shouldn't happen post-migration)
   }
 }

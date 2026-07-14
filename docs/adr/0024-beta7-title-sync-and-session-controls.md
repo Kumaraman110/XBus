@@ -51,8 +51,18 @@ hook/CLI surface (confirmed 2026-07-14 against docs.claude.com/en/docs/claude-co
 
 4. **Managed-session tracking:** `managed_by_xbus` / `managed_pid` / `managed_started_at` /
    `managed_launch_key` mark sessions XBus launched itself, so stop/restart target ONLY
-   xbus-managed sessions and validate liveness by `started_at` + `launch_key` (not pid alone —
-   OS pid recycling).
+   xbus-managed sessions. Liveness is proven by a **live in-process child handle** the broker
+   holds for each child it spawned (keyed by session id, carrying the pid + `launch_key`):
+   `stop_managed` clears the DB markers and then `SIGTERM`s the pid **only** when that live
+   handle is still present and its pid + `launch_key` match — the sole pid-recycling-safe proof
+   that the pid is still *our* child. Without a live handle (the broker restarted since the
+   spawn, or the child already exited) XBus does **not** kill a bare pid — it clears the markers
+   and reports `killed=false`, so a stale record can never terminate an OS-recycled, unrelated
+   process. When a managed child exits (natural or crash) its `exit` handler clears the session's
+   managed markers, so a dead session never retains a killable pid. (`managed_started_at` /
+   `managed_launch_key` remain the durable idempotent-launch anchor across restarts; the
+   cross-process kill authority deliberately does not survive a broker restart — a conservative,
+   safe-by-default choice.)
 
 ## Consequences
 

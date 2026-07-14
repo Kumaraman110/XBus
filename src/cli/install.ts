@@ -470,6 +470,12 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
     // FULL SUCCESS: every post-migration step committed. Only NOW discard the pre-upgrade
     // snapshot — it protected the DB across health/user-scope/manifest/marker (blocker #4).
     if (dbSnapshot) discardSnapshot(dbSnapshot.dir);
+    // Reclaim the pre-swap plugin backup(s): they exist ONLY to roll back a FAILED install, so on
+    // full success they are dead weight. beta.7 grew the plugin dir to tens of MB (the bundled
+    // node.exe), so leaving one behind per upgrade would accumulate unbounded disk until
+    // uninstall. Remove the backups we created this run (best-effort — a stale backup is
+    // reclaimable but should not be retained silently).
+    for (const b of backups) { try { if (fs.existsSync(b.backup)) fs.rmSync(b.backup, { recursive: true, force: true }); } catch { /* best effort */ } }
     return { ok: true, dryRun: false, plan, manifestPath: manifestPath(installRoot), health, migrated };
   } catch (e) {
     // Full rollback on ANY failure (incl. post-swap errors + post-migration fault boundaries).

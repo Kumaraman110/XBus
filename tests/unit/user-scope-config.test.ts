@@ -451,6 +451,13 @@ describe('inspectUserScopeHooks (read-only doctor view)', () => {
     expect(v.events.SessionStart.entry).toContain('session-start-hook.js');
     expect(v.events.UserPromptSubmit).toMatchObject({ registered: true, owned: false });
     expect(v.events.Stop).toMatchObject({ registered: true, owned: false });
+    // REGRESSION (beta.7): the doctor `node_runtime` check reads back the launcher `command` to
+    // confirm it is the bundled runtime. Path-based detection MUST also capture `command` after
+    // the tag is stripped (a tag-only read returns command=null → node_runtime false-fails a
+    // healthy install). With expectedEntries supplied, the command is captured by path.
+    expect(v.events.SessionStart.command).toBe(NODE);
+    // …and the tag-only view returns null command (the OLD behavior the fix must not rely on).
+    expect(tagOnly.events.SessionStart.command).toBeNull();
   });
 
   it('path detection is robust to Windows separator/case drift', () => {
