@@ -564,6 +564,118 @@ export const MIGRATIONS: readonly Migration[] = [
           JOIN threads th ON th.thread_id = t.thread_id;
     `,
   },
+  {
+    version: 9,
+    name: 'session_titles_lifecycle_and_scheduling',
+    sql: `
+      -- ADR 0024 (title sync + session controls) + ADR 0025 (idle wake + scheduling): beta.7
+      -- Phase 3. ALL ADDITIVE. Moves SCHEMA_VERSION 8 -> 9, so the wire tuple becomes
+      -- xbus-p1-stp1-s9 (protocol + STP frozen at 1). Fail-closed: an s8 (beta.6) component
+      -- meeting a v9 broker is rejected 'upgrade_component' at the handshake (checkCompatibility);
+      -- beta.7 is a controlled whole-install upgrade (ADR 0019). Every ALTER on the POPULATED
+      -- sessions table is nullable-or-NOT-NULL-DEFAULT (SQLite cannot ALTER-add an FK or a bare
+      -- NOT NULL to a populated table); FKs appear ONLY on the two brand-new (empty-at-create)
+      -- tables. No backfill needed — existing sessions get DEFAULT 0 flags + NULL new columns.
+
+      -- ===== Area 3a: the Claude Code NATIVE display title (ADR 0024) =====
+      -- A deliberately INERT FOURTH identity pool, DISTINCT from the xbus session_name /
+      -- normalized_session_name / aliases pools. It is NEVER normalized, NEVER unique-indexed,
+      -- NEVER reserved, and NEVER read by resolveRecipient/aliasForSession — it is untrusted
+      -- DISPLAY text captured ONLY from Claude Code's documented SessionStart 'session_title'
+      -- stdin field (or a SessionStart hookSpecificOutput.sessionTitle XBus emits). Storing it
+      -- separately from the xbus alias is what lets the console show both without ever CLAIMING
+      -- the Claude title changed when only the xbus alias did (ADR 0024).
+      ALTER TABLE sessions ADD COLUMN claude_title TEXT;                          -- untrusted display text, nullable
+      ALTER TABLE sessions ADD COLUMN claude_title_source TEXT;                   -- startup|resume|clear|compact|hook_output
+      ALTER TABLE sessions ADD COLUMN claude_title_at TEXT;                       -- ISO, last observation
+
+      -- ===== Area 3b: xbus-MANAGED background session tracking (ADR 0024/0025) =====
+      -- managed_by_xbus marks a session XBus launched itself (via 'claude --bg'); managed_pid +
+      -- managed_started_at + managed_launch_key let stop/restart target ONLY xbus-managed
+      -- sessions and validate liveness (not pid alone — OS pid recycling). Default 0 => a normal
+      -- user-launched session is never treated as managed.
+      ALTER TABLE sessions ADD COLUMN managed_by_xbus INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN managed_pid INTEGER;
+      ALTER TABLE sessions ADD COLUMN managed_started_at TEXT;
+      ALTER TABLE sessions ADD COLUMN managed_launch_key TEXT;                    -- <schedule_id:scheduled_for>, idempotent-launch guard
+
+      -- ===== Area 3c: pin/archive lifecycle (ADR 0024) =====
+      -- ORTHOGONAL to connection state / readiness / management_state / expired_at. archived
+      -- hides a stale record from the default console view; pinned keeps it surfaced. Neither
+      -- deletes the record or the Claude transcript (removal is an explicit operator op that
+      -- deletes only the sessions row + projections, NEVER unlinks transcript_path).
+      ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE sessions ADD COLUMN archived_at TEXT;
+      CREATE INDEX idx_sessions_lifecycle ON sessions(archived, pinned);
+
+      -- ===== Area 4a: schedules (ADR 0025) =====
+      -- Opt-in managed execution. NO FK to sessions: the target is resolved AT FIRE TIME from
+      -- target_address (a name/alias/session-id), so a schedule can target a not-yet-existing
+      -- (managed_spawn) session and survives target archival/deletion. Loop prevention:
+      -- min_interval_ms floor + origin_guard (a scheduled message may not create schedules) +
+      -- wake_limit_per_day. delivery_mode: enqueue_only (durable QUEUED, drains at the target's
+      -- next checkpoint) | wake_if_running (also nudges the resident rewaker) | managed_spawn
+      -- (launch a sandboxed background session; EXPERIMENTAL, default off).
+      CREATE TABLE schedules (
+        schedule_id        TEXT PRIMARY KEY,
+        created_by_actor   TEXT NOT NULL,                        -- 'local-operator' | a session id
+        title              TEXT,                                 -- operator label (display only, untrusted)
+        target_address     TEXT NOT NULL,                        -- resolved at fire time (name/alias/session id)
+        payload_kind       TEXT NOT NULL DEFAULT 'request',
+        payload_text       TEXT NOT NULL,                        -- untrusted-peer body enqueued when due
+        requires_ack       INTEGER NOT NULL DEFAULT 1,
+        requires_reply     INTEGER NOT NULL DEFAULT 1,
+        kind               TEXT NOT NULL,                        -- 'once' | 'interval' | 'cron'
+        schedule_expr      TEXT,                                 -- interval ms / 5-field cron; NULL for 'once'
+        timezone           TEXT NOT NULL DEFAULT 'UTC',
+        quiet_hours_json   TEXT,                                 -- {tz,windows:[{start,end}]} or NULL
+        delivery_mode      TEXT NOT NULL DEFAULT 'enqueue_only', -- enqueue_only|wake_if_running|managed_spawn
+        managed_budget_json TEXT,                                -- {maxTurns,maxBudgetUsd,timeoutMs} for managed_spawn
+        concurrency_key    TEXT,                                 -- at-most-one in-flight per key
+        min_interval_ms    INTEGER NOT NULL DEFAULT 60000,       -- loop floor (rejected below at creation)
+        wake_limit_per_day INTEGER,                              -- NULL = unlimited
+        wakes_today        INTEGER NOT NULL DEFAULT 0,
+        wakes_today_date   TEXT,                                 -- UTC date for wakes_today reset
+        next_run           TEXT,                                 -- ISO next occurrence; NULL => nothing due
+        last_run           TEXT,
+        max_fires          INTEGER,                              -- NULL = unbounded
+        fires_used         INTEGER NOT NULL DEFAULT 0,
+        origin_guard       INTEGER NOT NULL DEFAULT 1,           -- forbid this schedule's own delivery creating schedules
+        state              TEXT NOT NULL DEFAULT 'active',       -- active|paused|exhausted|cancelled
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+      );
+      CREATE INDEX idx_schedules_due ON schedules(state, next_run);
+
+      -- ===== Area 4b: schedule_runs — the exactly-once run ledger (ADR 0025) =====
+      -- UNIQUE(schedule_id, scheduled_for) is the CAS: one claim per fire-slot, EVER. Combined
+      -- with the ux_idem UNIQUE on messages(sender_session_id, idempotency_key) and the single
+      -- savepoint-reentrant transaction per tick, this gives exactly-once execution across a
+      -- duplicate tick AND a broker restart mid-fire (claim rolls back on crash-before-commit;
+      -- on crash-after-commit the advanced next_run + these two UNIQUEs prevent a re-fire). No
+      -- claim_expires_at lease — redundant under the atomic claim+send+advance.
+      CREATE TABLE schedule_runs (
+        run_id             TEXT PRIMARY KEY,
+        schedule_id        TEXT NOT NULL,
+        scheduled_for      TEXT NOT NULL,                        -- the fire-slot instant (idempotency anchor)
+        idempotency_key    TEXT NOT NULL,                        -- 'sched:'||schedule_id||':'||scheduled_for
+        state              TEXT NOT NULL DEFAULT 'claimed',      -- claimed|sent|delivered|completed|skipped|failed
+        skip_reason        TEXT,                                 -- quiet_hours|wake_limit|concurrency|paused|recipient_expired|budget
+        claimed_at         TEXT NOT NULL,
+        message_id         TEXT,                                 -- operatorSend result (ux_idem-deduped)
+        managed_session_id TEXT,                                 -- preminted UUID if managed_spawn
+        managed_pid        INTEGER,
+        attempt            INTEGER NOT NULL DEFAULT 1,
+        error_code         TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        UNIQUE(schedule_id, scheduled_for),
+        FOREIGN KEY(schedule_id) REFERENCES schedules(schedule_id)
+      );
+      CREATE INDEX idx_schedule_runs_state ON schedule_runs(state, schedule_id);
+    `,
+  },
 ];
 
 function checksum(sql: string): string {
