@@ -346,6 +346,8 @@ export class BrokerDaemon {
           return this.onSetControl(conn, frame);
         case 'process_next':
           return this.onProcessNext(conn, frame);
+        case 'wake_poll':
+          return this.onWakePoll(conn, frame);
         case 'dead_letter':
           return this.onDeadLetter(conn, frame);
         case 'block_peer':
@@ -876,6 +878,20 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const msgs = this.delivery.processNext(auth, this.ids.next());
     this.reply(conn, 'process_next_ack', { messages: msgs }, frame.requestId);
+  }
+
+  /**
+   * Beta.7 (ADR 0025): the resident rewaker hook polls this to decide whether to fire the
+   * documented asyncRewake (exit 2) that wakes an idle session. Identity is the AUTHENTICATED
+   * connection (auth.sessionId), never a payload field. Returns {eligible} = there is a queued
+   * delivery the next checkpoint would inject AND the session accepts injection. This is a PURE
+   * READ — it never injects a body (the body still drains on the pull path); the wake only
+   * accelerates that. So even if the wake never fires, delivery is unaffected (the durable floor).
+   */
+  private onWakePoll(conn: ServerConn, frame: Frame): void {
+    const auth = this.requireAuth(conn);
+    const eligible = this.store.hasEligibleDelivery(auth.sessionId);
+    this.reply(conn, 'wake_poll_ack', { eligible }, frame.requestId);
   }
 
   /**

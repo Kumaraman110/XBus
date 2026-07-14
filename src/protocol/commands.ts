@@ -32,6 +32,7 @@ export type FrameType =
   | 'dead_letter' | 'dead_letter_ack'
   | 'block_peer' | 'block_peer_ack'
   | 'takeover' | 'takeover_ack'
+  | 'wake_poll' | 'wake_poll_ack'
   | 'shutdown_notice';
 
 export interface Frame {

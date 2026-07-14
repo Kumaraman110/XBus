@@ -21,7 +21,7 @@ import { validateUserAlias, automaticAlias, parseRecipient, type NormalizedAlias
 import { validateSessionName, type NormalizedSessionName } from '../identity/session-name.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
-import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
+import { resolveReadiness, isReadiness, acceptsInjection, type Readiness, type ReadinessHints } from './readiness.js';
 import { ledgerAppend, type LedgerSubject } from './ledger.js';
 import type { ImportedSessionMeta } from './session-import.js';
 import { OPERATOR_SESSION_ID, OPERATOR_ALIAS, OPERATOR_ACTOR_KIND, OPERATOR_LEDGER_ACTOR } from './operator.js';
@@ -1244,6 +1244,29 @@ export class BrokerStore {
       }
       this.ledger('MANAGED_SESSION_LAUNCHED', OPERATOR_LEDGER_ACTOR, { sessionId }, { launchKey });
     });
+  }
+
+  /**
+   * Beta.7 (ADR 0025): does this session have an ELIGIBLE queued delivery right now — i.e. a
+   * message the NEXT checkpoint would inject? True iff (a) a queued/retry_wait delivery exists
+   * whose next_attempt_at is due and whose message hasn't expired, AND (b) the session accepts
+   * injection (ready_checkpoint|ready_live) AND auto-delivery isn't paused/dnd/manual. Used by
+   * the resident rewaker hook to decide whether to fire the documented asyncRewake (exit 2).
+   * PURE READ — no mutation, no injection; the actual body still drains on the pull path.
+   */
+  hasEligibleDelivery(sessionId: string): boolean {
+    const rd = this.readinessOf(sessionId);
+    if (!acceptsInjection(rd)) return false;
+    if (!this.controls.autoDeliveryEnabled(sessionId)) return false;
+    const now = this.clock.nowIso();
+    const row = this.db.prepare(
+      `SELECT 1 FROM deliveries d JOIN messages m ON m.message_id=d.message_id
+        WHERE d.recipient_session_id=? AND d.state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}')
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+          AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
+        LIMIT 1`,
+    ).get(sessionId, now, now) as unknown;
+    return row !== undefined;
   }
 
   // ─────────────────────── beta.7 schedules (ADR 0025) ───────────────────────
