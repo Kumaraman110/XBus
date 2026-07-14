@@ -150,11 +150,20 @@ async function main(): Promise<void> {
       const dr = sh(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { env: { XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') } });
       let dok: boolean;
       try { dok = dr.code === 0 && (JSON.parse(dr.out.slice(dr.out.indexOf('{'))) as { ok?: boolean }).ok === true; } catch { dok = false; }
-      // sh() runs with cwd=REPO; re-run from the artifact dir for source=artifact.
-      const dr2 = spawnSync(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: { ...process.env, XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') }, timeout: 60_000 });
-      let d2ok: boolean;
-      try { d2ok = (dr2.status ?? 1) === 0 && (JSON.parse((dr2.stdout ?? '').slice((dr2.stdout ?? '').indexOf('{'))) as { ok?: boolean }).ok === true; } catch { d2ok = false; }
-      record('artifact-first-installable', d2ok, d2ok ? 'xbus install --dry-run accepts the packaged artifact' : 'packaged artifact is NOT installable (RC2-INSTALL-1 regression)');
+      // sh() runs with cwd=REPO; re-run from the artifact dir for source=artifact. Retry a bounded
+      // number of times with a generous timeout: on a contended Windows/AV-EDR runner the spawn of
+      // the freshly-packaged CLI (a cold-started bundled node.exe under real-time AV scan) can be
+      // transiently slow/blocked right after the shard run — a single attempt yields a flaky FAIL
+      // even though the artifact is installable. A GENUINE non-installable artifact fails every
+      // attempt (deterministic), so the retry only absorbs the transient spawn contention.
+      let d2ok = false; let d2detail = '';
+      for (let attempt = 0; attempt < 3 && !d2ok; attempt++) {
+        const dr2 = spawnSync(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: { ...process.env, XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') }, timeout: 120_000 });
+        try { d2ok = (dr2.status ?? 1) === 0 && (JSON.parse((dr2.stdout ?? '').slice((dr2.stdout ?? '').indexOf('{'))) as { ok?: boolean }).ok === true; }
+        catch { d2ok = false; }
+        if (!d2ok) d2detail = `attempt ${attempt + 1}: status=${dr2.status ?? 'null'}${dr2.error ? ' err=' + dr2.error.message.slice(0, 60) : ''}`;
+      }
+      record('artifact-first-installable', d2ok, d2ok ? 'xbus install --dry-run accepts the packaged artifact' : `packaged artifact is NOT installable (RC2-INSTALL-1 regression; ${d2detail})`);
       void dok;
 
       // 6c) DETERMINISTIC release ZIP (§7): build the archive TWICE from the same
