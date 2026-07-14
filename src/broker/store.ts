@@ -1265,7 +1265,7 @@ export class BrokerStore {
           AND (m.expires_at IS NULL OR m.expires_at > ?)
           AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
         LIMIT 1`,
-    ).get(sessionId, now, now) as unknown;
+    ).get(sessionId, now, now) as { 1: number } | undefined;
     return row !== undefined;
   }
 
