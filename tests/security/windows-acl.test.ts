@@ -78,6 +78,19 @@ describe(`runtime artifact permissions (${process.platform})`, () => {
     fs.rmSync(t, { recursive: true, force: true });
   });
 
+  it('describeAcl: an UNREADABLE ACL is INCONCLUSIVE (readError), never a false broadAccess', () => {
+    // Regression (beta.7): under heavy concurrent load the icacls READ subprocess can time out.
+    // That is an inconclusive read, NOT evidence of a broad principal — it must return
+    // broadAccess:false + readError:true so an install health-check doesn't false-fail an
+    // owner-only secret. We can't force a timeout deterministically, but a non-existent Windows
+    // target makes icacls exit non-zero (the same catch path), so readError must be set and
+    // broadAccess must NOT be asserted true. On Unix statSync throws (different contract) — skip.
+    if (!isWin) return;
+    const acl = describeAcl(path.join(os.tmpdir(), `xbus-no-such-acl-${process.pid}-${Date.now()}`));
+    expect(acl.readError, `inconclusive read must set readError: ${JSON.stringify(acl)}`).toBe(true);
+    expect(acl.broadAccess).toBe(false); // an unreadable ACL is never reported as broad
+  });
+
   it('loadOrCreateRootSecret works when auth/ pre-exists and the parent inheritance was removed (ACL-orphan regression)', () => {
     // Regression for a real, deterministic Windows failure (reproduced in plain node,
     // no vitest/contention): if the `auth/` subdir already exists when the data dir is

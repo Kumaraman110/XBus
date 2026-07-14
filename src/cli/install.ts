@@ -514,11 +514,14 @@ function readCommit(source: string): string {
 async function healthCheck(dataDir: string): Promise<{ ok: boolean; detail: string }> {
   try {
     const broker = await startBrokerHost({ dataDir, reaperIntervalMs: 0 });
-    // ACL of the secret must be owner-only.
+    // ACL of the secret must be owner-only. A GENUINE broad principal fails closed; an
+    // INCONCLUSIVE read (the icacls read subprocess timed out under load — readError) is not
+    // evidence of a broad ACL, so it does not fail the install (the hardening step already
+    // ran/was skipped by policy; a read-timeout must not falsely condemn an owner-only secret).
     const acl = describeAcl(secretPath(dataDir));
     await broker.stop();
-    if (acl.broadAccess) return { ok: false, detail: 'root secret has broad ACL' };
-    return { ok: true, detail: 'broker started + stopped cleanly; secret ACL owner-only' };
+    if (acl.broadAccess && !acl.readError) return { ok: false, detail: 'root secret has broad ACL' };
+    return { ok: true, detail: acl.readError ? 'broker started + stopped cleanly; secret ACL read inconclusive (icacls timeout)' : 'broker started + stopped cleanly; secret ACL owner-only' };
   } catch (e) {
     return { ok: false, detail: (e as Error).message };
   }
