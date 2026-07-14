@@ -166,6 +166,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
         // read-only. A throw surfaces to the route as a clean 4xx; the broker is unaffected.
         onOperatorSend: (payload) => daemon.operatorSend(payload),
         onMarkThreadRead: (payload) => daemon.operatorMarkThreadRead(payload),
+        onOperatorControl: (payload) => daemon.operatorControl(payload),
       });
       await dashboard.start();
       dashboardUrl = dashboard.url;

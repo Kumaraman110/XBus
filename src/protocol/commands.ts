@@ -90,4 +90,8 @@ export interface AnnouncePayload {
   transcriptPath?: string;
   /** Optional agent type (present when launched with `--agent`). */
   agentType?: string;
+  /** Beta.7 (ADR 0024): the Claude Code native session title, from the documented SessionStart
+   *  `session_title` stdin field. Captured OBSERVE-ONLY into claude_title (separate from the
+   *  xbus alias); absent on most starts (only set once a title exists via --name/-n or /rename). */
+  sessionTitle?: string;
 }

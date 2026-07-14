@@ -80,6 +80,9 @@ export interface DashboardServerOptions {
    */
   onOperatorSend?: (payload: unknown) => unknown;
   onMarkThreadRead?: (payload: unknown) => unknown;
+  /** Beta.7 (ADR 0024): operator session-control callback (rename alias / pause-DND / pin /
+   *  archive / remove-record / stop-managed). Payload carries {action, sessionId, ...}. */
+  onOperatorControl?: (payload: unknown) => unknown;
   /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
   maxWriteBodyBytes?: number;
 }
@@ -107,6 +110,7 @@ export class DashboardServer {
   private readonly maxStreams: number;
   private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
   private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorControl: ((payload: unknown) => unknown) | undefined;
   private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
 
@@ -123,6 +127,7 @@ export class DashboardServer {
     this.maxStreams = opts.maxStreams ?? 64;
     this.onOperatorSend = opts.onOperatorSend;
     this.onMarkThreadRead = opts.onMarkThreadRead;
+    this.onOperatorControl = opts.onOperatorControl;
     this.maxWriteBodyBytes = opts.maxWriteBodyBytes ?? 96 * 1024;
   }
 
@@ -284,7 +289,8 @@ export class DashboardServer {
     const sendNew = p === '/api/thread';
     const sendFollow = /^\/api\/thread\/([^/]+)\/send$/.exec(p);
     const markRead = /^\/api\/thread\/([^/]+)\/read$/.exec(p);
-    if (!sendNew && !sendFollow && !markRead) return this.json(res, 404, { error: 'not_found' });
+    const control = /^\/api\/session\/([^/]+)\/control$/.exec(p); // beta.7 operator controls
+    if (!sendNew && !sendFollow && !markRead && !control) return this.json(res, 404, { error: 'not_found' });
 
     const body = await this.readJsonBody(req, res, this.maxWriteBodyBytes);
     if (body === null) return; // already responded (413/400)
@@ -297,6 +303,12 @@ export class DashboardServer {
         // A NEW-thread POST must NOT carry a threadId (that is the follow-up route's job).
         if (sendNew && 'threadId' in payload) delete (payload as { threadId?: unknown }).threadId;
         const result = await this.onOperatorSend(payload);
+        return this.json(res, 200, result);
+      }
+      if (control) {
+        if (!this.onOperatorControl) return this.json(res, 503, { error: 'write_unavailable' });
+        // The target sessionId comes from the PATH (not a spoofable body field); action + params from the body.
+        const result = await this.onOperatorControl({ ...body, sessionId: decodeURIComponent(control[1]!) });
         return this.json(res, 200, result);
       }
       // markRead

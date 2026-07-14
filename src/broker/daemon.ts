@@ -502,11 +502,13 @@ export class BrokerDaemon {
     const cwd = this.optString(p.cwd, 'cwd');
     const transcriptPath = this.optString(p.transcriptPath, 'transcriptPath');
     const agentType = this.optString(p.agentType, 'agentType');
+    const sessionTitle = this.optString(p.sessionTitle, 'sessionTitle'); // beta.7 (ADR 0024): documented SessionStart field
     const r = this.store.announceSession(auth, {
       source: p.source,
       ...(cwd !== undefined ? { cwd } : {}),
       ...(transcriptPath !== undefined ? { transcriptPath } : {}),
       ...(agentType !== undefined ? { agentType } : {}),
+      ...(sessionTitle !== undefined ? { sessionTitle } : {}),
     });
     // Beta.5: nudge any open dashboard streams that session state changed (best-effort,
     // off-loop read; never throws into the handler). No-op if no dashboard is wired.
@@ -700,6 +702,53 @@ export class BrokerDaemon {
     const r = this.store.markThreadRead(threadId, up);
     try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
     return r;
+  }
+
+  /**
+   * Beta.7 (ADR 0024): operator session-control callbacks. Each validates the untrusted
+   * browser payload (a target sessionId + typed params), delegates to the OPERATOR-authority
+   * store method (which stamps 'local-operator' + appends one ledger event), then nudges the
+   * dashboard. A throw surfaces to the HTTP route as a clean 4xx/5xx; the broker is unaffected.
+   * `raw.action` selects the control so ONE injected callback (onOperatorControl) covers them.
+   */
+  operatorControl(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const action = this.optString(p.action, 'action');
+    const sessionId = this.optString(p.sessionId, 'sessionId');
+    if (!sessionId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'sessionId required');
+    let result: unknown;
+    switch (action) {
+      case 'rename_alias': {
+        const name = this.optString(p.name, 'name');
+        if (!name) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'name required');
+        result = this.store.operatorRenameAlias(sessionId, name);
+        break;
+      }
+      case 'set_control': {
+        const mode = this.optString(p.mode, 'mode');
+        if (mode !== 'active' && mode !== 'paused' && mode !== 'do_not_disturb' && mode !== 'manual_checkpoint') {
+          throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "mode must be active|paused|do_not_disturb|manual_checkpoint");
+        }
+        result = this.store.operatorSetControl(sessionId, mode);
+        break;
+      }
+      case 'pin': result = this.store.operatorSetPinned(sessionId, true); break;
+      case 'unpin': result = this.store.operatorSetPinned(sessionId, false); break;
+      case 'archive': result = this.store.operatorSetArchived(sessionId, true); break;
+      case 'unarchive': result = this.store.operatorSetArchived(sessionId, false); break;
+      case 'remove_record': result = this.store.operatorRemoveRecord(sessionId); break;
+      case 'stop_managed': {
+        const cleared = this.store.clearManagedSession(sessionId);
+        // Kill the managed child by pid (best-effort; the store already refused non-managed).
+        if (cleared.pid && cleared.pid > 0) { try { process.kill(cleared.pid, 'SIGTERM'); } catch { /* already gone */ } }
+        result = { sessionId: cleared.sessionId, stopped: true, pid: cleared.pid };
+        break;
+      }
+      default:
+        throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `unknown control action: ${String(action)}`);
+    }
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
   }
 
   /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time
