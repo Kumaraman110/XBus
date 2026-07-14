@@ -70,17 +70,18 @@ describe('build-identity model', () => {
     expect(STP_VERSION).toBe(1);
     expect(SECURE_TRANSPORT_VERSION).toBe(STP_VERSION);
     // The wire-bound compatibility value is the STABLE tuple, not the product
-    // version. Beta.6 Phase 2's migration v8 moved the SCHEMA component 7 -> 8
-    // (ADR 0019, a deliberate fail-closed bump; beta.5's v7 had moved 6 -> 7);
+    // version. Beta.7 Phase 3's migration v9 moved the SCHEMA component 8 -> 9
+    // (ADR 0019, a deliberate fail-closed bump; beta.6's v8 had moved 7 -> 8);
     // protocol + STP are still 1, so the wire BYTES/key-schedule are unchanged —
     // only the schema integer in the tuple moves.
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s8');
+    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s9');
     expect(WIRE_COMPATIBILITY_ID).toBe(compatibilityId(SCHEMA_VERSION));
-    expect(SCHEMA_VERSION).toBe(8);
+    expect(SCHEMA_VERSION).toBe(9);
     // The pure arithmetic for OLD schemas is unchanged (version-independent fn).
     expect(compatibilityId(5)).toBe('xbus-p1-stp1-s5');
     expect(compatibilityId(6)).toBe('xbus-p1-stp1-s6');
     expect(compatibilityId(7)).toBe('xbus-p1-stp1-s7');
+    expect(compatibilityId(8)).toBe('xbus-p1-stp1-s8');
   });
 
   it('12: a MISSING provenance manifest is caught by required-files (fail closed at install)', async () => {

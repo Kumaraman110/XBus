@@ -86,10 +86,17 @@ function seedV7Conversation(db: SqliteDriver, nowIso: string): { correlationId: 
 }
 
 describe('migration v8 — schema/version bump', () => {
-  it('the global schema is exactly 8 and the wire tuple is xbus-p1-stp1-s8', () => {
-    expect(SCHEMA_VERSION).toBe(8);
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s8');
+  it('migration v8 exists and moves the schema to exactly 8 at its boundary', () => {
+    // v8 is the beta.6 boundary. The GLOBAL current schema/wire tuple has since moved forward
+    // (owned by version-consistency.test.ts); this file stays scoped to the v8 migration
+    // itself, asserting the 8-boundary via a bounded apply — not the global SCHEMA_VERSION.
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(8);
+    expect(WIRE_COMPATIBILITY_ID).toMatch(/^xbus-p1-stp1-s\d+$/);
     expect(MIGRATIONS.some((m) => m.version === 8 && m.name === 'threaded_messaging_and_operator')).toBe(true);
+    const { db } = freshDb();
+    applyUpTo(db, 8, '2026-01-01T00:00:00.000Z');
+    expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(8);
+    db.close();
   });
 
   it('applying up to v8 on a fresh DB creates the thread tables + message columns', () => {
@@ -133,11 +140,13 @@ describe('migration v8 — 7→8 on a populated DB (backfill)', () => {
     expect(before).toBe(2); // request + correlated reply
     db.close();
 
-    // Real 7→8 upgrade via runMigrations (the exact production path).
+    // Real upgrade via runMigrations (the production path — applies v8 THEN any later
+    // migration). This test asserts the v8 BACKFILL effects (thread_id/thread_sequence/threads),
+    // which later additive migrations do not touch; it no longer pins the exact applied set.
     const db2 = openDatabase(p, { applyPragmas: true });
     const r = runMigrations(db2, now);
-    expect(r.appliedNow).toEqual([8]); // only v8 applied on the already-v7 DB
-    expect(r.currentVersion).toBe(8);
+    expect(r.appliedNow).toContain(8); // v8 was applied on the previously-v7 DB
+    expect(r.currentVersion).toBeGreaterThanOrEqual(8);
 
     // No message lost.
     const after = (db2.prepare('SELECT COUNT(*) AS c FROM messages').get() as { c: number }).c;
@@ -178,16 +187,17 @@ describe('migration v8 — 7→8 on a populated DB (backfill)', () => {
     db2.close();
   });
 
-  it('the 7→8 migration is idempotent-safe (re-run applies nothing, checksum verified)', () => {
+  it('the v8 migration is checksum-stable (a full runMigrations over a v8-boundary DB re-verifies v8, never re-applies it)', () => {
     const { db, path: p } = freshDb();
     const now = '2026-01-01T00:00:00.000Z';
-    runMigrations(db, now); // straight to 8
-    expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(8);
+    applyUpTo(db, 8, now); // stop AT the v8 boundary
     db.close();
+    // A full runMigrations must verify v8's frozen checksum (never re-apply it) and carry the
+    // DB forward to the current tip — proving v8's SQL bytes stay stable under later migrations.
     const db2 = openDatabase(p, { applyPragmas: true });
-    const r = runMigrations(db2, now); // no-op; checksum of v8 must match
-    expect(r.appliedNow).toEqual([]);
-    expect(r.currentVersion).toBe(8);
+    const r = runMigrations(db2, now);
+    expect(r.appliedNow).not.toContain(8); // v8 already applied → verified, not re-run
+    expect(r.currentVersion).toBeGreaterThanOrEqual(8);
     db2.close();
   });
 });

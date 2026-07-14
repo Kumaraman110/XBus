@@ -418,7 +418,7 @@ describe('inspectUserScopeHooks (read-only doctor view)', () => {
   it('reports all-absent for a missing settings file (uninstalled / fresh)', () => {
     const v = inspectUserScopeHooks(path.join(dir, 'does-not-exist', 'settings.json'));
     for (const ev of ['SessionStart', 'UserPromptSubmit', 'Stop'] as const) {
-      expect(v.events[ev]).toEqual({ registered: false, entry: null, owned: false });
+      expect(v.events[ev]).toEqual({ registered: false, entry: null, owned: false, command: null });
     }
   });
 
