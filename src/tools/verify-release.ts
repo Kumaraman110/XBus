@@ -158,19 +158,24 @@ async function main(): Promise<void> {
       // attempt (deterministic), so the retry only absorbs the transient spawn contention.
       // Spawn env: an END-USER install never has XBUS_BUNDLED_NODE / XBUS_DATA_DIR set (those are
       // BUILD-time / broker-internal), so scrub them — the artifact dry-run must be validated
-      // exactly as a real user would run it, and inheriting build env could exercise a path the
-      // user never hits. Use an isolated HOME too so the plan reads a clean legacy root (a running
-      // real broker under the tester's real HOME must not perturb the artifact-installability
-      // signal). Retry a bounded number of times with a delay + generous timeout: on a contended
-      // Windows/AV-EDR runner the cold-start of the freshly-extracted bundled node.exe (under
-      // real-time AV scan) can be transiently blocked right after the shard run. A GENUINELY
-      // non-installable artifact fails every attempt (deterministic).
+      // exactly as a real user would run it. Use an isolated HOME too so the plan reads a clean
+      // legacy root (a running real broker under the tester's real HOME must not perturb the
+      // signal).
       const drEnv: Record<string, string> = { ...process.env as Record<string, string>, HOME: isoHome, USERPROFILE: isoHome, XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') };
       delete drEnv.XBUS_BUNDLED_NODE; delete drEnv.XBUS_DATA_DIR;
+      // Run the artifact CLI with the SAME Node an installed XBus uses: its BUNDLED runtime
+      // (runtime/node.exe, a supported Node 22) when the artifact ships one, NOT this verify
+      // process's own interpreter — which may be an UNSUPPORTED Node (e.g. v25, outside the
+      // >=22.13 <25 floor) that the CLI's runtime guard correctly refuses. Using process.execPath
+      // here made the check fail on a perfectly-installable artifact purely because the harness
+      // ran under an unsupported Node. Fall back to process.execPath only when the artifact ships
+      // no bundled runtime (dev/source/non-Windows).
+      const bundledNode = path.join(staging, 'runtime', 'node.exe');
+      const drNode = fs.existsSync(bundledNode) ? bundledNode : node;
       let d2ok = false; let d2detail = '';
       for (let attempt = 0; attempt < 4 && !d2ok; attempt++) {
         if (attempt > 0) { const until = Date.now() + 3000; while (Date.now() < until) { /* let an AV scan / file lock settle before retrying */ } }
-        const dr2 = spawnSync(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: drEnv, timeout: 120_000 });
+        const dr2 = spawnSync(drNode, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: drEnv, timeout: 120_000 });
         try { d2ok = (dr2.status ?? 1) === 0 && (JSON.parse((dr2.stdout ?? '').slice((dr2.stdout ?? '').indexOf('{'))) as { ok?: boolean }).ok === true; }
         catch { d2ok = false; }
         if (!d2ok) {
