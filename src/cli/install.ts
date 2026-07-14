@@ -28,6 +28,7 @@ import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaul
 import { SCHEMA_VERSION } from '../protocol/handshake.js';
 import { snapshotDbCheckpointed, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
 import { openDatabase } from '../database/connection.js';
+import { bundledNodePath } from '../shared/bundled-runtime.js';
 import { classifyShutdown, readStateFile, stateFilePath, pidIsAlive } from '../broker/state-file.js';
 
 /**
@@ -154,7 +155,11 @@ export interface InstallResult {
 /** The payload directories/files that constitute the installable plugin.
  *  provenance.json travels with the install so installed binaries report the exact
  *  build identity (ADR 0011) with no git / no source checkout. */
-const PAYLOAD = ['.claude-plugin', '.mcp.json', 'hooks', 'dist', 'package.json', 'provenance.json'];
+// Beta.7 (ADR 0022): 'runtime' carries the XBus-owned node.exe into the installed plugin dir
+// (present in a packaged artifact; absent in a dev/source install — enumeratePayload skips a
+// missing entry). It is walked, checksum-verified during staging, recorded in manifest.files[]
+// for clean uninstall, and swapped atomically by the existing stage->rename install path.
+const PAYLOAD = ['.claude-plugin', '.mcp.json', 'hooks', 'dist', 'package.json', 'provenance.json', 'runtime'];
 const PAYLOAD_DEPS = ['uuid', 'zod'];
 
 function sha256(file: string): string {
@@ -412,10 +417,16 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       const installId = `xbus-${now.replace(/[:.]/g, '-')}-${process.pid}`;
       const configPath = opts.claudeConfigPath ?? defaultClaudeConfigPath();
       const settingsPath = opts.claudeSettingsPath ?? defaultClaudeSettingsPath();
+      // Beta.7 (ADR 0022): the MCP server + hooks are launched by the XBus-OWNED bundled
+      // runtime when the installed plugin dir ships one, so installed XBus IGNORES system
+      // Node/PATH. Precedence: explicit opts.nodePath (tests) → bundled runtime/node.exe (real
+      // Windows install) → process.execPath (dev/source install with no bundled runtime).
+      const installedRuntime = bundledNodePath(pluginDir);
+      const nodePath = opts.nodePath ?? (fs.existsSync(installedRuntime) ? installedRuntime : process.execPath);
       const usrOpts = {
         configPath,
         settingsPath,
-        nodePath: opts.nodePath ?? process.execPath,
+        nodePath,
         serverEntry: path.join(pluginDir, 'dist', 'channel', 'server.js'),
         hookEntry: path.join(pluginDir, 'dist', 'channel', 'hook-entry.js'),
         // Beta.5: SessionStart gets its OWN handler (control-plane visibility), distinct

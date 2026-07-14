@@ -22,6 +22,7 @@ import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../laun
 import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, inspectUserScopeHooks } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
+import { bundledNodePath, hasBundledRuntime, BUNDLED_NODE_VERSION } from '../shared/bundled-runtime.js';
 import { dashboardAlive } from '../broker/dashboard/browser.js';
 
 /** This process's exact identity: prefer the packaged provenance.json next to the
@@ -95,10 +96,13 @@ function cmdRepair(): CliResult {
   }
   const configPath = manifest.userScope?.configPath ?? defaultClaudeConfigPath();
   const settingsPath = manifest.userScope?.settingsPath ?? defaultClaudeSettingsPath();
+  // Beta.7 (ADR 0022): re-point config at the XBus-OWNED bundled runtime when the installed
+  // plugin dir ships one (so repair keeps ignoring system Node), else the running node (dev).
+  const repairRuntime = bundledNodePath(manifest.pluginDir);
   const r = repairUserScope({
     configPath,
     settingsPath,
-    nodePath: process.execPath,
+    nodePath: fs.existsSync(repairRuntime) ? repairRuntime : process.execPath,
     serverEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'server.js'),
     hookEntry: path.join(manifest.pluginDir, 'dist', 'channel', 'hook-entry.js'),
     // Beta.5: repair re-applies the SessionStart handler too (fixes a drifted/missing one).
@@ -212,6 +216,37 @@ async function cmdDoctor(): Promise<CliResult> {
   try { const { DatabaseSync } = await import('node:sqlite'); sqliteOk = typeof DatabaseSync === 'function'; sqliteDetail = sqliteOk ? 'node:sqlite available' : 'node:sqlite export missing'; }
   catch (e) { sqliteDetail = `node:sqlite import failed: ${(e as Error).message}`; }
   checks.push({ name: 'node_sqlite', ok: sqliteOk, detail: sqliteDetail });
+
+  // Beta.7 (ADR 0022): the XBus-OWNED bundled Node runtime. Reports whether the installed
+  // plugin dir ships runtime/node.exe and whether the user-scope MCP/hook `command` points at
+  // it (so installed XBus ignores system Node). Uninstalled / dev-source (no bundled runtime)
+  // is INFORMATIONAL — the running Node is then the accepted floor-checked one; a REAL install
+  // that ships a runtime but whose config points elsewhere is a fail (the guarantee leaked).
+  {
+    const manifest = readInstallManifest(defaultInstallRoot());
+    const pluginDir = typeof manifest?.pluginDir === 'string' ? manifest.pluginDir : null;
+    if (pluginDir && hasBundledRuntime(pluginDir)) {
+      const runtime = bundledNodePath(pluginDir);
+      // Probe the bundled binary's real version so a swapped/corrupt runtime is caught.
+      let rtVersion: string; let versionOk = false;
+      try {
+        const { execFileSync } = await import('node:child_process');
+        rtVersion = execFileSync(runtime, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+        versionOk = assertSupportedNode({ version: rtVersion, exit: () => undefined as never, warn: () => {} }).ok;
+      } catch (e) { rtVersion = `probe failed: ${(e as Error).message}`; }
+      // Is the user-scope config command actually the bundled runtime? Read it back.
+      let wired = false;
+      try {
+        const settingsPath = manifest?.userScope?.settingsPath ?? defaultClaudeSettingsPath();
+        const hk = inspectUserScopeHooks(settingsPath);
+        const cmd = hk.events.SessionStart.command ?? '';
+        wired = cmd.replace(/\\/g, '/').toLowerCase() === runtime.replace(/\\/g, '/').toLowerCase();
+      } catch { /* best-effort */ }
+      checks.push({ name: 'node_runtime', ok: versionOk && wired, detail: `bundled ${rtVersion} (pinned ${BUNDLED_NODE_VERSION}); config→bundled=${wired}` });
+    } else {
+      checks.push({ name: 'node_runtime', ok: true, detail: `no bundled runtime (running ${process.version}; system Node — dev/source or non-Windows install)` });
+    }
+  }
 
   // Beta.5: SessionStart (+ checkpoint) hooks registered at user scope. Reads the settings
   // file XBus actually writes hooks to (~/.claude/settings.json); an XBus SessionStart

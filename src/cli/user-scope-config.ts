@@ -409,10 +409,10 @@ export function inspectUserScopeHooks(
   expectedEntries?: Partial<Record<XbusHookEvent, string>>,
 ): {
   settingsPath: string;
-  events: Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
+  events: Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean; command: string | null }>;
 } {
   const s = readClaudeSettings(settingsPath);
-  const out = {} as Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean }>;
+  const out = {} as Record<XbusHookEvent, { registered: boolean; entry: string | null; owned: boolean; command: string | null }>;
   // The install stores backslashes on Windows; a host may re-serialize with mixed separators,
   // so compare on forward slashes. Case-fold ONLY on Windows (case-insensitive FS); on a
   // case-sensitive filesystem lowercasing would be an incorrect normalization. Both sides
@@ -424,6 +424,7 @@ export function inspectUserScopeHooks(
     const expectedNorm = expectedRaw !== undefined ? norm(expectedRaw) : undefined;
     let entry: string | null = null;
     let owned = false;
+    let command: string | null = null;
     for (const g of groups) {
       for (const h of g.hooks ?? []) {
         const handlerEntry = Array.isArray(h.args) && typeof h.args[0] === 'string'
@@ -435,10 +436,13 @@ export function inspectUserScopeHooks(
         if (isOwned || isXbusByPath) {
           if (isOwned) owned = true;
           if (handlerEntry !== null) entry = handlerEntry;
+          // Capture the launcher `command` (the node path) — beta.7 doctor verifies it points
+          // at the XBus-owned bundled runtime (exec form: command=node, args=[entry]).
+          if (typeof h.command === 'string') command = h.command;
         }
       }
     }
-    out[ev] = { registered: entry !== null, entry, owned };
+    out[ev] = { registered: entry !== null, entry, owned, command };
   }
   return { settingsPath, events: out };
 }
