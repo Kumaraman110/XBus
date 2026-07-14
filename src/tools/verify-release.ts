@@ -156,12 +156,27 @@ async function main(): Promise<void> {
       // transiently slow/blocked right after the shard run — a single attempt yields a flaky FAIL
       // even though the artifact is installable. A GENUINE non-installable artifact fails every
       // attempt (deterministic), so the retry only absorbs the transient spawn contention.
+      // Spawn env: an END-USER install never has XBUS_BUNDLED_NODE / XBUS_DATA_DIR set (those are
+      // BUILD-time / broker-internal), so scrub them — the artifact dry-run must be validated
+      // exactly as a real user would run it, and inheriting build env could exercise a path the
+      // user never hits. Use an isolated HOME too so the plan reads a clean legacy root (a running
+      // real broker under the tester's real HOME must not perturb the artifact-installability
+      // signal). Retry a bounded number of times with a delay + generous timeout: on a contended
+      // Windows/AV-EDR runner the cold-start of the freshly-extracted bundled node.exe (under
+      // real-time AV scan) can be transiently blocked right after the shard run. A GENUINELY
+      // non-installable artifact fails every attempt (deterministic).
+      const drEnv: Record<string, string> = { ...process.env as Record<string, string>, HOME: isoHome, USERPROFILE: isoHome, XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') };
+      delete drEnv.XBUS_BUNDLED_NODE; delete drEnv.XBUS_DATA_DIR;
       let d2ok = false; let d2detail = '';
-      for (let attempt = 0; attempt < 3 && !d2ok; attempt++) {
-        const dr2 = spawnSync(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: { ...process.env, XBUS_INSTALL_ROOT: path.join(isoHome, 'verify-install') }, timeout: 120_000 });
+      for (let attempt = 0; attempt < 4 && !d2ok; attempt++) {
+        if (attempt > 0) { const until = Date.now() + 3000; while (Date.now() < until) { /* let an AV scan / file lock settle before retrying */ } }
+        const dr2 = spawnSync(node, [path.join(staging, 'dist', 'cli', 'main.js'), 'install', '--dry-run', '--json'], { cwd: staging, encoding: 'utf8', env: drEnv, timeout: 120_000 });
         try { d2ok = (dr2.status ?? 1) === 0 && (JSON.parse((dr2.stdout ?? '').slice((dr2.stdout ?? '').indexOf('{'))) as { ok?: boolean }).ok === true; }
         catch { d2ok = false; }
-        if (!d2ok) d2detail = `attempt ${attempt + 1}: status=${dr2.status ?? 'null'}${dr2.error ? ' err=' + dr2.error.message.slice(0, 60) : ''}`;
+        if (!d2ok) {
+          const errTail = ((dr2.stderr ?? '').split('\n').filter((l) => !/ExperimentalWarning|--trace-warnings/.test(l)).join(' ')).slice(-200);
+          d2detail = `attempt ${attempt + 1}: status=${dr2.status ?? 'null'}${dr2.error ? ' err=' + dr2.error.message.slice(0, 60) : ''}${errTail ? ' stderr=' + errTail : ''}${!errTail && dr2.stdout ? ' stdout=' + dr2.stdout.slice(0, 200) : ''}`;
+        }
       }
       record('artifact-first-installable', d2ok, d2ok ? 'xbus install --dry-run accepts the packaged artifact' : `packaged artifact is NOT installable (RC2-INSTALL-1 regression; ${d2detail})`);
       void dok;
