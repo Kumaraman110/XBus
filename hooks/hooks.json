@@ -3,7 +3,8 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/channel/session-start-hook.js\"" }
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/channel/session-start-hook.js\"" },
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/channel/rewaker-entry.js\"", "async": true, "asyncRewake": true, "timeout": 1800 }
         ]
       }
     ],
