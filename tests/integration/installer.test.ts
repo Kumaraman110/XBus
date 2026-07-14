@@ -110,13 +110,18 @@ describe('F-B — installer', () => {
     expect(manifest.pluginDir).toContain('plugin');
   });
 
-  it('install is idempotent: a second install backs up the prior plugin and still succeeds', async () => {
+  it('install is idempotent: a second install succeeds and leaves NO leaked plugin backup', async () => {
     await install({ installRoot: root });
     const r2 = await install({ installRoot: root });
     expect(r2.ok, r2.error).toBe(true);
-    // a backup of the prior plugin dir was taken
+    // The prior plugin IS backed up during the atomic swap (that backup protects a failed
+    // re-install — proven by the 'failed RE-install restores the prior plugin' test below), but
+    // on FULL SUCCESS it is reclaimed: with beta.7's bundled runtime a retained backup would be
+    // tens of MB accumulating per upgrade. So a clean second install must leave zero backups.
     const backups = fs.readdirSync(root).filter((e) => e.startsWith('.plugin.backup-'));
-    expect(backups.length).toBeGreaterThanOrEqual(1);
+    expect(backups, `no plugin backup should be leaked on success, found: ${backups.join(', ')}`).toHaveLength(0);
+    // The live plugin is intact after the swap + backup reclaim.
+    expect(fs.existsSync(path.join(root, 'plugin', 'dist', 'cli', 'main.js'))).toBe(true);
   });
 
   it('install does NOT create files in the current working directory', async () => {
