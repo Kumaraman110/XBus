@@ -14,6 +14,7 @@ import { makeFrame, type Frame, type FrameType, type RegisterPayload, type Annou
 import { BrokerStore, type SessionAuthority } from './store.js';
 import { DeliveryOps, INJECTION_METADATA_KEY } from './delivery.js';
 import { Reaper, type SweepResult } from './reaper.js';
+import { Scheduler, type SchedulerTickResult } from './scheduler.js';
 import { DeadLetterStore } from './deadletter.js';
 import { ControlsStore, type ReceiveControl } from './controls.js';
 import type { ReadinessHints } from './readiness.js';
@@ -39,6 +40,9 @@ export interface DaemonOptions {
   /** Reaper sweep interval (ms). 0 disables the periodic timer (tests drive it
    *  explicitly via runReaperSweep). Default 30s. */
   reaperIntervalMs?: number;
+  /** Beta.7 (ADR 0025): scheduler tick interval (ms). 0 disables the periodic timer (tests
+   *  drive it explicitly via runSchedulerTick). Default 15s. */
+  schedulerIntervalMs?: number;
   /** Beta.5 blocker #7: audit-ledger verify interval (ms). 0 disables the periodic timer
    *  (tests drive verifyLedgerNow explicitly). Default 1h. Startup verify always runs. */
   ledgerVerifyIntervalMs?: number;
@@ -57,9 +61,12 @@ export class BrokerDaemon {
   private delivery: DeliveryOps;
   private controls: ControlsStore;
   private reaper: Reaper;
+  private scheduler: Scheduler;
   private deadLetters: DeadLetterStore;
   private readonly metrics: BrokerMetrics;
   private reaperTimer: NodeJS.Timeout | null = null;
+  private schedulerTimer: NodeJS.Timeout | null = null;
+  private readonly schedulerIntervalMs: number;
   private readonly reaperIntervalMs: number;
   private ledgerVerifyTimer: NodeJS.Timeout | null = null;
   /** Beta.5 blocker #7: ledger-verify interval (ms). 0 disables the timer (tests drive it).
@@ -100,6 +107,11 @@ export class BrokerDaemon {
     // Real process: jitter the retry backoff with Math.random (full jitter).
     // Deterministic tests construct Reaper directly with a fixed rng.
     this.reaper = new Reaper(db, clock, ids, { rng: () => Math.random() });
+    // Beta.7 (ADR 0025): the opt-in scheduler — mirrors the reaper (pure tick, unref'd timer,
+    // 0-disables, FakeClock-drivable). It ENQUEUES due schedules via store.operatorSend
+    // (exactly-once via schedule_runs UNIQUE + ux_idem); it never pushes to a session.
+    this.scheduler = new Scheduler(db, clock, ids, this.store);
+    this.schedulerIntervalMs = opts.schedulerIntervalMs ?? 15_000;
     // Dead-letter inspection store, surfaced via the admin-gated
     // `dead_letter` frame (read-only list/inspect — safe metadata only).
     this.deadLetters = new DeadLetterStore(db, clock, ids);
@@ -148,6 +160,14 @@ export class BrokerDaemon {
       }, this.reaperIntervalMs);
       if (typeof this.reaperTimer.unref === 'function') this.reaperTimer.unref();
     }
+    // Beta.7 (ADR 0025): scheduler tick — fire due schedules (enqueue exactly-once). unref'd
+    // so it never holds the process open; try/catch so a tick error never kills the loop.
+    if (this.schedulerIntervalMs > 0) {
+      this.schedulerTimer = setInterval(() => {
+        try { this.scheduler.tick(); } catch (e) { this.log(`scheduler tick failed: ${(e as Error).message}`); }
+      }, this.schedulerIntervalMs);
+      if (typeof this.schedulerTimer.unref === 'function') this.schedulerTimer.unref();
+    }
     // Beta.5 blocker #7: audit-ledger verification on STARTUP + on a periodic interval, so
     // an out-of-band tamper / bit-rot is caught within at most one interval (ADR 0020 Q4),
     // not "next restart". A broken chain is LOGGED + recorded (LEDGER_CHAIN_BROKEN) but does
@@ -192,8 +212,15 @@ export class BrokerDaemon {
     return r;
   }
 
+  /** Explicit scheduler tick — used by tests (FakeClock) + `xbus doctor`. Deterministic +
+   *  idempotent given a fixed clock (mirrors runReaperSweep). */
+  runSchedulerTick(): SchedulerTickResult {
+    return this.scheduler.tick();
+  }
+
   async stop(): Promise<void> {
     if (this.reaperTimer) { clearInterval(this.reaperTimer); this.reaperTimer = null; }
+    if (this.schedulerTimer) { clearInterval(this.schedulerTimer); this.schedulerTimer = null; }
     if (this.ledgerVerifyTimer) { clearInterval(this.ledgerVerifyTimer); this.ledgerVerifyTimer = null; }
     await this.ipc?.close();
   }
@@ -749,6 +776,66 @@ export class BrokerDaemon {
     }
     try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
     return result;
+  }
+
+  /**
+   * Beta.7 (ADR 0025): operator schedule callback. `action`: 'create' | 'pause' | 'resume' |
+   * 'cancel'. Create validates the untrusted body + computes the first next_run (now for an
+   * immediately-due 'once'/'interval', or a caller-supplied ISO for a future 'once'). The
+   * schedule is created AS the operator (created_by_actor='local-operator'); its fires enqueue
+   * via operatorSend under the same exactly-once guarantees.
+   */
+  operatorSchedule(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const action = this.optString(p.action, 'action');
+    if (action === 'pause' || action === 'resume' || action === 'cancel') {
+      const scheduleId = this.optString(p.scheduleId, 'scheduleId');
+      if (!scheduleId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'scheduleId required');
+      const state = action === 'pause' ? 'paused' : action === 'resume' ? 'active' : 'cancelled';
+      const r = this.store.setScheduleState(scheduleId, state);
+      try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+      return r;
+    }
+    if (action !== 'create') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `unknown schedule action: ${String(action)}`);
+    const to = this.optString(p.to, 'to');
+    const text = this.optString(p.text, 'text');
+    const kind = this.optString(p.kind, 'kind');
+    if (!to) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'to required');
+    if (!text) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'text required');
+    if (kind !== 'once' && kind !== 'interval' && kind !== 'cron') throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, "kind must be once|interval|cron");
+    // Bound the untrusted body with the SAME size/reserved-key defenses as a send.
+    validateSendInput({ to, text });
+    const scheduleExpr = this.optString(p.scheduleExpr, 'scheduleExpr');
+    const nowMs = this.clock.nowMs();
+    // First run: an explicit future ISO 'firstRunAt', else now (immediately due).
+    const firstRunAt = this.optString(p.firstRunAt, 'firstRunAt');
+    let nextRunAtIso: string;
+    if (firstRunAt) {
+      const t = Date.parse(firstRunAt);
+      if (!Number.isFinite(t)) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'firstRunAt must be an ISO instant');
+      nextRunAtIso = new Date(t).toISOString();
+    } else {
+      nextRunAtIso = new Date(nowMs).toISOString();
+    }
+    const numOpt = (v: unknown, field: string): number | undefined => {
+      if (v === undefined) return undefined;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `${field} must be a non-negative number`);
+      return v;
+    };
+    const r = this.store.createSchedule({
+      createdByActor: 'local-operator', targetAddress: to, payloadText: text, kind,
+      ...(this.optString(p.title, 'title') !== undefined ? { title: this.optString(p.title, 'title')! } : {}),
+      ...(scheduleExpr !== undefined ? { scheduleExpr } : {}),
+      ...(p.requiresAck !== undefined ? { requiresAck: p.requiresAck === true } : {}),
+      ...(p.requiresReply !== undefined ? { requiresReply: p.requiresReply === true } : {}),
+      ...(this.optString(p.quietHoursJson, 'quietHoursJson') !== undefined ? { quietHoursJson: this.optString(p.quietHoursJson, 'quietHoursJson')! } : {}),
+      ...(numOpt(p.minIntervalMs, 'minIntervalMs') !== undefined ? { minIntervalMs: numOpt(p.minIntervalMs, 'minIntervalMs')! } : {}),
+      ...(numOpt(p.wakeLimitPerDay, 'wakeLimitPerDay') !== undefined ? { wakeLimitPerDay: numOpt(p.wakeLimitPerDay, 'wakeLimitPerDay')! } : {}),
+      ...(numOpt(p.maxFires, 'maxFires') !== undefined ? { maxFires: numOpt(p.maxFires, 'maxFires')! } : {}),
+      nextRunAtIso,
+    });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return r;
   }
 
   /** Beta.5 (blocker #3): set by the host when a dashboard is running — mints a one-time

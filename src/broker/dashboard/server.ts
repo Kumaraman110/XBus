@@ -83,6 +83,8 @@ export interface DashboardServerOptions {
   /** Beta.7 (ADR 0024): operator session-control callback (rename alias / pause-DND / pin /
    *  archive / remove-record / stop-managed). Payload carries {action, sessionId, ...}. */
   onOperatorControl?: (payload: unknown) => unknown;
+  /** Beta.7 (ADR 0025): operator schedule callback (create / pause / resume / cancel). */
+  onOperatorSchedule?: (payload: unknown) => unknown;
   /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
   maxWriteBodyBytes?: number;
 }
@@ -111,6 +113,7 @@ export class DashboardServer {
   private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
   private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
   private readonly onOperatorControl: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorSchedule: ((payload: unknown) => unknown) | undefined;
   private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
 
@@ -128,6 +131,7 @@ export class DashboardServer {
     this.onOperatorSend = opts.onOperatorSend;
     this.onMarkThreadRead = opts.onMarkThreadRead;
     this.onOperatorControl = opts.onOperatorControl;
+    this.onOperatorSchedule = opts.onOperatorSchedule;
     this.maxWriteBodyBytes = opts.maxWriteBodyBytes ?? 96 * 1024;
   }
 
@@ -290,7 +294,9 @@ export class DashboardServer {
     const sendFollow = /^\/api\/thread\/([^/]+)\/send$/.exec(p);
     const markRead = /^\/api\/thread\/([^/]+)\/read$/.exec(p);
     const control = /^\/api\/session\/([^/]+)\/control$/.exec(p); // beta.7 operator controls
-    if (!sendNew && !sendFollow && !markRead && !control) return this.json(res, 404, { error: 'not_found' });
+    const scheduleNew = p === '/api/schedule';                    // beta.7 create schedule
+    const scheduleState = /^\/api\/schedule\/([^/]+)\/state$/.exec(p); // pause/resume/cancel
+    if (!sendNew && !sendFollow && !markRead && !control && !scheduleNew && !scheduleState) return this.json(res, 404, { error: 'not_found' });
 
     const body = await this.readJsonBody(req, res, this.maxWriteBodyBytes);
     if (body === null) return; // already responded (413/400)
@@ -309,6 +315,15 @@ export class DashboardServer {
         if (!this.onOperatorControl) return this.json(res, 503, { error: 'write_unavailable' });
         // The target sessionId comes from the PATH (not a spoofable body field); action + params from the body.
         const result = await this.onOperatorControl({ ...body, sessionId: decodeURIComponent(control[1]!) });
+        return this.json(res, 200, result);
+      }
+      if (scheduleNew || scheduleState) {
+        if (!this.onOperatorSchedule) return this.json(res, 503, { error: 'write_unavailable' });
+        // Create: action defaults to 'create'. State-change: scheduleId + action from the PATH/body.
+        const payload = scheduleState
+          ? { ...body, scheduleId: decodeURIComponent(scheduleState[1]!) }
+          : { action: 'create', ...body };
+        const result = await this.onOperatorSchedule(payload);
         return this.json(res, 200, result);
       }
       // markRead

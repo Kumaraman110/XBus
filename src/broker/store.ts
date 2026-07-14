@@ -1246,6 +1246,64 @@ export class BrokerStore {
     });
   }
 
+  // ─────────────────────── beta.7 schedules (ADR 0025) ───────────────────────
+
+  /**
+   * Create a schedule (opt-in managed execution). Validates the loop-floor (min_interval_ms)
+   * and computes the first next_run. Appends a SCHEDULE_CREATED ledger event. The scheduler
+   * tick fires it exactly-once. `nextRunAtIso` is the first fire instant (caller-computed for
+   * 'once', or now for an immediately-due interval). Returns the schedule id.
+   */
+  createSchedule(input: {
+    createdByActor: string; title?: string; targetAddress: string; payloadText: string; payloadKind?: string;
+    requiresAck?: boolean; requiresReply?: boolean; kind: 'once' | 'interval' | 'cron'; scheduleExpr?: string;
+    timezone?: string; quietHoursJson?: string; deliveryMode?: 'enqueue_only' | 'wake_if_running' | 'managed_spawn';
+    managedBudgetJson?: string; concurrencyKey?: string; minIntervalMs?: number; wakeLimitPerDay?: number;
+    maxFires?: number; originGuard?: boolean; nextRunAtIso: string;
+  }): { scheduleId: string; nextRun: string } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const scheduleId = this.ids.next();
+      const minInterval = input.minIntervalMs ?? 60000;
+      if (minInterval < 1000) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'min_interval_ms floor is 1000 (loop guard)');
+      if (input.kind === 'interval') {
+        const iv = Number(input.scheduleExpr ?? '');
+        if (!Number.isFinite(iv) || iv < minInterval) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `interval schedule_expr must be >= min_interval_ms (${minInterval})`);
+      }
+      this.db.prepare(
+        `INSERT INTO schedules (schedule_id, created_by_actor, title, target_address, payload_kind, payload_text,
+           requires_ack, requires_reply, kind, schedule_expr, timezone, quiet_hours_json, delivery_mode,
+           managed_budget_json, concurrency_key, min_interval_ms, wake_limit_per_day, next_run, max_fires,
+           origin_guard, state, created_at, updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, ?)`,
+      ).run(
+        scheduleId, input.createdByActor, input.title ?? null, input.targetAddress, input.payloadKind ?? 'request', input.payloadText,
+        input.requiresAck === false ? 0 : 1, input.requiresReply === false ? 0 : 1, input.kind, input.scheduleExpr ?? null,
+        input.timezone ?? 'UTC', input.quietHoursJson ?? null, input.deliveryMode ?? 'enqueue_only',
+        input.managedBudgetJson ?? null, input.concurrencyKey ?? null, minInterval, input.wakeLimitPerDay ?? null,
+        input.nextRunAtIso, input.maxFires ?? null, input.originGuard === false ? 0 : 1, now, now,
+      );
+      this.ledger('SCHEDULE_CREATED', input.createdByActor === OPERATOR_SESSION_ID ? OPERATOR_LEDGER_ACTOR : input.createdByActor, {}, { scheduleId, kind: input.kind, target: input.targetAddress, deliveryMode: input.deliveryMode ?? 'enqueue_only' });
+      return { scheduleId, nextRun: input.nextRunAtIso };
+    });
+  }
+
+  /** Pause or resume a schedule (CAS on active/paused). */
+  setScheduleState(scheduleId: string, state: 'paused' | 'active' | 'cancelled'): { scheduleId: string; state: string } {
+    return this.db.transaction(() => {
+      const s = this.db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string } | undefined;
+      if (!s) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such schedule');
+      // Never revive a terminal (exhausted/cancelled) schedule via pause/resume.
+      if (s.state === 'cancelled' || s.state === 'exhausted') {
+        if (state === 'cancelled') return { scheduleId, state: s.state };
+        throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `schedule is ${s.state}`);
+      }
+      this.db.prepare('UPDATE schedules SET state=?, updated_at=? WHERE schedule_id=?').run(state, this.clock.nowIso(), scheduleId);
+      this.ledger(state === 'cancelled' ? 'SCHEDULE_CANCELLED' : state === 'paused' ? 'SCHEDULE_PAUSED' : 'SCHEDULE_RESUMED', OPERATOR_LEDGER_ACTOR, {}, { scheduleId });
+      return { scheduleId, state };
+    });
+  }
+
   /** Clear the managed markers when a managed session is stopped. Returns the pid it had (for
    *  the caller to kill), or null if it was not managed. Refuses a non-managed session. */
   clearManagedSession(sessionId: string): { sessionId: string; pid: number | null } {
