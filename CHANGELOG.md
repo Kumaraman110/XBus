@@ -6,6 +6,19 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.5.1] — fix: doctor false-fails hook detection after first `claude` run
+
+A detection-only patch; **no protocol, schema, wire, or messaging change** — the compatibility
+tuple stays `xbus-p1-stp1-s7` and beta.5 data/installs are unaffected. `xbus doctor` decided the
+`session_start_hook` check from the non-standard `_xbusOwner` handler property, but Claude Code
+**strips unknown keys** when it re-serializes `~/.claude/settings.json` (which it does on the
+first session after install). The hook stayed fully functional, yet doctor reported
+`SessionStart hook NOT registered` — a false failure that drove users to "repair" a working hook.
+`inspectUserScopeHooks` now also recognizes an XBus hook by its installed **entry path** (supplied
+by `doctor` from the install manifest); the `_xbusOwner` tag remains authoritative for uninstall
+*ownership* only, and a host-stripped hook now reports `registered:true, owned:false`. Foreign
+untagged hooks are still never claimed. Regression covered in `tests/unit/user-scope-config.test.ts`.
+
 ## [0.1.0-beta.5] — control plane, Phase 1: session visibility
 
 The control-plane milestone. Every new/resumed/continued/cleared/compacted/forked Claude

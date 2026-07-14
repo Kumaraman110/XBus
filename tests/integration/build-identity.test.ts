@@ -19,6 +19,7 @@ import {
 } from '../../src/shared/build-identity.js';
 import { STP_VERSION } from '../../src/ipc/secure-channel.js';
 import { WIRE_COMPATIBILITY_ID, SCHEMA_VERSION } from '../../src/protocol/handshake.js';
+import { XBUS_VERSION } from '../../src/protocol/version.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const dirs: string[] = [];
@@ -114,7 +115,9 @@ describe('build-identity model', () => {
   it('source run (no provenance) degrades to a LABELLED source identity, never a false exact id', () => {
     const id = resolveIdentity(5, null);
     expect(id.sourceCommit).toBe('source');
-    expect(id.buildId).toBe('xbus-0.1.0-beta.5-source');
+    // Derive from XBUS_VERSION (the single source of truth) so a product version bump
+    // updates this fixture automatically instead of silently drifting the assertion.
+    expect(id.buildId).toBe(`xbus-${XBUS_VERSION}-source`);
     expect(id.compatibilityId).toBe('xbus-p1-stp1-s5');
   });
 

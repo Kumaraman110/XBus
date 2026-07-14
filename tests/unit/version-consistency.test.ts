@@ -21,7 +21,7 @@ const readJson = (p: string) => JSON.parse(fs.readFileSync(path.join(REPO, p), '
 // (beta.N) is a deliberate, reviewed act: change this literal and every surface
 // below must move with it. Compatibility + schema are INDEPENDENT of the product
 // version and must NOT move just because the prerelease label did.
-const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.5';
+const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.5.1';
 // beta.5 Phase 1 (migration v7 — control-plane session visibility + audit ledger)
 // bumps the schema 6 -> 7, so the wire tuple moves to xbus-p1-stp1-s7. Protocol + STP
 // stay 1. Product version is now 0.1.0-beta.5 (the control-plane milestone).

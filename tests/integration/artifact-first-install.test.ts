@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { buildPackage } from '../../src/tools/package-win.js';
 import { validateArtifact, validateChecksumCoverage, REQUIRED_FILES } from '../../src/shared/artifact-contract.js';
+import { XBUS_VERSION } from '../../src/protocol/version.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 let base: string;        // temp root WITH A SPACE in the name (see §5.8)
@@ -220,7 +221,9 @@ describe('artifact-first — install lifecycle (tests 5-11)', () => {
       });
     } catch (e) { out = (e as { stdout?: string }).stdout ?? ''; }
     expect(out).toContain('"name":"xbus"');
-    expect(out).toContain('"version":"0.1.0-beta.5"');
+    // Derive from XBUS_VERSION (single source of truth) so a product version bump updates
+    // this fixture automatically rather than silently drifting the assertion.
+    expect(out).toContain(`"version":"${XBUS_VERSION}"`);
   });
 
   it('12+13: installed UserPromptSubmit and Stop hooks execute from the INSTALLED path', () => {
