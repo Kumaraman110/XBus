@@ -157,10 +157,19 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
       const auth = new DashboardAuth(clock);
       const reader = new WorkerReadExecutor(dbPath, { requestTimeoutMs: 5000 });
       const wantPort = typeof opts.dashboard === 'object' && opts.dashboard.port !== undefined ? opts.dashboard.port : 0;
-      dashboard = new DashboardServer({ auth, reader, host: '127.0.0.1', port: wantPort, ...(opts.log ? { log: opts.log } : {}) });
+      dashboard = new DashboardServer({
+        auth, reader, host: '127.0.0.1', port: wantPort, ...(opts.log ? { log: opts.log } : {}),
+        // Beta.6 Phase 2 (ADR 0021): the operator console's WRITE seam. The dashboard route
+        // (already bearer-authenticated) forwards the payload to these daemon methods, which
+        // run the transactional store op on the BROKER LOOP (the single writer) and stamp the
+        // reserved 'local-operator' identity server-side. The dashboard's own DB handle stays
+        // read-only. A throw surfaces to the route as a clean 4xx; the broker is unaffected.
+        onOperatorSend: (payload) => daemon.operatorSend(payload),
+        onMarkThreadRead: (payload) => daemon.operatorMarkThreadRead(payload),
+      });
       await dashboard.start();
       dashboardUrl = dashboard.url;
-      // Push live snapshots to open streams on every session-state mutation (off-loop read).
+      // Push live snapshots to open streams on every session-state / thread mutation (off-loop read).
       daemon.onSessionStateChanged = () => dashboard!.notifyChange();
       // Beta.5 (blocker #3): let the `xbus dashboard` CLI mint a one-time open-URL over IPC.
       // mintOpenUrl() returns `${url}/#n=<nonce>` (nonce in fragment, single-use, short-TTL);
