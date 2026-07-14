@@ -89,6 +89,7 @@ A per-user **broker** (Node + `node:sqlite`/WAL) owns the durable store and rout
 - [Architecture](docs/architecture.md) · [Control plane / dashboard (beta.5)](docs/beta5-control-plane-architecture.md) · [Delivery semantics](docs/delivery-semantics.md) · [Providers](docs/providers.md)
 - [Security](docs/security.md) · [Privacy](docs/privacy.md) · [Troubleshooting](docs/troubleshooting.md)
 - [Benchmarks](docs/benchmarks.md) · [Compatibility](docs/compatibility.md) · [Roadmap](docs/roadmap.md)
+- [Federation & enterprise](docs/federation.md) *(experimental design sketch — not implemented, not tested)*
 - [Contributing](CONTRIBUTING.md) · [Security policy](SECURITY.md) · [Changelog](CHANGELOG.md)
 
 ## Status
