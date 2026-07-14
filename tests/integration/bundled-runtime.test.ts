@@ -16,6 +16,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { buildPackage } from '../../src/tools/package-win.js';
 import { validateChecksumCoverage } from '../../src/shared/artifact-contract.js';
@@ -23,10 +24,23 @@ import { BUNDLED_NODE_VERSION, BUNDLED_NODE_SHA256, bundledNodePath, hasBundledR
 import { registerUserScope, inspectUserScopeHooks } from '../../src/cli/user-scope-config.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-// The vetted node.exe on this host (the pinned validation runtime). If absent, the
-// bundling-specific assertions are skipped (the pure-helper + no-runtime cases still run).
-const VETTED_NODE = 'C:/Users/v173617/xbus-validation/node22/node.exe';
-const haveVetted = fs.existsSync(VETTED_NODE);
+// A vetted node.exe to stand in for the builder-supplied runtime. We do NOT hardcode any
+// host path: prefer an explicit XBUS_BUNDLED_NODE override, else the node binary running this
+// test (process.execPath). The packager verifies the supplied binary's SHA-256 against the
+// pinned BUNDLED_NODE_SHA256, so the copy-dependent assertions run ONLY when the candidate is
+// a Windows .exe whose bytes hash to exactly that pin; otherwise they skip cleanly and the
+// pure-helper + no-runtime cases still run. This keeps the fixture machine-agnostic (no private
+// path) and honest (it never claims to bundle a binary that isn't the pinned one).
+function resolveVettedNode(): string | null {
+  const cand = process.env.XBUS_BUNDLED_NODE ?? process.execPath;
+  if (!cand || !/\.exe$/i.test(cand) || !fs.existsSync(cand)) return null;
+  try {
+    const sha = createHash('sha256').update(fs.readFileSync(cand)).digest('hex');
+    return sha === BUNDLED_NODE_SHA256 ? cand : null;
+  } catch { return null; }
+}
+const VETTED_NODE = resolveVettedNode();
+const haveVetted = VETTED_NODE !== null;
 
 const dirs: string[] = [];
 function tmp(prefix: string): string { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); dirs.push(d); return d; }
@@ -72,7 +86,7 @@ describe('packaging WITHOUT a bundled runtime (dev/source) stays valid + omits i
 describe('packaging WITH a bundled runtime (ADR 0022)', () => {
   it.skipIf(!haveVetted)('copies runtime/node.exe, checksums it, records bundledNodeVersion, stays valid', () => {
     const prev = process.env.XBUS_BUNDLED_NODE;
-    process.env.XBUS_BUNDLED_NODE = VETTED_NODE;
+    process.env.XBUS_BUNDLED_NODE = VETTED_NODE!; // non-null: skipIf(!haveVetted) gates this test
     try {
       const staging = tmp('xbus-pkg-rt-');
       const r = buildPackage(staging);

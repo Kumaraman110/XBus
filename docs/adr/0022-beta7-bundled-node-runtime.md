@@ -74,9 +74,10 @@ within `[22.13, 25)`.
   guarantee is enforced on the **real install path** — user-scope registration writes the
   bundled runtime `command` — which is exactly what the acceptance test exercises. A future ADR
   may pin the templates once POSIX bundling exists.
-- Reproducibility: the fixed binary + STORE zip keep the release archive byte-identical across
-  builds (verified: two builds → identical SHA `24cf3c8c…`; the ~2.4MB artifact grows to ~89MB,
-  which is the runtime, by design).
+- Reproducibility: the fixed binary + STORE (no-compression, fixed metadata) zip keep the release
+  archive byte-identical across builds — two packaging runs over the same tree + the same pinned
+  `node.exe` produce the same whole-archive SHA-256. The artifact grows from the runtime-free
+  low-single-digit MB to tens of MB, all of which is the runtime, by design.
 - Supply chain / AV: an unsigned bundled `node.exe` extracted from a zip may be flagged by
   SmartScreen/AV on some hosts; the pinned upstream SHA + the whole-tree SHA256SUMS fix the
   bytes end-to-end. Code-signing is a future hardening, not a beta.7 blocker.

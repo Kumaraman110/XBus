@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { install } from '../../src/cli/install.js';
 import { openDatabase, type SqliteDriver } from '../../src/database/connection.js';
 import { MIGRATIONS } from '../../src/database/migrations.js';
+import { SCHEMA_VERSION } from '../../src/protocol/handshake.js';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 let root: string; let dataDir: string; let dbPath: string; let prevLegacy: string | undefined;
@@ -116,9 +117,12 @@ describe('install DB rollback — fault injection after every post-migration bou
     expect(hasArchive, 'retained snapshot contains the main-DB archive').toBe(true);
   }, 60_000);
 
-  it('beta.6 s7→s8: a CLEAN upgrade migrates in place, preserving messages + backfilling threads', async () => {
+  it('beta.6 s7→head: a CLEAN upgrade migrates in place, preserving messages + backfilling threads (v8)', async () => {
     // Seed a pre-existing s7 (beta.5.1) DB with a real message so we can prove the v8 backfill
-    // runs on live user data during the health-check migration and preserves it.
+    // runs on live user data during the health-check migration and preserves it. The install
+    // forward-migrates to the CURRENT head schema (beta.7 = s9; v9 is additive over v8), so we
+    // assert SCHEMA_VERSION, not a frozen literal — the v8 backfill effects below are unchanged
+    // by later additive migrations.
     const s7root = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-s7up-'));
     const s7data = path.join(s7root, 'data'); const s7db = path.join(s7data, 'xbus.sqlite');
     fs.mkdirSync(s7data, { recursive: true });
@@ -132,7 +136,7 @@ describe('install DB rollback — fault injection after every post-migration bou
     try {
       const r = await install({ source: REPO, installRoot: s7root, dataDir: s7data, registerUserScope: true, claudeConfigPath: path.join(s7root, '.claude.json'), claudeSettingsPath: path.join(s7root, '.claude', 'settings.json'), stopRunningBroker: false });
       expect(r.ok, r.error).toBe(true);
-      expect(schemaVersion(s7db)).toBe(8); // migrated in place
+      expect(schemaVersion(s7db)).toBe(SCHEMA_VERSION); // migrated in place to head (>= 8; beta.7 = 9)
       const ro = openDatabase(s7db, { readOnly: true });
       try {
         // The legacy message survived and was backfilled into a coherent degenerate thread.
