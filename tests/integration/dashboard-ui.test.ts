@@ -68,6 +68,32 @@ describe('dashboard UI — inert client assets', () => {
     expect(js).not.toContain('EventSource'); // uses fetch-streaming (header auth)
   });
 
+  it('beta.6: the console markup is present + inert (no inline JS, no baked session data)', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    // The communication console shell is served (selector, thread list, timeline, composer).
+    expect(html).toContain('communication console');
+    expect(html).toContain('session-select');
+    expect(html).toContain('thread-list');
+    expect(html).toContain('timeline');
+    expect(html).toContain('composer');
+    // Still no inline handlers anywhere in the enlarged markup.
+    expect(/\son\w+\s*=/.test(html), 'inline on* handler present').toBe(false);
+    // The inert HTML bakes in NO thread/session ids or operator secrets.
+    expect(html).not.toMatch(/local-operator['"]/); // no hardcoded operator identity value
+  });
+
+  it('beta.6: app.js drives the console write API + stamps NO client-side sender/actor', async () => {
+    const js = await (await fetch(`${base}/app.js`)).text();
+    // Uses the authenticated write routes …
+    expect(js).toContain('/api/thread');
+    expect(js).toContain('/api/threads');
+    expect(js).toContain('idempotencyKey'); // safe retry / no-duplicate submit
+    // … and NEVER sets a sender/actor/author (identity is broker-stamped, ADR 0021).
+    expect(js).not.toMatch(/author_type|sender_session_id|["']actor["']\s*:/);
+    // Still fetch-streaming (header auth), never EventSource.
+    expect(js).not.toContain('EventSource');
+  });
+
   it('static assets still carry the strict CSP + hardening headers', async () => {
     const res = await fetch(`${base}/style.css`);
     expect(res.status).toBe(200);
