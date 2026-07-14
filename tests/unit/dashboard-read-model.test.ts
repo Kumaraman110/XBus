@@ -12,7 +12,19 @@ import { openDatabase, type SqliteDriver } from '../../src/database/connection.j
 import { runMigrations } from '../../src/database/migrations.js';
 import { BrokerStore } from '../../src/broker/store.js';
 import { FakeClock, SeqIdGen } from '../../src/shared/clock.js';
-import { DashboardReadModel, deriveSessionLabel } from '../../src/broker/dashboard/read-model.js';
+import { DashboardReadModel, deriveSessionLabel, isInternalSession } from '../../src/broker/dashboard/read-model.js';
+
+describe('beta.7 isInternalSession — hide XBus internals from the console by default', () => {
+  it('classifies operator + cli/installer shells as internal; real sessions as not', () => {
+    expect(isInternalSession('local-operator', '__xbus_operator__')).toBe(true);
+    expect(isInternalSession('cli-1234-5678', 'proj-cli')).toBe(true);
+    expect(isInternalSession('installer-9999', 'proj-install')).toBe(true);
+    expect(isInternalSession('anything', 'proj-operator')).toBe(true);
+    // A real Claude session: a UUID id + a real project slug → NOT internal.
+    expect(isInternalSession('aaaa1111-0000-4000-8000-000000000001', 'seatmap')).toBe(false);
+    expect(isInternalSession('bbbb2222-0000-4000-8000-000000000002', 'proj-x')).toBe(false);
+  });
+});
 
 describe('deriveSessionLabel — ADR 0020 Q2 decision table (top-down, first match wins)', () => {
   const base = { managementState: 'active', connectionState: 'connected', readiness: 'ready_live', expiredAt: null as string | null };

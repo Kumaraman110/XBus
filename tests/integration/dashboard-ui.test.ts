@@ -41,6 +41,31 @@ describe('dashboard UI — inert client assets', () => {
     expect(html).toContain('/style.css'); // external stylesheet (style-src 'self')
   });
 
+  it('beta.7: delivery renders as FIVE separate columns, never the combined q/d/ack/reply/fail string', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    // The five separate column headers are present, in order.
+    for (const h of ['Queued', 'Delivered', 'ACK', 'Replied', 'Failed']) {
+      expect(html, `missing delivery column header ${h}`).toContain(`>${h}<`);
+    }
+    // The old combined header/string must be GONE from both the markup and the client.
+    expect(html).not.toContain('q/d/ack/reply/fail');
+    expect(html).not.toContain('Delivery (');
+    const js = await (await fetch(`${base}/app.js`)).text();
+    expect(js).not.toMatch(/\$\{d\.queued\}\/\$\{d\.delivered\}/); // no combined template literal
+  });
+
+  it('beta.7: an "Internal sessions" filter + friendly statuses are present (inert markup + client)', async () => {
+    const html = await (await fetch(`${base}/`)).text();
+    expect(html).toContain('Internal sessions');
+    expect(html).toContain('show-internal');
+    const js = await (await fetch(`${base}/app.js`)).text();
+    // Friendly, human status wording (not raw labels) — the specific queued-case copy.
+    expect(js).toContain('Waiting for recipient checkpoint');
+    // The internal filter is client-enforced (hide by default) + reads the read-model flag.
+    expect(js).toContain('isInternal');
+    expect(js).toMatch(/show-internal/);
+  });
+
   it('index.html has NO inline <script> or on* handlers (strict CSP compliance)', async () => {
     const html = await (await fetch(`${base}/`)).text();
     // No inline script bodies: every <script> must be a src= include with no inline content.

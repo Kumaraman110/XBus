@@ -64,24 +64,89 @@ function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.c
 function cell(row, value) { const td = document.createElement('td'); td.appendChild(text(value)); row.appendChild(td); return td; }
 function hhmmss(iso) { return iso ? String(iso).slice(11, 19) : ''; }
 
-/* ── sessions / ledger / audit (unchanged behavior) ── */
-function msgCell(m, who) { if (!m) return '—'; return `${m[who]} · ${m.state} · ${m.at.slice(11, 19)}`; }
+/* ── sessions table (beta.7: separate delivery columns, friendly status, internal filter) ── */
+
+/** Human-friendly status per SessionLabel (drill-down keeps the raw label + conn/readiness). */
+const FRIENDLY_STATUS = {
+  'active-ready': 'Ready',
+  'active-starting': 'Waiting for recipient checkpoint',
+  'active-disconnected': 'Disconnected — queuing',
+  'dormant': 'Dormant',
+  'unmanaged': 'Unmanaged',
+  'expired': 'Expired',
+};
+function friendlyStatus(label) { return FRIENDLY_STATUS[label] || label; }
+
+/** A colored delivery-count cell (a "state pill"): the number carries the value, the
+ *  column header + pill class carry the state (never color-alone). Zero renders muted. */
+function deliveryCell(row, n, state) {
+  const td = document.createElement('td');
+  td.className = 'num';
+  const pill = el('span', 'pill pill-' + state + (n ? '' : ' pill-zero'), String(n));
+  td.appendChild(pill);
+  row.appendChild(td);
+}
+
+/** A drill-down details cell: a keyboard-operable disclosure showing the technical detail
+ *  (session id, connection/readiness, last sent/received) that the friendly row hides. */
+function detailsCell(row, s) {
+  const td = document.createElement('td');
+  const btn = el('button', 'link-btn', 'Details');
+  btn.type = 'button';
+  btn.setAttribute('aria-expanded', 'false');
+  btn.addEventListener('click', () => {
+    const open = btn.getAttribute('aria-expanded') === 'true';
+    btn.setAttribute('aria-expanded', String(!open));
+    if (open) { if (td.__drawer) { td.__drawer.remove(); td.__drawer = null; } return; }
+    const drawer = el('div', 'drill');
+    const line = (k, v) => { const d = el('div', 'drill-line'); d.appendChild(el('span', 'drill-k', k)); d.appendChild(text(v)); drawer.appendChild(d); };
+    line('id ', s.sessionId);
+    line('conn/ready ', s.connection + ' / ' + s.readiness);
+    line('mgmt ', s.managementState + (s.identifyConfidence ? ' · ' + s.identifyConfidence : ''));
+    if (s.lastSent) line('last sent ', s.lastSent.to + ' · ' + s.lastSent.state + ' · ' + hhmmss(s.lastSent.at));
+    if (s.lastReceived) line('last recv ', s.lastReceived.from + ' · ' + s.lastReceived.state + ' · ' + hhmmss(s.lastReceived.at));
+    td.appendChild(drawer); td.__drawer = drawer;
+  });
+  td.appendChild(btn); row.appendChild(td);
+}
+
+function isInternal(s) {
+  // Prefer the authoritative read-model flag; fall back to the id/slug heuristic for
+  // older brokers that don't yet emit `internal`.
+  if (typeof s.internal === 'boolean') return s.internal;
+  return s.sessionId.startsWith('cli-') || s.sessionId === 'local-operator' || String(s.project).startsWith('proj-cli');
+}
+
 function renderSessions(sessions) {
-  window.__sessions = sessions; // cache for the console selector
+  window.__sessions = sessions; // cache for re-render on filter toggle + the console selector
   const body = document.getElementById('sessions-body');
   body.replaceChildren();
-  if (!sessions.length) { const r = body.insertRow(); const c = cell(r, 'No sessions yet.'); c.colSpan = 7; }
-  else for (const s of sessions) {
+  const showInternal = document.getElementById('show-internal') && document.getElementById('show-internal').checked;
+  const shown = (sessions || []).filter((s) => showInternal || !isInternal(s));
+  const hiddenCount = (sessions || []).length - shown.length;
+  if (!shown.length) {
+    const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
+    c.colSpan = 9; c.className = 'state-cell';
+  } else for (const s of shown) {
     const r = document.createElement('tr');
+    if (isInternal(s)) r.className = 'row-internal';
     const label = document.createElement('td');
     const badge = el('span', 'badge badge-' + s.label); badge.appendChild(text(s.name || s.sessionId.slice(0, 8)));
     label.appendChild(badge); r.appendChild(label);
-    cell(r, s.label); cell(r, `${s.connection}/${s.readiness}`);
-    cell(r, msgCell(s.lastSent, 'to')); cell(r, msgCell(s.lastReceived, 'from'));
+    const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
     const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
-    cell(r, `${d.queued}/${d.delivered}/${d.acknowledged}/${d.replied}/${d.failed}`);
-    cell(r, s.project); body.appendChild(r);
+    deliveryCell(r, d.queued, 'queued');
+    deliveryCell(r, d.delivered, 'delivered');
+    deliveryCell(r, d.acknowledged, 'ack');
+    deliveryCell(r, d.replied, 'replied');
+    deliveryCell(r, d.failed, 'failed');
+    cell(r, s.project);
+    detailsCell(r, s);
+    body.appendChild(r);
   }
+  // A muted footer note when internal sessions are hidden, so the filter is discoverable.
+  const note = document.getElementById('sessions-hidden-note');
+  if (note) { note.textContent = hiddenCount > 0 && !showInternal ? hiddenCount + ' internal session(s) hidden' : ''; }
   renderSessionSelect(sessions);
 }
 function renderAudit(a) {
@@ -146,7 +211,13 @@ function renderThreadList(threads) {
     main.appendChild(el('span', 'thread-item-sub', t.subject || ('turn ' + t.lastThreadSequence + ' · ' + t.lastTurnState)));
     li.appendChild(main);
     if (t.unreadCount > 0) li.appendChild(el('span', 'unread', String(t.unreadCount)));
+    // Keyboard-operable: a thread row behaves as a button (Enter/Space select it) + is
+    // focusable + announces selection state for assistive tech.
+    li.setAttribute('role', 'button');
+    li.setAttribute('tabindex', '0');
+    li.setAttribute('aria-pressed', String(t.threadId === consoleState.selectedThreadId));
     li.addEventListener('click', () => selectThread(t.threadId));
+    li.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void selectThread(t.threadId); } });
     list.appendChild(li);
   }
 }
@@ -299,6 +370,17 @@ async function loadThreadQuiet(threadId) {
   catch (e) { if (String(e.message) !== 'unauthorized') { /* keep prior */ } }
 }
 
+function showError(msg) {
+  let b = document.getElementById('error-banner');
+  if (!msg) { if (b) b.hidden = true; return; }
+  if (!b) {
+    b = el('section', 'error-banner'); b.id = 'error-banner'; b.setAttribute('role', 'alert');
+    const main = document.querySelector('main');
+    if (main && main.parentNode) main.parentNode.insertBefore(b, main);
+  }
+  b.hidden = false; b.textContent = msg;
+}
+
 async function refresh() {
   const [{ sessions }, ledger, banner, audit, threads] = await Promise.all([
     api('/api/sessions'),
@@ -312,6 +394,7 @@ async function refresh() {
   if (banner) renderBanner(banner);
   renderAudit(audit);
   renderThreadList(threads.threads || []);
+  showError(null); // clear any prior error on a good refresh
   setStatus('Connected · ' + sessions.length + ' session(s)', 'ok');
 }
 
@@ -343,6 +426,17 @@ async function stream() {
 function wireUp() {
   document.getElementById('new-thread-btn').addEventListener('click', () => { void startNewThread(); });
   document.getElementById('composer').addEventListener('submit', (e) => { e.preventDefault(); void sendComposed(); });
+  // Internal-sessions filter: re-render the cached sessions on toggle (also honored by the
+  // live stream via renderSessions reading the checkbox). Persist the preference in
+  // sessionStorage so a reload keeps the operator's choice (CSP-safe; same store as the token).
+  const showInternal = document.getElementById('show-internal');
+  if (showInternal) {
+    try { showInternal.checked = sessionStorage.getItem('xbus.showInternal') === '1'; } catch { /* ignore */ }
+    showInternal.addEventListener('change', () => {
+      try { sessionStorage.setItem('xbus.showInternal', showInternal.checked ? '1' : '0'); } catch { /* ignore */ }
+      if (window.__sessions) renderSessions(window.__sessions);
+    });
+  }
 }
 
 async function boot() {
@@ -354,9 +448,10 @@ async function boot() {
   try {
     await refresh();
     void stream();
-    setInterval(() => { refresh().catch(() => {}); }, 5000);
+    // Backstop poll: surface a persistent failure as a visible error banner (not silent).
+    setInterval(() => { refresh().catch((e) => { if (String(e && e.message) !== 'unauthorized') showError('Lost contact with the broker: ' + (e && e.message || e) + ' — retrying…'); }); }, 5000);
   } catch (e) {
-    if (String(e.message) !== 'unauthorized') setStatus('Error: ' + e.message, 'err');
+    if (String(e.message) !== 'unauthorized') { setStatus('Error: ' + e.message, 'err'); showError('Could not load the console: ' + e.message); }
   }
 }
 
