@@ -51,9 +51,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  emit a specific, actionable error rather than the generic charset message. */
 const PATH_LIKE_RE = /[:/\\]|^[A-Za-z]:/;
 
-/** Administrative identities that must never be user-claimable. */
+/** Administrative identities that must never be user-claimable. `local-operator` is the
+ *  beta.6 reserved dashboard-operator principal (ADR 0021) — a real session must never be
+ *  able to claim/shadow it. `operator` is reserved alongside it for the same reason. */
 export const RESERVED_SESSION_NAMES: ReadonlySet<string> = new Set([
   'xbus', 'broker', 'admin', 'system', 'root', 'all', 'broadcast', 'self', 'none',
+  'operator', 'local-operator',
 ]);
 
 /** Low-signal placeholder names a user should be challenged to replace. */

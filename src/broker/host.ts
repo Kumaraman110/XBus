@@ -21,6 +21,7 @@ import { DashboardServer } from './dashboard/server.js';
 import { DashboardAuth } from './dashboard/auth.js';
 import { WorkerReadExecutor } from './dashboard/read-worker.js';
 import { BrokerStore } from './store.js';
+import { ensureOperatorSession } from './operator.js';
 import { scanTranscripts } from './session-import.js';
 
 export interface BrokerHostOptions extends DaemonOptions {
@@ -75,6 +76,10 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
     try { if (fsExists(f)) hardenFile(f); } catch { /* best effort */ }
   }
   runMigrations(db, clock.nowIso());
+  // Beta.6 Phase 2 (ADR 0021): provision the reserved `local-operator` principal AFTER
+  // migrations (its columns exist) and BEFORE the daemon binds (a reply may route to it as
+  // soon as delivery starts). Idempotent; never expires; never registers a component.
+  ensureOperatorSession(db, clock);
   // Beta.5 Phase 1 (ADR 0013 D5): best-effort dormant import from the transcript LISTING
   // (metadata only). A scan/import failure must NEVER fail broker start (I5), so it is
   // wrapped + swallowed with a log note. Runs once at start, before the daemon binds.

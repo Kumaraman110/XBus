@@ -449,6 +449,121 @@ export const MIGRATIONS: readonly Migration[] = [
         BEGIN SELECT RAISE(ABORT, 'ledger_anchors is append-only'); END;
     `,
   },
+  {
+    version: 8,
+    name: 'threaded_messaging_and_operator',
+    sql: `
+      -- ADR 0017 (data model) + ADR 0021 (operator identity + console): beta.6 Phase 2
+      -- real multi-turn threaded messaging + a local-operator communication console.
+      -- ALL ADDITIVE (CREATE TABLE / ALTER ADD COLUMN nullable-or-default / CREATE INDEX /
+      -- backfill of existing rows) so a live beta.5 schema-7 DB migrates IN PLACE and
+      -- preserves every row. Moves SCHEMA_VERSION 7 -> 8, so the wire tuple becomes
+      -- xbus-p1-stp1-s8 (protocol + STP frozen at 1). Fail-closed: an s7 (beta.5.1)
+      -- component meeting a v8 broker is rejected 'upgrade_component' at the handshake
+      -- (checkCompatibility); beta.6 is a controlled whole-install upgrade (ADR 0019),
+      -- NOT mixed-version operation. SQLite cannot ALTER-add an FK or a NOT-NULL-without-
+      -- default column to a populated table, so thread_id/thread_sequence are nullable and
+      -- author_type carries a DEFAULT; FKs are declared only on the brand-new tables.
+
+      -- A THREAD is a first-class ordered conversation (ADR 0017 D1). thread_id equals the
+      -- root turn's message_id (== its correlation_id), so beta.5 correlation tooling still
+      -- groups a thread's turns. state: 'open' (accepts turns) | 'closed' (archived).
+      CREATE TABLE threads (
+        thread_id            TEXT PRIMARY KEY,        -- == root message_id == correlation_id
+        root_message_id      TEXT NOT NULL,           -- the opening turn
+        subject              TEXT,                    -- optional operator-set subject (untrusted text)
+        created_by_actor     TEXT NOT NULL,           -- 'local-operator' | a session id
+        state                TEXT NOT NULL DEFAULT 'open',
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL,
+        last_message_at      TEXT NOT NULL,
+        last_thread_sequence INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX idx_threads_updated ON threads(updated_at);
+
+      -- Extensible N-party participant join-table (ADR 0017 locked decision) — two-party
+      -- behavior now, N-party is a data-only extension later with no schema rewrite. Per
+      -- (thread, participant): read cursor + membership. session_id is 'local-operator' for
+      -- the operator participant, else a real session_id. actor_kind mirrors messages.author_type.
+      CREATE TABLE thread_participants (
+        participant_id       TEXT PRIMARY KEY,
+        thread_id            TEXT NOT NULL,
+        session_id           TEXT NOT NULL,           -- 'local-operator' | real session id
+        actor_kind           TEXT NOT NULL,           -- 'operator' | 'claude'
+        participant_role     TEXT NOT NULL DEFAULT 'member',
+        joined_at            TEXT NOT NULL,
+        left_at              TEXT,
+        last_read_thread_seq INTEGER NOT NULL DEFAULT 0,
+        muted                INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(thread_id, session_id),
+        FOREIGN KEY(thread_id) REFERENCES threads(thread_id)
+      );
+      CREATE INDEX idx_participants_session ON thread_participants(session_id);
+
+      -- Per-thread monotonic sequence allocator (ADR 0017 D4 / ADR 0021 D5). recipient_sequence
+      -- is per-RECIPIENT, so a thread that spans op->session AND session->op draws from two
+      -- recipient streams and gives no single monotonic order — this does. Allocated inside the
+      -- send/reply transaction with INSERT OR REPLACE, mirroring recipient_sequences.
+      CREATE TABLE thread_sequences (
+        thread_id    TEXT PRIMARY KEY,
+        next_sequence INTEGER NOT NULL,
+        FOREIGN KEY(thread_id) REFERENCES threads(thread_id)
+      );
+
+      -- Thread linkage + attribution on messages. thread_id/thread_sequence are nullable
+      -- (ALTER on a populated table); author_type defaults 'claude' for every legacy row.
+      ALTER TABLE messages ADD COLUMN thread_id TEXT;
+      ALTER TABLE messages ADD COLUMN thread_sequence INTEGER;
+      ALTER TABLE messages ADD COLUMN author_type TEXT NOT NULL DEFAULT 'claude';
+      CREATE INDEX idx_messages_thread ON messages(thread_id, thread_sequence);
+
+      -- BACKFILL: make existing conversations coherent degenerate threads (ADR 0017 D2).
+      -- correlation_id is already the thread-root key (a request + its replies share it),
+      -- so every legacy message adopts thread_id = correlation_id.
+      UPDATE messages SET thread_id = correlation_id WHERE thread_id IS NULL;
+
+      -- Seed one threads row per distinct correlation group. The root turn is the earliest
+      -- message in the group (by created_at, then message_id to break ties deterministically);
+      -- created_by_actor is that root's sender (legacy roots are all Claude sessions — the
+      -- operator did not exist pre-v8). last_message_at is the group's latest created_at.
+      INSERT INTO threads (thread_id, root_message_id, subject, created_by_actor, state, created_at, updated_at, last_message_at, last_thread_sequence)
+        SELECT g.thread_id,
+               (SELECT m2.message_id FROM messages m2 WHERE m2.thread_id = g.thread_id ORDER BY m2.created_at ASC, m2.message_id ASC LIMIT 1),
+               NULL,
+               (SELECT m3.sender_session_id FROM messages m3 WHERE m3.thread_id = g.thread_id ORDER BY m3.created_at ASC, m3.message_id ASC LIMIT 1),
+               'open',
+               g.min_created, g.max_created, g.max_created, g.cnt
+          FROM (SELECT thread_id, MIN(created_at) AS min_created, MAX(created_at) AS max_created, COUNT(*) AS cnt
+                  FROM messages WHERE thread_id IS NOT NULL GROUP BY thread_id) g;
+
+      -- Assign a per-thread sequence to legacy messages in (created_at, message_id) order.
+      -- SQLite window functions (ROW_NUMBER) are available on the node:sqlite build (>=22.13).
+      UPDATE messages
+         SET thread_sequence = (
+           SELECT rn FROM (
+             SELECT message_id, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at ASC, message_id ASC) AS rn
+               FROM messages WHERE thread_id IS NOT NULL
+           ) ranked WHERE ranked.message_id = messages.message_id)
+       WHERE thread_id IS NOT NULL;
+
+      -- Seed thread_sequences.next_sequence to one past the highest assigned sequence per thread.
+      INSERT INTO thread_sequences (thread_id, next_sequence)
+        SELECT thread_id, COALESCE(MAX(thread_sequence), 0) + 1
+          FROM messages WHERE thread_id IS NOT NULL GROUP BY thread_id;
+
+      -- Seed participants from the sender/recipient of each legacy thread's messages. Every
+      -- distinct (thread, session) that appears as a sender or recipient becomes a 'claude'
+      -- participant (the operator is provisioned at runtime, ADR 0021, not in this migration).
+      INSERT OR IGNORE INTO thread_participants (participant_id, thread_id, session_id, actor_kind, participant_role, joined_at, last_read_thread_seq, muted)
+        SELECT lower(hex(randomblob(16))), t.thread_id, t.session_id, 'claude', 'member', th.created_at, 0, 0
+          FROM (
+            SELECT DISTINCT thread_id, sender_session_id AS session_id FROM messages WHERE thread_id IS NOT NULL
+            UNION
+            SELECT DISTINCT thread_id, recipient_session_id AS session_id FROM messages WHERE thread_id IS NOT NULL
+          ) t
+          JOIN threads th ON th.thread_id = t.thread_id;
+    `,
+  },
 ];
 
 function checksum(sql: string): string {

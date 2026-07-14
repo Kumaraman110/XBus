@@ -19,12 +19,18 @@ import { PROTOCOL_VERSION, XBUS_VERSION } from '../protocol/version.js';
 import { DeliveryState } from '../protocol/states.js';
 import { validateUserAlias, automaticAlias, parseRecipient, type NormalizedAlias } from '../identity/aliases.js';
 import { validateSessionName, type NormalizedSessionName } from '../identity/session-name.js';
-import type { SendInput } from '../protocol/schemas.js';
 import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, type Readiness, type ReadinessHints } from './readiness.js';
 import { ledgerAppend, type LedgerSubject } from './ledger.js';
 import type { ImportedSessionMeta } from './session-import.js';
+import { OPERATOR_SESSION_ID, OPERATOR_ALIAS, OPERATOR_ACTOR_KIND, OPERATOR_LEDGER_ACTOR } from './operator.js';
+import type { SendInput } from '../protocol/schemas.js';
+
+/** Input the operator console supplies to operatorSend (identity is broker-stamped; the
+ *  browser never sets sender/actor). Extends the validated SendInput with thread routing +
+ *  an optional operator-set subject for a NEW thread. */
+export type OperatorSendInput = SendInput & { threadId?: string; parentMessageId?: string; subject?: string };
 
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
@@ -858,16 +864,27 @@ export class BrokerStore {
       const ttlMs = input.ttlSeconds ? input.ttlSeconds * 1000 : undefined;
       const expiresAt = ttlMs ? new Date(this.clock.nowMs() + ttlMs).toISOString() : null;
 
+      // Beta.6 (ADR 0017/0021): a root send OPENS a degenerate thread whose id == this
+      // message id == its correlation id (matches the existing convention), so every
+      // message — peer or operator — is a thread turn and visible in the console timeline.
+      // thread_sequence 1 is this opening turn. author_type='claude' (peer send).
+      const threadId = correlationId; // == messageId for a root send
+      this.ensureThread(threadId, messageId, auth.sessionId, 'claude', now);
+      const threadSequence = this.allocThreadSequence(threadId);
+      this.ensureParticipant(threadId, auth.sessionId, 'claude', now);
+      this.ensureParticipant(threadId, recipient.sessionId, 'claude', now);
+
       this.db
         .prepare(
-          `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, not_before, expires_at, created_at, trace_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, not_before, expires_at, created_at, trace_id, thread_id, thread_sequence, author_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           messageId, PROTOCOL_VERSION, auth.sessionId, this.aliasForSession(auth.sessionId), recipient.sessionId, recipient.alias,
           input.kind, correlationId, null, null, sequence, input.idempotencyKey ?? null, input.text, hashBody(input.text),
           input.metadata ? JSON.stringify(input.metadata) : null, input.requiresAck ? 1 : 0, input.requiresReply ? 1 : 0,
-          null, expiresAt, now, traceId,
+          null, expiresAt, now, traceId, threadId, threadSequence, 'claude',
         );
+      this.touchThread(threadId, threadSequence, now);
 
       this.db
         .prepare(`INSERT INTO deliveries (delivery_id, message_id, recipient_session_id, state, created_at, updated_at) VALUES (?,?,?, '${DeliveryState.QUEUED}', ?, ?)`)
@@ -881,10 +898,197 @@ export class BrokerStore {
     });
   }
 
+  // ─────────────────────────── beta.6 thread helpers (ADR 0017/0021) ───────────────────────────
+
+  /** Ensure a `threads` row + `thread_sequences` cursor exist for a thread. Idempotent
+   *  (INSERT OR IGNORE); called from send()/reply()/operatorSend inside their transaction. */
+  private ensureThread(threadId: string, rootMessageId: string, createdByActor: string, _actorKind: string, now: string): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO threads (thread_id, root_message_id, subject, created_by_actor, state, created_at, updated_at, last_message_at, last_thread_sequence)
+       VALUES (?,?,?,?, 'open', ?,?,?, 0)`,
+    ).run(threadId, rootMessageId, null, createdByActor, now, now, now);
+    this.db.prepare('INSERT OR IGNORE INTO thread_sequences (thread_id, next_sequence) VALUES (?, 1)').run(threadId);
+  }
+
+  /** Allocate the next per-thread sequence (monotonic, gap-free — single writer). Mirrors
+   *  recipient_sequences. MUST run inside the caller's transaction. */
+  private allocThreadSequence(threadId: string): number {
+    const row = this.db.prepare('SELECT next_sequence FROM thread_sequences WHERE thread_id=?').get(threadId) as { next_sequence: number } | undefined;
+    const seq = row ? row.next_sequence : 1;
+    this.db.prepare('INSERT OR REPLACE INTO thread_sequences (thread_id, next_sequence) VALUES (?, ?)').run(threadId, seq + 1);
+    return seq;
+  }
+
+  /** Ensure a participant row for (thread, session). Idempotent via UNIQUE(thread_id,
+   *  session_id). Never resets an existing participant's read cursor. */
+  private ensureParticipant(threadId: string, sessionId: string, actorKind: string, now: string): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO thread_participants (participant_id, thread_id, session_id, actor_kind, participant_role, joined_at, last_read_thread_seq, muted)
+       VALUES (?,?,?,?, 'member', ?, 0, 0)`,
+    ).run(this.ids.next(), threadId, sessionId, actorKind, now);
+  }
+
+  /** Advance the thread's activity stamps + last sequence. */
+  private touchThread(threadId: string, threadSequence: number, now: string): void {
+    this.db.prepare('UPDATE threads SET updated_at=?, last_message_at=?, last_thread_sequence=MAX(last_thread_sequence, ?) WHERE thread_id=?').run(now, now, threadSequence, threadId);
+  }
+
   private aliasForSession(sessionId: string): string {
     const r = this.db.prepare(`SELECT alias FROM aliases WHERE session_id=? AND scope='global' AND active=1 ORDER BY alias_ci='session-'||substr(?,1,8) LIMIT 1`).get(sessionId, sessionId) as { alias: string } | undefined;
     if (r) return r.alias;
     const s = this.db.prepare('SELECT automatic_alias FROM sessions WHERE session_id=?').get(sessionId) as { automatic_alias: string } | undefined;
     return s?.automatic_alias ?? 'unknown';
+  }
+
+  // ─────────────────────── beta.6 operator console (ADR 0021) ───────────────────────
+
+  /**
+   * Send a message AS the reserved `local-operator` principal (ADR 0021) — the dashboard
+   * communication console's ONLY write. Identity is ALWAYS broker-stamped: the browser
+   * supplies only {to, text, threadId?, parentMessageId?, requiresAck, requiresReply,
+   * idempotencyKey?, ttlSeconds?, subject?}, never a sender/actor field. Reuses the SAME
+   * durable lifecycle as store.send (QUEUED delivery, recipient checkpoint pull injects it
+   * identically to a peer message) plus threading:
+   *   - no threadId  → OPENS a new thread (thread_id = this message id = correlation id);
+   *   - threadId set → CONTINUES it (correlation_id = thread's root, parent = the answered turn).
+   * Appends exactly ONE hash-chained ledger event (actor='local-operator', subject.threadId)
+   * in the same transaction. Idempotent on (operator, idempotencyKey) via ux_idem.
+   * The recipient identity is validated (must be a real, non-expired, routable-by-address
+   * session); the operator can never send to itself. Message text stays untrusted-peer
+   * content to the recipient (validateSendInput reserved-key defense is applied by the caller).
+   */
+  operatorSend(input: OperatorSendInput): SendResult & { threadId: string; threadSequence: number; authorType: string } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      // Idempotency short-circuit (operator-scoped) — a double-click / retry with the same
+      // key returns the recorded result, never a duplicate row (ux_idem on sender+key).
+      if (input.idempotencyKey) {
+        const dup = this.db
+          .prepare('SELECT message_id, correlation_id, recipient_session_id, recipient_alias, recipient_sequence, thread_id, thread_sequence FROM messages WHERE sender_session_id=? AND idempotency_key=?')
+          .get(OPERATOR_SESSION_ID, input.idempotencyKey) as
+          | { message_id: string; correlation_id: string; recipient_session_id: string; recipient_alias: string; recipient_sequence: number; thread_id: string; thread_sequence: number }
+          | undefined;
+        if (dup) {
+          const d = this.db.prepare('SELECT state FROM deliveries WHERE message_id=?').get(dup.message_id) as { state: string } | undefined;
+          return {
+            messageId: dup.message_id, correlationId: dup.correlation_id, recipientSessionId: dup.recipient_session_id,
+            recipientAlias: dup.recipient_alias, sequence: dup.recipient_sequence, state: d?.state ?? DeliveryState.QUEUED,
+            deduplicated: true, threadId: dup.thread_id, threadSequence: dup.thread_sequence, authorType: OPERATOR_ACTOR_KIND,
+          };
+        }
+      }
+
+      const recipient = this.resolveRecipient(input.to);
+      if (recipient.sessionId === OPERATOR_SESSION_ID) {
+        throw new XBusError(XBusErrorCode.UNKNOWN_RECIPIENT, 'the operator cannot message itself');
+      }
+      // Recipient-expiry guard (symmetric with store.send): never queue for a tombstoned session.
+      const exp = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(recipient.sessionId) as { expired_at: string | null } | undefined;
+      if (exp?.expired_at) {
+        throw new XBusError(XBusErrorCode.RECIPIENT_SESSION_EXPIRED, 'recipient session expired (no activity for 15 days); it must re-register', { recipient: recipient.alias });
+      }
+
+      const messageId = this.ids.next();
+      const traceId = this.ids.next();
+
+      // Thread resolution: continue an existing thread, or open a new one rooted at this message.
+      let threadId: string;
+      let correlationId: string;
+      let parentMessageId: string | null;
+      let causationId: string | null;
+      if (input.threadId !== undefined) {
+        const t = this.db.prepare('SELECT thread_id, root_message_id, state FROM threads WHERE thread_id=?').get(input.threadId) as { thread_id: string; root_message_id: string; state: string } | undefined;
+        if (!t) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such thread');
+        if (t.state !== 'open') throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, 'thread is closed');
+        // The operator must be a participant of a thread it continues (it is added on open).
+        threadId = t.thread_id;
+        correlationId = threadId; // thread_id == root correlation_id (ADR 0017 D1)
+        // parent = the explicit turn answered, else the latest turn in the thread.
+        if (input.parentMessageId !== undefined) {
+          const pm = this.db.prepare('SELECT message_id FROM messages WHERE message_id=? AND thread_id=?').get(input.parentMessageId, threadId) as { message_id: string } | undefined;
+          if (!pm) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'parentMessageId is not a turn in this thread');
+          parentMessageId = pm.message_id;
+        } else {
+          const last = this.db.prepare('SELECT message_id FROM messages WHERE thread_id=? ORDER BY thread_sequence DESC LIMIT 1').get(threadId) as { message_id: string } | undefined;
+          parentMessageId = last?.message_id ?? t.root_message_id;
+        }
+        causationId = parentMessageId;
+      } else {
+        threadId = messageId;      // new thread rooted here
+        correlationId = messageId; // root: correlation == messageId (unchanged convention)
+        parentMessageId = null;
+        causationId = null;
+      }
+
+      this.ensureThread(threadId, input.threadId !== undefined ? (this.db.prepare('SELECT root_message_id FROM threads WHERE thread_id=?').get(threadId) as { root_message_id: string }).root_message_id : messageId, OPERATOR_SESSION_ID, OPERATOR_ACTOR_KIND, now);
+      if (input.subject !== undefined && input.threadId === undefined) {
+        this.db.prepare('UPDATE threads SET subject=? WHERE thread_id=? AND subject IS NULL').run(input.subject, threadId);
+      }
+      const threadSequence = this.allocThreadSequence(threadId);
+      this.ensureParticipant(threadId, OPERATOR_SESSION_ID, OPERATOR_ACTOR_KIND, now);
+      this.ensureParticipant(threadId, recipient.sessionId, 'claude', now);
+
+      // Allocate the recipient sequence (per-recipient global ordering) in the same txn.
+      const seqRow = this.db.prepare('SELECT next_sequence FROM recipient_sequences WHERE recipient_session_id=?').get(recipient.sessionId) as { next_sequence: number } | undefined;
+      const sequence = seqRow ? seqRow.next_sequence : 1;
+      this.db.prepare('INSERT OR REPLACE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, ?)').run(recipient.sessionId, sequence + 1);
+
+      const ttlMs = input.ttlSeconds ? input.ttlSeconds * 1000 : undefined;
+      const expiresAt = ttlMs ? new Date(this.clock.nowMs() + ttlMs).toISOString() : null;
+
+      this.db
+        .prepare(
+          `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, not_before, expires_at, created_at, trace_id, thread_id, thread_sequence, author_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          messageId, PROTOCOL_VERSION, OPERATOR_SESSION_ID, OPERATOR_ALIAS, recipient.sessionId, recipient.alias,
+          input.kind, correlationId, causationId, parentMessageId, sequence, input.idempotencyKey ?? null, input.text, hashBody(input.text),
+          input.metadata ? JSON.stringify(input.metadata) : null, input.requiresAck ? 1 : 0, input.requiresReply ? 1 : 0,
+          null, expiresAt, now, traceId, threadId, threadSequence, OPERATOR_ACTOR_KIND,
+        );
+      this.touchThread(threadId, threadSequence, now);
+      // The operator has "read" its own turn (so it never counts as unread to itself).
+      this.db.prepare('UPDATE thread_participants SET last_read_thread_seq=MAX(last_read_thread_seq, ?) WHERE thread_id=? AND session_id=?').run(threadSequence, threadId, OPERATOR_SESSION_ID);
+
+      this.db
+        .prepare(`INSERT INTO deliveries (delivery_id, message_id, recipient_session_id, state, created_at, updated_at) VALUES (?,?,?, '${DeliveryState.QUEUED}', ?, ?)`)
+        .run(this.ids.next(), messageId, recipient.sessionId, now, now);
+
+      // Recipient meaningful-activity is NOT refreshed here (the operator sending TO a session
+      // is not the session's own activity); delivery/ack will refresh it, matching store.send
+      // which refreshes only the sender (and the operator never expires).
+      this.audit('OPERATOR_MESSAGE_SENT', { sessionId: OPERATOR_SESSION_ID, messageId, traceId, recipient: recipient.alias, threadId, threadSequence });
+      // Exactly one hash-chained ledger event in this transaction (ADR 0021 D7).
+      this.ledger(input.threadId === undefined ? 'THREAD_OPENED' : 'OPERATOR_MESSAGE_SENT', OPERATOR_LEDGER_ACTOR, { threadId, messageId }, {
+        recipient: recipient.alias, threadSequence, requiresAck: input.requiresAck ? 1 : 0, requiresReply: input.requiresReply ? 1 : 0, bodyHash: hashBody(input.text),
+      });
+
+      return {
+        messageId, correlationId, recipientSessionId: recipient.sessionId, recipientAlias: recipient.alias,
+        sequence, state: DeliveryState.QUEUED, deduplicated: false, threadId, threadSequence, authorType: OPERATOR_ACTOR_KIND,
+      };
+    });
+  }
+
+  /**
+   * Mark a thread read UP TO a sequence for the operator participant (ADR 0021 D6). Advances
+   * last_read_thread_seq (monotonic — never rewinds) and appends one THREAD_READ ledger
+   * event. Idempotent; a no-op if already read past `upToSequence`. Returns the new cursor.
+   */
+  markThreadRead(threadId: string, upToSequence: number): { threadId: string; lastReadThreadSeq: number } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const t = this.db.prepare('SELECT thread_id FROM threads WHERE thread_id=?').get(threadId) as { thread_id: string } | undefined;
+      if (!t) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such thread');
+      this.ensureParticipant(threadId, OPERATOR_SESSION_ID, OPERATOR_ACTOR_KIND, now);
+      const cur = this.db.prepare('SELECT last_read_thread_seq FROM thread_participants WHERE thread_id=? AND session_id=?').get(threadId, OPERATOR_SESSION_ID) as { last_read_thread_seq: number };
+      const target = Math.max(cur.last_read_thread_seq, Math.max(0, Math.trunc(upToSequence)));
+      if (target === cur.last_read_thread_seq) {
+        return { threadId, lastReadThreadSeq: cur.last_read_thread_seq }; // already read that far — no ledger churn
+      }
+      this.db.prepare('UPDATE thread_participants SET last_read_thread_seq=? WHERE thread_id=? AND session_id=?').run(target, threadId, OPERATOR_SESSION_ID);
+      this.ledger('THREAD_READ', OPERATOR_LEDGER_ACTOR, { threadId }, { lastReadThreadSeq: target });
+      return { threadId, lastReadThreadSeq: target };
+    });
   }
 }

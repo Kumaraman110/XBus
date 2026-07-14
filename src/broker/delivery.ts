@@ -123,6 +123,23 @@ export class DeliveryOps {
       .run(this.ids.next(), eventType, fields.sessionId ?? null, fields.instanceId ?? null, fields.messageId ?? null, null, JSON.stringify(fields), this.clock.nowIso());
   }
 
+  /** Beta.6 (ADR 0017): allocate the next per-thread sequence for a reply turn. Mirrors
+   *  BrokerStore.allocThreadSequence; MUST run inside the reply transaction. The thread +
+   *  its sequence cursor already exist (the root/prior turn created them; migration v8
+   *  backfilled legacy threads), so INSERT OR IGNORE is a safety net for any edge. */
+  private allocThreadSequence(threadId: string, now: string): number {
+    this.db.prepare('INSERT OR IGNORE INTO thread_sequences (thread_id, next_sequence) VALUES (?, 1)').run(threadId);
+    const row = this.db.prepare('SELECT next_sequence FROM thread_sequences WHERE thread_id=?').get(threadId) as { next_sequence: number } | undefined;
+    const seq = row ? row.next_sequence : 1;
+    this.db.prepare('INSERT OR REPLACE INTO thread_sequences (thread_id, next_sequence) VALUES (?, ?)').run(threadId, seq + 1);
+    return seq;
+  }
+
+  /** Advance a thread's activity stamps + high-water sequence after a reply turn. */
+  private touchThread(threadId: string, threadSequence: number, now: string): void {
+    this.db.prepare('UPDATE threads SET updated_at=?, last_message_at=?, last_thread_sequence=MAX(last_thread_sequence, ?) WHERE thread_id=?').run(now, now, threadSequence, threadId);
+  }
+
   /**
    * Beta.4 (ADR 0012 Decision 5): refresh the RECIPIENT's meaningful-activity
    * timestamp (+ recompute the 15-day expiry). Called from genuinely meaningful
@@ -683,8 +700,8 @@ export class DeliveryOps {
     this.assertCurrentEpoch(auth);
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
-      const orig = this.db.prepare('SELECT sender_session_id, sender_alias, recipient_alias, correlation_id, trace_id, recipient_session_id, body_hash FROM messages WHERE message_id=?').get(input.messageId) as
-        | { sender_session_id: string; sender_alias: string; recipient_alias: string; correlation_id: string; trace_id: string; recipient_session_id: string; body_hash: string }
+      const orig = this.db.prepare('SELECT sender_session_id, sender_alias, recipient_alias, correlation_id, trace_id, recipient_session_id, body_hash, thread_id FROM messages WHERE message_id=?').get(input.messageId) as
+        | { sender_session_id: string; sender_alias: string; recipient_alias: string; correlation_id: string; trace_id: string; recipient_session_id: string; body_hash: string; thread_id: string | null }
         | undefined;
       if (!orig) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such message');
       if (orig.recipient_session_id !== auth.sessionId) throw new XBusError(XBusErrorCode.NOT_RECIPIENT, 'not the recipient of this message');
@@ -728,11 +745,21 @@ export class DeliveryOps {
 
       const replyId = this.ids.next();
       const sequence = allocSequence(orig.sender_session_id);
+      // Beta.6 (ADR 0017): the reply inherits the ORIGINAL turn's thread and takes the next
+      // per-thread sequence (a reply is turn N of the same thread). thread_id is backfilled
+      // to correlation_id for every message by migration v8, so orig.thread_id is present for
+      // any post-v8 message; fall back to correlation_id defensively. author_type='claude'
+      // (a session is the one replying — the operator never calls reply()).
+      const threadId = orig.thread_id ?? orig.correlation_id;
+      const threadSequence = this.allocThreadSequence(threadId, now);
       this.db
         .prepare(
-          `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, created_at, trace_id) VALUES (?,?,?,?,?,?, 'reply', ?,?,?,?,?,?,?,?,0,0,?,?)`,
+          `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, created_at, trace_id, thread_id, thread_sequence, author_type) VALUES (?,?,?,?,?,?, 'reply', ?,?,?,?,?,?,?,?,0,0,?,?,?,?, 'claude')`,
         )
-        .run(replyId, 1, auth.sessionId, orig.recipient_alias, orig.sender_session_id, orig.sender_alias, orig.correlation_id, input.messageId, input.messageId, sequence, input.idempotencyKey ?? null, input.text, hashBody(input.text), input.metadata ? JSON.stringify(input.metadata) : null, now, orig.trace_id);
+        .run(replyId, 1, auth.sessionId, orig.recipient_alias, orig.sender_session_id, orig.sender_alias, orig.correlation_id, input.messageId, input.messageId, sequence, input.idempotencyKey ?? null, input.text, hashBody(input.text), input.metadata ? JSON.stringify(input.metadata) : null, now, orig.trace_id, threadId, threadSequence);
+      this.touchThread(threadId, threadSequence, now);
+      // The replier has "read" the thread up to its own new turn (its unread never counts itself).
+      this.db.prepare('UPDATE thread_participants SET last_read_thread_seq=MAX(last_read_thread_seq, ?) WHERE thread_id=? AND session_id=?').run(threadSequence, threadId, auth.sessionId);
       this.db.prepare(`INSERT INTO deliveries (delivery_id, message_id, recipient_session_id, state, created_at, updated_at) VALUES (?,?,?, '${DeliveryState.QUEUED}', ?, ?)`).run(this.ids.next(), replyId, orig.sender_session_id, now, now);
 
       // Complete the original delivery (from accepted, or transport_written if no ack required).
