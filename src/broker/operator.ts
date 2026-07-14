@@ -53,10 +53,23 @@ export function ensureOperatorSession(db: SqliteDriver, clock: Clock): void {
     const now = clock.nowIso();
     const existing = db.prepare('SELECT session_id FROM sessions WHERE session_id=?').get(OPERATOR_SESSION_ID) as { session_id: string } | undefined;
     if (!existing) {
+      // A pre-existing (pre-reservation) legacy DB could conceivably have a DIFFERENT session
+      // already holding the reserved name/alias. Claiming it unconditionally would hit the
+      // active-name / active-alias unique indexes and CRASH broker start. So we claim the name
+      // + alias only when FREE (mirroring upsertAutomaticAliasSafe): the operator is always
+      // routable-to by its exact session_id 'local-operator' regardless, so a name/alias clash
+      // is a cosmetic from= fallback, never a start-blocking error.
+      const nameHeld = db.prepare(
+        `SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`,
+      ).get(OPERATOR_ALIAS.toLowerCase(), OPERATOR_SESSION_ID) as { session_id: string } | undefined;
+      const aliasHeld = db.prepare(
+        `SELECT session_id FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`,
+      ).get(OPERATOR_ALIAS.toLowerCase()) as { session_id: string } | undefined;
       // A minimal, unmanaged, non-routable, non-expiring session row. No epoch is started
       // (active_epoch stays 0 — the operator never registers a component), and expires_at
       // is left NULL so the retention reaper never tombstones it (the reaper ALSO skips it
-      // by id, ADR 0021). session_name_state='active' + the reserved name locks the name.
+      // by id, ADR 0021). The name is claimed 'active' only if free, else the row exists
+      // unnamed (still addressable by its reserved session_id).
       db.prepare(
         `INSERT INTO sessions (
            session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json,
@@ -64,18 +77,21 @@ export function ensureOperatorSession(db: SqliteDriver, clock: Clock): void {
            management_state, source_last, identify_confidence,
            session_name, normalized_session_name, session_name_state
          ) VALUES (?,?,?,?,?, '[]', 'disconnected', 'disconnected', 'disconnected', ?,?,?,
-           'unmanaged', 'operator', 'unidentified', ?, ?, 'active')`,
+           'unmanaged', 'operator', 'unidentified', ?, ?, ?)`,
       ).run(
         OPERATOR_SESSION_ID, OPERATOR_ALIAS, '__xbus_operator__', '__xbus_operator__', XBUS_VERSION,
-        now, now, now, OPERATOR_ALIAS, OPERATOR_ALIAS,
+        now, now, now,
+        nameHeld ? null : OPERATOR_ALIAS, nameHeld ? null : OPERATOR_ALIAS, nameHeld ? 'unnamed' : 'active',
       );
       db.prepare('INSERT OR IGNORE INTO recipient_sequences (recipient_session_id, next_sequence) VALUES (?, 1)').run(OPERATOR_SESSION_ID);
-      // An active global alias so aliasForSession(operator) returns 'local-operator'
-      // (what the recipient sees as from=), not the automatic fallback.
-      db.prepare(
-        `INSERT INTO aliases (alias_id, alias, alias_ci, scope, project_id, session_id, active, created_at)
-         VALUES (?,?,?, 'global', NULL, ?, 1, ?)`,
-      ).run(`alias-${OPERATOR_SESSION_ID}`, OPERATOR_ALIAS, OPERATOR_ALIAS.toLowerCase(), OPERATOR_SESSION_ID, now);
+      // An active global alias so aliasForSession(operator) returns 'local-operator' (what the
+      // recipient sees as from=), not the automatic fallback — only if the alias is free.
+      if (!aliasHeld) {
+        db.prepare(
+          `INSERT INTO aliases (alias_id, alias, alias_ci, scope, project_id, session_id, active, created_at)
+           VALUES (?,?,?, 'global', NULL, ?, 1, ?)`,
+        ).run(`alias-${OPERATOR_SESSION_ID}`, OPERATOR_ALIAS, OPERATOR_ALIAS.toLowerCase(), OPERATOR_SESSION_ID, now);
+      }
     } else {
       // Idempotent hardening: make sure the row can never expire and stays unmanaged even if
       // a prior build (or a manual edit) left it otherwise. Never touches its epoch/components.

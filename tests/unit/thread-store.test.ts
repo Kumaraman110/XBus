@@ -86,6 +86,41 @@ describe('local-operator principal (ADR 0021)', () => {
     expect(n).toBe(1);
   });
 
+  it('a peer CANNOT register as the reserved operator session id (no impersonation via register)', () => {
+    // ADR 0021 hardening: store.register must refuse the reserved id (the daemon also gates it
+    // pre-store). Registering it would bind a live component to the operator + make it routable.
+    expect(() => store.register({ sessionId: OPERATOR_SESSION_ID, instanceId: 'x', connectionId: 'cx', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: [], role: 'mcp' })).toThrow();
+    // The operator row is untouched: still unmanaged, no live component, epoch 0.
+    const row = db.prepare('SELECT management_state, active_epoch FROM sessions WHERE session_id=?').get(OPERATOR_SESSION_ID) as { management_state: string; active_epoch: number };
+    expect(row.management_state).toBe('unmanaged');
+    expect(row.active_epoch).toBe(0);
+    const live = db.prepare(`SELECT COUNT(*) n FROM component_instances WHERE session_id=? AND state='live'`).get(OPERATOR_SESSION_ID) as { n: number };
+    expect(live.n).toBe(0);
+  });
+
+  it('ensureOperatorSession does not crash if a foreign session already holds the name/alias', () => {
+    // A pre-reservation legacy DB could have a different session holding 'local-operator'.
+    // Provisioning must NOT hit the active-name / active-alias unique indexes and crash.
+    const other = 'ffff0000-0000-4000-8000-00000000000f';
+    // Fresh DB (this test wants the operator NOT yet present) — rebuild a clean one.
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'xbus-opclash-'));
+    const db2 = openDatabase(path.join(d2, 'x.sqlite'), { applyPragmas: true });
+    try {
+      runMigrations(db2, clock.nowIso());
+      // A foreign session squats the reserved name + alias BEFORE the operator is provisioned.
+      db2.prepare(`INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, state, last_seen_at, created_at, updated_at, session_name, normalized_session_name, session_name_state) VALUES (?,?,?,?,?,?, 'connected', ?,?,?, 'local-operator','local-operator','active')`).run(other, 'session-ffff0000', 'p', '/', '0', '[]', 'n', 'n', 'n');
+      db2.prepare(`INSERT INTO aliases (alias_id, alias, alias_ci, scope, project_id, session_id, active, created_at) VALUES ('a-other','local-operator','local-operator','global',NULL,?,1,'n')`).run(other);
+      // Must NOT throw, and must still create the operator row (addressable by its id).
+      expect(() => ensureOperatorSession(db2, clock)).not.toThrow();
+      const op = db2.prepare('SELECT session_id, management_state FROM sessions WHERE session_id=?').get(OPERATOR_SESSION_ID) as { session_id: string; management_state: string } | undefined;
+      expect(op).toBeDefined();
+      expect(op!.management_state).toBe('unmanaged');
+      // The foreign session keeps its name (no clobber); the operator fell back to unnamed.
+      const opName = db2.prepare('SELECT session_name_state FROM sessions WHERE session_id=?').get(OPERATOR_SESSION_ID) as { session_name_state: string };
+      expect(opName.session_name_state).toBe('unnamed');
+    } finally { db2.close(); try { fs.rmSync(d2, { recursive: true, force: true }); } catch { /* */ } }
+  });
+
   it('the retention reaper NEVER expires the operator, even if expires_at were set', () => {
     // Force a due expiry on the operator, then sweep — it must survive.
     db.prepare('UPDATE sessions SET expires_at=? WHERE session_id=?').run('2000-01-01T00:00:00.000Z', OPERATOR_SESSION_ID);
@@ -165,6 +200,52 @@ describe('operator ↔ session thread — linkage semantics (ADR 0021 worked exa
     expect(distinctCorr.n).toBe(1);
     const seqs = (db.prepare('SELECT thread_sequence FROM messages WHERE thread_id=? ORDER BY thread_sequence').all(T) as Array<{ thread_sequence: number }>).map((x) => x.thread_sequence);
     expect(seqs).toEqual([1, 2, 3, 4]); // monotonic, gap-free, single ordering across both directions
+  });
+});
+
+describe('operator thread access control (ADR 0021 hardening)', () => {
+  it('the operator CANNOT continue a thread it does not participate in (e.g. a backfilled peer thread)', () => {
+    registerSession();
+    // Simulate a peer-to-peer / backfilled thread with NO operator participant.
+    const foreignThread = 'peer-thread-xyz';
+    db.prepare(`INSERT INTO threads (thread_id, root_message_id, created_by_actor, state, created_at, updated_at, last_message_at) VALUES (?,?,?, 'open', ?,?,?)`).run(foreignThread, 'm-root', S, clock.nowIso(), clock.nowIso(), clock.nowIso());
+    db.prepare(`INSERT INTO thread_participants (participant_id, thread_id, session_id, actor_kind, participant_role, joined_at) VALUES ('pp','${foreignThread}','${S}','claude','member',?)`).run(clock.nowIso());
+    // A tab-token holder tries to inject an operator turn into it → rejected (not a participant).
+    expect(() => store.operatorSend({ to: 'seatmap-api', text: 'sneak in', kind: 'request', requiresAck: false, requiresReply: false, threadId: foreignThread })).toThrow();
+    // No operator turn was persisted into the foreign thread.
+    const n = (db.prepare('SELECT COUNT(*) n FROM messages WHERE thread_id=? AND sender_session_id=?').get(foreignThread, OPERATOR_SESSION_ID) as { n: number }).n;
+    expect(n).toBe(0);
+  });
+
+  it('a follow-up recipient must match the thread\'s peer (no retargeting a thread to a third session)', () => {
+    const auth = registerSession();
+    // A second routable session C.
+    const C = 'cccc6666-0000-4000-8000-00000000000e';
+    const authC = store.register({ sessionId: C, instanceId: 'iC', connectionId: 'cC', processId: 3, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'other-svc' });
+    store.signalReadiness(authC, { ackAvailable: true, versionOk: true });
+    const t = store.operatorSend({ to: 'seatmap-api', text: 'q', kind: 'request', requiresAck: true, requiresReply: true });
+    // Continuing the thread but addressing a DIFFERENT session → rejected.
+    expect(() => store.operatorSend({ to: 'other-svc', text: 'redirect', kind: 'request', requiresAck: false, requiresReply: false, threadId: t.threadId })).toThrow();
+    void auth; void authC;
+  });
+
+  it('sending a follow-up does NOT clear the unread badge for an intervening unread peer turn', () => {
+    const auth = registerSession();
+    const t = store.operatorSend({ to: 'seatmap-api', text: 'q1', kind: 'request', requiresAck: true, requiresReply: true });
+    const T = t.threadId;
+    // Peer replies (seq 2) — now the operator has 1 unread.
+    const inj = delivery.checkpointPull(hookAuth(auth), 'cp', 10).find((m) => m.messageId === t.messageId)!.metadata![INJECTION_METADATA_KEY];
+    delivery.ack(auth, { messageId: t.messageId, status: 'accepted', injectionId: inj });
+    delivery.reply(auth, { messageId: t.messageId, text: 'a1', outcome: 'completed', injectionId: inj }, allocSeq);
+    const unread = (): number => {
+      const cur = db.prepare('SELECT last_read_thread_seq FROM thread_participants WHERE thread_id=? AND session_id=?').get(T, OPERATOR_SESSION_ID) as { last_read_thread_seq: number };
+      return (db.prepare('SELECT COUNT(*) n FROM messages WHERE thread_id=? AND thread_sequence > ? AND sender_session_id <> ?').get(T, cur.last_read_thread_seq, OPERATOR_SESSION_ID) as { n: number }).n;
+    };
+    expect(unread()).toBe(1);
+    // Operator sends a follow-up (seq 3) WITHOUT opening the reply. The unread peer turn (seq 2)
+    // must STILL count as unread — sending must not advance the read cursor past it.
+    store.operatorSend({ to: 'seatmap-api', text: 'q2', kind: 'request', requiresAck: false, requiresReply: false, threadId: T });
+    expect(unread()).toBe(1); // the intervening peer reply is still unread
   });
 });
 

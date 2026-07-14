@@ -265,6 +265,11 @@ export class BrokerStore {
    * componentInstanceIds and role-restricted capabilities.
    */
   register(input: RegisterInput & { supersede?: boolean }): SessionAuthority {
+    // Beta.6 (ADR 0021): the reserved `local-operator` principal is broker-provisioned and
+    // must NEVER be registerable as a live session (defense-in-depth behind the daemon gate).
+    if (input.sessionId === OPERATOR_SESSION_ID) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'this session id is reserved and cannot be registered', { sessionId: input.sessionId });
+    }
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
       const role = input.role ?? ComponentRole.MCP;
@@ -1000,7 +1005,12 @@ export class BrokerStore {
         const t = this.db.prepare('SELECT thread_id, root_message_id, state FROM threads WHERE thread_id=?').get(input.threadId) as { thread_id: string; root_message_id: string; state: string } | undefined;
         if (!t) throw new XBusError(XBusErrorCode.MESSAGE_NOT_FOUND, 'no such thread');
         if (t.state !== 'open') throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, 'thread is closed');
-        // The operator must be a participant of a thread it continues (it is added on open).
+        // ACCESS CONTROL (ADR 0021): the operator may only continue a thread it PARTICIPATES
+        // in — i.e. one it opened. A tab-token holder must not be able to inject an operator
+        // turn into a peer-to-peer / legacy-backfilled thread (which has no operator
+        // participant) by POSTing to /api/thread/<foreignThreadId>/send. Fail closed.
+        const opPart = this.db.prepare('SELECT 1 AS present FROM thread_participants WHERE thread_id=? AND session_id=?').get(input.threadId, OPERATOR_SESSION_ID) as { present: number } | undefined;
+        if (!opPart) throw new XBusError(XBusErrorCode.NOT_RECIPIENT, 'the operator is not a participant of this thread');
         threadId = t.thread_id;
         correlationId = threadId; // thread_id == root correlation_id (ADR 0017 D1)
         // parent = the explicit turn answered, else the latest turn in the thread.
@@ -1013,6 +1023,14 @@ export class BrokerStore {
           parentMessageId = last?.message_id ?? t.root_message_id;
         }
         causationId = parentMessageId;
+        // The follow-up recipient MUST be the thread's established peer (not an arbitrary `to`)
+        // — a thread is a conversation with ONE session; retargeting a follow-up elsewhere
+        // would fork identities under one thread id. If the thread has a recorded non-operator
+        // participant, the resolved recipient must equal it.
+        const peer = this.db.prepare(`SELECT session_id FROM thread_participants WHERE thread_id=? AND session_id<>? ORDER BY joined_at ASC LIMIT 1`).get(threadId, OPERATOR_SESSION_ID) as { session_id: string } | undefined;
+        if (peer && peer.session_id !== recipient.sessionId) {
+          throw new XBusError(XBusErrorCode.UNKNOWN_RECIPIENT, 'recipient does not match this thread\'s participant');
+        }
       } else {
         threadId = messageId;      // new thread rooted here
         correlationId = messageId; // root: correlation == messageId (unchanged convention)
@@ -1047,8 +1065,12 @@ export class BrokerStore {
           null, expiresAt, now, traceId, threadId, threadSequence, OPERATOR_ACTOR_KIND,
         );
       this.touchThread(threadId, threadSequence, now);
-      // The operator has "read" its own turn (so it never counts as unread to itself).
-      this.db.prepare('UPDATE thread_participants SET last_read_thread_seq=MAX(last_read_thread_seq, ?) WHERE thread_id=? AND session_id=?').run(threadSequence, threadId, OPERATOR_SESSION_ID);
+      // NOTE: we deliberately do NOT advance the operator's read cursor on send. The operator's
+      // own turns are already excluded from its unread count (unread counts turns with
+      // sender <> operator), so a bump is unnecessary — and advancing to this new sequence
+      // would JUMP PAST any intervening UNREAD peer turn (a reply the operator hasn't opened),
+      // wrongly clearing its unread badge. The cursor advances ONLY via an explicit mark-read
+      // (markThreadRead / the console's on-view read) — never as a side effect of sending.
 
       this.db
         .prepare(`INSERT INTO deliveries (delivery_id, message_id, recipient_session_id, state, created_at, updated_at) VALUES (?,?,?, '${DeliveryState.QUEUED}', ?, ?)`)

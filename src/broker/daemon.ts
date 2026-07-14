@@ -26,6 +26,7 @@ import { BrokerMetrics, type MetricsGauges, type MetricsSnapshot } from '../obse
 import { verifyLedger } from './ledger.js';
 import { evaluateRegistration, type AdapterRegistrationDeclaration } from '../adapter-broker/enforce.js';
 import { TrustedEvidenceRegistry } from '../adapter-broker/trusted-evidence.js';
+import { isOperatorSession } from './operator.js';
 import type { AwardedSupport } from '../adapter/evidence.js';
 
 export interface DaemonOptions {
@@ -386,6 +387,14 @@ export class BrokerDaemon {
       if (typeof p[field] !== 'string' || !p[field]) {
         throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, `register_session requires a non-empty ${field}`, { field });
       }
+    }
+    // Beta.6 (ADR 0021): the reserved `local-operator` principal is broker-provisioned and
+    // must NEVER be registerable as a live session — a peer registering with this id would
+    // hijack the operator into a routable/injectable actor + bind a component to it. Reject
+    // it fail-closed BEFORE store.register (a caller-supplied sessionId is untrusted).
+    if (isOperatorSession(p.sessionId)) {
+      this.audit('RESERVED_SESSION_REGISTER_REJECTED', { sessionId: p.sessionId });
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'this session id is reserved and cannot be registered', { sessionId: p.sessionId });
     }
     if (typeof p.processId !== 'number') {
       throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'register_session requires a numeric processId');
