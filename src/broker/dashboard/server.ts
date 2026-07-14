@@ -78,8 +78,8 @@ export interface DashboardServerOptions {
    * (mapped to a 4xx) or resolve a JSON result. The browser NEVER supplies a sender/actor —
    * identity is stamped server-side to 'local-operator'.
    */
-  onOperatorSend?: (payload: unknown) => unknown | Promise<unknown>;
-  onMarkThreadRead?: (payload: unknown) => unknown | Promise<unknown>;
+  onOperatorSend?: (payload: unknown) => unknown;
+  onMarkThreadRead?: (payload: unknown) => unknown;
   /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
   maxWriteBodyBytes?: number;
 }
@@ -105,8 +105,8 @@ export class DashboardServer {
   private readonly log: (line: string) => void;
   private readonly onChange: ((cb: () => void) => () => void) | undefined;
   private readonly maxStreams: number;
-  private readonly onOperatorSend: ((payload: unknown) => unknown | Promise<unknown>) | undefined;
-  private readonly onMarkThreadRead: ((payload: unknown) => unknown | Promise<unknown>) | undefined;
+  private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
+  private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
   private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
 
@@ -381,7 +381,7 @@ export class DashboardServer {
       if (!res.writableEnded) { try { res.write(JSON.stringify({ type: 'sessions', sessions }) + '\n'); } catch { /* dropped */ } }
     }).catch(() => { /* off-loop read failed; skip */ });
     void this.reader.run('threads').then((threads) => {
-      if (!res.writableEnded) { try { res.write(JSON.stringify({ type: 'threads', ...(threads as object) }) + '\n'); } catch { /* dropped */ } }
+      if (threads && typeof threads === 'object' && !res.writableEnded) { try { res.write(JSON.stringify({ type: 'threads', ...(threads as Record<string, unknown>) }) + '\n'); } catch { /* dropped */ } }
     }).catch(() => { /* off-loop read failed; skip */ });
   }
 
@@ -414,7 +414,7 @@ export class DashboardServer {
     catch { done(); return; }
     void p.then(([sessions, threads]) => {
       const lines = [JSON.stringify({ type: 'sessions', sessions }) + '\n'];
-      if (threads) lines.push(JSON.stringify({ type: 'threads', ...(threads as object) }) + '\n');
+      if (threads && typeof threads === 'object') lines.push(JSON.stringify({ type: 'threads', ...(threads as Record<string, unknown>) }) + '\n');
       const blob = lines.join('');
       for (const res of this.streams) { if (!res.writableEnded) { try { res.write(blob); } catch { /* per-stream write failure; cleanup on close */ } } }
     }).catch(() => { /* skip this tick */ }).finally(done);

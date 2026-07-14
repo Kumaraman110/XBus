@@ -127,7 +127,7 @@ export class DeliveryOps {
    *  BrokerStore.allocThreadSequence; MUST run inside the reply transaction. The thread +
    *  its sequence cursor already exist (the root/prior turn created them; migration v8
    *  backfilled legacy threads), so INSERT OR IGNORE is a safety net for any edge. */
-  private allocThreadSequence(threadId: string, now: string): number {
+  private allocThreadSequence(threadId: string): number {
     this.db.prepare('INSERT OR IGNORE INTO thread_sequences (thread_id, next_sequence) VALUES (?, 1)').run(threadId);
     const row = this.db.prepare('SELECT next_sequence FROM thread_sequences WHERE thread_id=?').get(threadId) as { next_sequence: number } | undefined;
     const seq = row ? row.next_sequence : 1;
@@ -751,7 +751,7 @@ export class DeliveryOps {
       // any post-v8 message; fall back to correlation_id defensively. author_type='claude'
       // (a session is the one replying — the operator never calls reply()).
       const threadId = orig.thread_id ?? orig.correlation_id;
-      const threadSequence = this.allocThreadSequence(threadId, now);
+      const threadSequence = this.allocThreadSequence(threadId);
       this.db
         .prepare(
           `INSERT INTO messages (message_id, protocol_version, sender_session_id, sender_alias, recipient_session_id, recipient_alias, kind, correlation_id, causation_id, parent_message_id, recipient_sequence, idempotency_key, body_text, body_hash, metadata_json, requires_ack, requires_reply, created_at, trace_id, thread_id, thread_sequence, author_type) VALUES (?,?,?,?,?,?, 'reply', ?,?,?,?,?,?,?,?,0,0,?,?,?,?, 'claude')`,
