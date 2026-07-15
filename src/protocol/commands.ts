@@ -71,6 +71,11 @@ export interface RegisterPayload {
   requestedSessionName?: string;
   /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
   agentType?: string;
+  /** Beta.8 (ADR 0027): ownership proof to reclaim a prior durable identity's name+inbox
+   *  under a NEW Claude Code session id. Broker-minted, persisted client-side, presented
+   *  verbatim. Optional + additive — a beta.7 client that never sends it gets exact beta.7
+   *  behavior. Gated broker-side (secret match + liveness); never a self-promotion. */
+  ownerSecret?: string;
 }
 
 /**

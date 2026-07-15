@@ -85,6 +85,13 @@ export interface RegisterInput {
   requestedSessionName?: string;
   /** Beta.4: adapter/agent type captured for diagnostics (NOT trust evidence). */
   agentType?: string;
+  /** Beta.8 (ADR 0027): an ownership proof a successor under a NEW Claude Code session id
+   *  presents to reclaim the durable logical identity (name + inbox) of a prior, now-gone
+   *  session. Broker-minted at first name award, persisted client-side, presented verbatim.
+   *  A matching secret whose incumbent has NO live mcp component ⇒ the successor is
+   *  redirected onto the canonical (durable) session id and inherits name + inbox. A wrong
+   *  secret, or a live incumbent, ⇒ no reclaim (beta.7 pending), with nameReclaimFailed set. */
+  ownerSecret?: string;
 }
 
 /** Beta.4: outcome of a name claim (register or rename). */
@@ -113,6 +120,18 @@ export interface SessionAuthority {
   sessionNameState?: 'unnamed' | 'pending' | 'active' | 'retired';
   /** Beta.4: the held display name when sessionNameState==='active', else null. */
   awardedSessionName?: string | null;
+  /** Beta.8 (ADR 0027): the durable logical identity that owns this session's name + inbox.
+   *  For a fresh session it equals sessionId; for a reclaim it is the canonical (predecessor)
+   *  session id the successor was redirected onto. Persisted client-side as the reclaim anchor. */
+  logicalIdentityId?: string;
+  /** Beta.8: the ownership secret for the awarded name. Present ONLY when a name is newly
+   *  awarded (first claim or a successful reclaim) — the client persists it to reclaim later.
+   *  NEVER logged, NEVER written to the audit/ledger (only its sha256 hash is stored). */
+  ownerSecret?: string | null;
+  /** Beta.8: true when a requestedSessionName + ownerSecret was presented but reclaim was
+   *  refused (wrong secret, or the incumbent still has a live mcp component). The session is
+   *  left 'pending' exactly as beta.7. Lets the client/model know the name was not recovered. */
+  nameReclaimFailed?: boolean;
 }
 
 export interface SendResult {
@@ -197,7 +216,7 @@ export class BrokerStore {
    * The DB unique index `ux_session_name_active` is the authoritative race guard;
    * this pre-check produces the friendly state, and the index backstops a race.
    */
-  private claimNameForRegister(sessionId: string, requested: string | undefined, now: string): SessionNameStatus {
+  private claimNameForRegister(sessionId: string, requested: string | undefined, now: string): SessionNameStatus & { ownerSecret?: string | null } {
     if (requested === undefined) return { state: 'unnamed', name: null };
     let norm: NormalizedSessionName;
     try {
@@ -222,7 +241,10 @@ export class BrokerStore {
       this.markPending(sessionId, now);
       return { state: 'pending', name: null };
     }
-    return { state: 'active', name: norm.display };
+    // Beta.8 (ADR 0027): mirror the active name into name_ownership (the durable-identity name
+    // authority) in the SAME transaction, minting a stable owner secret on first protected award.
+    const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(sessionId), sessionId, norm, now);
+    return { state: 'active', name: norm.display, ownerSecret };
   }
 
   /**
@@ -241,6 +263,93 @@ export class BrokerStore {
     const pendingTtl = new Date(this.clock.nowMs() + 5 * 60_000).toISOString();
     this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='pending', pending_name_expires_at=?, updated_at=? WHERE session_id=?`)
       .run(pendingTtl, now, sessionId);
+  }
+
+  // ─── Beta.8 (ADR 0027): durable logical identity + name ownership ──────────────────────
+
+  /** sha256 of an ownership secret (what we persist; the plaintext is returned to the client
+   *  once and NEVER stored/logged). */
+  private static hashSecret(secret: string): string {
+    return createHash('sha256').update(`owner:${secret}`, 'utf8').digest('hex');
+  }
+
+  /** Mint a fresh opaque ownership secret (returned to the client verbatim, once). */
+  private mintOwnerSecret(): string {
+    // Derive from the monotonic fencing counter so it is unguessable + unique without a RNG
+    // dependency in the store (tests use a deterministic clock; the value must still be opaque).
+    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
+    const v = (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
+    return createHash('sha256').update(`owner-secret:${this.brokerInstanceId}:${v}:${this.clock.nowMs()}`, 'utf8').digest('hex');
+  }
+
+  /** The durable logical identity of a canonical session row (defaults to the id itself for a
+   *  pre-v10 / freshly-created row before backfill runs). */
+  private logicalIdOf(sessionId: string): string {
+    const r = this.db.prepare('SELECT logical_identity_id AS lid FROM sessions WHERE session_id=?').get(sessionId) as { lid: string | null } | undefined;
+    return r?.lid ?? sessionId;
+  }
+
+  /** Does the given canonical session currently have a LIVE mcp component? Used to refuse a
+   *  cross-id reclaim of a still-live incumbent (never evict a live owner — ADR 0027 D3). */
+  private hasLiveMcp(sessionId: string): boolean {
+    const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e;
+    if (epoch === undefined) return false;
+    const n = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp' AND state='live'`).get(sessionId, epoch) as { n: number }).n;
+    return n > 0;
+  }
+
+  /**
+   * Resolve a reclaim attempt. Given a requested name + an ownership secret, decide whether
+   * this registration should be REDIRECTED onto an existing canonical session (the durable
+   * identity that owns the name + inbox). Returns the canonical session id to redirect to, or
+   * null if there is no legitimate reclaim (wrong/absent secret, or a live incumbent — the
+   * caller then falls through to the normal beta.7 claim/pending path).
+   *
+   * MUST be called inside the register transaction, BEFORE the row lookup.
+   */
+  private resolveReclaim(requested: string | undefined, ownerSecret: string | undefined, newSessionId: string): { canonicalSessionId: string; logicalIdentityId: string } | null {
+    if (requested === undefined || ownerSecret === undefined) return null;
+    let norm: NormalizedSessionName;
+    try { norm = validateSessionName(requested); } catch { return null; }
+    const own = this.db
+      .prepare(`SELECT logical_identity_id AS lid, owner_secret_hash AS hash, current_session_id AS csid, name_state AS state FROM name_ownership WHERE normalized_name=? AND name_state IN ('active','pending')`)
+      .get(norm.normalized) as { lid: string; hash: string | null; csid: string | null; state: string } | undefined;
+    if (!own || own.hash === null) return null; // no protected owner → normal path (legacy-unprotected)
+    if (own.hash !== BrokerStore.hashSecret(ownerSecret)) return null; // wrong secret → no reclaim
+    if (!own.csid) return null;
+    if (own.csid === newSessionId) return null; // same id already owns it → normal path
+    // Liveness gate: never evict a LIVE incumbent by a cross-id reclaim.
+    if (this.hasLiveMcp(own.csid)) return null;
+    return { canonicalSessionId: own.csid, logicalIdentityId: own.lid };
+  }
+
+  /** Upsert the name_ownership row for a logical identity when a name goes ACTIVE. Mints the
+   *  owner secret if this identity has none yet (first protected award); keeps it STABLE across
+   *  reclaims (ADR 0027 D5 — no per-reclaim rotation, so a crash before the client persists the
+   *  ack can never self-lock the identity out). Returns the plaintext secret to hand back to the
+   *  client ONLY when it was freshly minted this call; null when an existing (already-delivered)
+   *  secret is reused. Same transaction as the sessions-row name write, so they never diverge. */
+  private setNameOwnershipActive(logicalId: string, canonicalSessionId: string, norm: NormalizedSessionName, now: string): { ownerSecret: string | null } {
+    const existing = this.db.prepare('SELECT owner_secret_hash AS hash FROM name_ownership WHERE logical_identity_id=?').get(logicalId) as { hash: string | null } | undefined;
+    let plaintext: string | null = null;
+    let hash: string | null = existing?.hash ?? null;
+    if (hash === null) { plaintext = this.mintOwnerSecret(); hash = BrokerStore.hashSecret(plaintext); }
+    // Release any OTHER identity that held this normalized name (superseded predecessor whose
+    // ownership row lingers) so ux_name_ownership_active never blocks the new active owner.
+    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, superseded_at=?, updated_at=? WHERE normalized_name=? AND logical_identity_id<>? AND name_state IN ('active','pending')`)
+      .run(now, now, norm.normalized, logicalId);
+    this.db.prepare(`INSERT INTO name_ownership (logical_identity_id, normalized_name, display_name, owner_secret_hash, name_state, current_session_id, superseded_at, created_at, updated_at)
+                     VALUES (?,?,?,?, 'active', ?, NULL, ?, ?)
+                     ON CONFLICT(logical_identity_id) DO UPDATE SET normalized_name=excluded.normalized_name, display_name=excluded.display_name, owner_secret_hash=excluded.owner_secret_hash, name_state='active', current_session_id=excluded.current_session_id, superseded_at=NULL, updated_at=excluded.updated_at`)
+      .run(logicalId, norm.normalized, norm.display, hash, canonicalSessionId, now, now);
+    return { ownerSecret: plaintext };
+  }
+
+  /** Mirror a name RELEASE (pending/unnamed/retired) into name_ownership for a logical identity.
+   *  The owner_secret_hash is PRESERVED (a released name keeps its secret so the same identity
+   *  can re-acquire), only the routing (normalized_name/state) is cleared. */
+  private setNameOwnershipReleased(logicalId: string, now: string): void {
+    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, updated_at=? WHERE logical_identity_id=?`).run(now, logicalId);
   }
 
   private nextFencingToken(): number {
@@ -264,16 +373,40 @@ export class BrokerStore {
    * Many components (mcp + hook + transport) coexist in one epoch with distinct
    * componentInstanceIds and role-restricted capabilities.
    */
-  register(input: RegisterInput & { supersede?: boolean }): SessionAuthority {
+  register(inputRaw: RegisterInput & { supersede?: boolean }): SessionAuthority {
     // Beta.6 (ADR 0021): the reserved `local-operator` principal is broker-provisioned and
     // must NEVER be registerable as a live session (defense-in-depth behind the daemon gate).
-    if (input.sessionId === OPERATOR_SESSION_ID) {
-      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'this session id is reserved and cannot be registered', { sessionId: input.sessionId });
+    if (inputRaw.sessionId === OPERATOR_SESSION_ID) {
+      throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'this session id is reserved and cannot be registered', { sessionId: inputRaw.sessionId });
     }
     return this.db.transaction(() => {
       const now = this.clock.nowIso();
-      const role = input.role ?? ComponentRole.MCP;
+      const role = inputRaw.role ?? ComponentRole.MCP;
       const componentInstanceId = this.ids.next();
+
+      // Beta.8 (ADR 0027): durable-identity RECLAIM redirect. If the caller presents a
+      // requestedSessionName + a matching ownerSecret whose incumbent is gone (no live mcp
+      // component), REDIRECT this registration onto the canonical (durable) session id that
+      // owns the name + inbox, and force it through the supersede path — the successor thereby
+      // inherits the name + the entire inbox with ZERO row movement (the inbox is keyed on the
+      // canonical session id). The physical→canonical map records the NEW Claude id so later
+      // frames on the same connection resolve to the canonical identity. A wrong/absent secret
+      // or a LIVE incumbent ⇒ no redirect: the caller registers under its own id and gets the
+      // beta.7 taken→pending outcome (with nameReclaimFailed surfaced when a secret was tried).
+      const physicalSessionId = inputRaw.sessionId;
+      const reclaim = role === ComponentRole.MCP
+        ? this.resolveReclaim(inputRaw.requestedSessionName, inputRaw.ownerSecret, physicalSessionId)
+        : null;
+      const reclaimAttempted = inputRaw.ownerSecret !== undefined && inputRaw.requestedSessionName !== undefined;
+      const input: RegisterInput & { supersede?: boolean } = reclaim
+        ? { ...inputRaw, sessionId: reclaim.canonicalSessionId, supersede: true }
+        : inputRaw;
+      if (reclaim && physicalSessionId !== reclaim.canonicalSessionId) {
+        this.db.prepare('INSERT OR REPLACE INTO physical_session_map (physical_session_id, canonical_session_id, logical_identity_id, created_at) VALUES (?,?,?,?)')
+          .run(physicalSessionId, reclaim.canonicalSessionId, reclaim.logicalIdentityId, now);
+        this.audit('IDENTITY_RECLAIMED', { sessionId: reclaim.canonicalSessionId, physicalSessionId });
+      }
+
       const existing = this.db
         .prepare('SELECT session_id, active_epoch, expired_at FROM sessions WHERE session_id = ?')
         .get(input.sessionId) as { session_id: string; active_epoch: number; expired_at: string | null } | undefined;
@@ -377,7 +510,7 @@ export class BrokerStore {
       // joining is not "activity" and a reconnecting hook must not re-roll the name or
       // extend the idle timer.
       const isNewLifecycle = !existing || freshLifecycle;
-      let nameStatus: SessionNameStatus;
+      let nameStatus: SessionNameStatus & { ownerSecret?: string | null };
       if (isNewLifecycle) {
         nameStatus = this.claimNameForRegister(input.sessionId, input.requestedSessionName, now);
         this.refreshMeaningfulActivity(input.sessionId, now);
@@ -403,11 +536,20 @@ export class BrokerStore {
         }
       }
 
+      // Beta.8 (ADR 0027): a reclaim was ATTEMPTED (secret + name presented) but the name did
+      // not come back active — either the secret was wrong/absent-owner, or a live incumbent
+      // blocked the redirect. Tell the client the reclaim failed so it does not believe it owns
+      // the name. (A legitimate reclaim redirected above, so nameStatus is 'active' there.)
+      const nameReclaimFailed = reclaimAttempted && nameStatus.state !== 'active';
+
       this.audit('COMPONENT_REGISTERED', { sessionId: input.sessionId, instanceId: componentInstanceId, role, epoch, sessionNameState: nameStatus.state });
       return {
         sessionId: input.sessionId, instanceId: componentInstanceId, componentInstanceId, role, epoch,
         generation: epoch, fencingToken: epochToken, connectionId: input.connectionId,
         sessionNameState: nameStatus.state, awardedSessionName: nameStatus.name,
+        logicalIdentityId: this.logicalIdOf(input.sessionId),
+        ...(nameStatus.ownerSecret != null ? { ownerSecret: nameStatus.ownerSecret } : {}),
+        ...(nameReclaimFailed ? { nameReclaimFailed: true } : {}),
       };
     });
   }
@@ -666,7 +808,7 @@ export class BrokerStore {
    * mcp-role only (a hook must not rename). All in one transaction so a failure
    * leaves the prior name binding intact.
    */
-  renameSession(auth: SessionAuthority, rawName: string): SessionNameStatus {
+  renameSession(auth: SessionAuthority, rawName: string): SessionNameStatus & { ownerSecret?: string | null } {
     if (auth.role !== ComponentRole.MCP) {
       throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'only the mcp component may name/rename a session');
     }
@@ -718,8 +860,12 @@ export class BrokerStore {
         this.upsertAutomaticAliasSafe(automaticAlias(auth.sessionId), auth.sessionId, now);
       }
       this.refreshMeaningfulActivity(auth.sessionId, now); // now applies (expired_at cleared above)
+      // Beta.8 (ADR 0027): mirror the (re)named identity into name_ownership — the durable name
+      // authority — in the same transaction; mint a stable owner secret on first protected award
+      // (reused, not rotated, on subsequent renames so the client cannot be self-locked-out).
+      const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
       this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
-      return { state: 'active', name: norm.display };
+      return { state: 'active', name: norm.display, ownerSecret };
     });
   }
 

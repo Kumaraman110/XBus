@@ -494,6 +494,10 @@ export class BrokerDaemon {
       // name (active) or falls to pending_name; never fails registration over it.
       ...(p.requestedSessionName !== undefined ? { requestedSessionName: p.requestedSessionName } : {}),
       ...(p.agentType !== undefined ? { agentType: p.agentType } : {}),
+      // Beta.8 (ADR 0027): an ownership proof to reclaim a prior durable identity's name+inbox
+      // under a NEW Claude Code session id. Untrusted string; the store gates it (secret match
+      // + liveness). Type-checked here to avoid a raw bind error.
+      ...(typeof p.ownerSecret === 'string' ? { ownerSecret: p.ownerSecret } : {}),
     });
     this.connAuth.set(conn.id, auth);
     // Composition (ADR 0012 §5 + PR #4): the register ack carries THREE additive,
@@ -511,6 +515,13 @@ export class BrokerDaemon {
       role: auth.role, epoch: auth.epoch, generation: auth.generation,
       ...(auth.sessionNameState !== undefined ? { sessionNameState: auth.sessionNameState } : {}),
       ...(auth.awardedSessionName != null ? { awardedSessionName: auth.awardedSessionName } : {}),
+      // Beta.8 (ADR 0027): the durable logical identity + a freshly-minted ownership secret
+      // (present ONLY on a new protected name award / successful reclaim — the client persists
+      // it to reclaim later) + a reclaim-failed flag. The secret travels ONLY on this ack field;
+      // it is never written to the audit/ledger (only its sha256 hash is stored broker-side).
+      ...(auth.logicalIdentityId !== undefined ? { logicalIdentityId: auth.logicalIdentityId } : {}),
+      ...(auth.ownerSecret != null ? { ownerSecret: auth.ownerSecret } : {}),
+      ...(auth.nameReclaimFailed ? { nameReclaimFailed: true } : {}),
     };
     if (enforcement) {
       this.connAwarded.set(conn.id, enforcement.awarded);
@@ -563,7 +574,13 @@ export class BrokerDaemon {
     const auth = this.requireAuth(conn);
     const p = (frame.payload ?? {}) as { name?: string };
     const r = this.store.renameSession(auth, p.name as string);
-    this.reply(conn, 'rename_session_ack', { name: r.name, sessionNameState: r.state }, frame.requestId);
+    this.reply(conn, 'rename_session_ack', {
+      name: r.name, sessionNameState: r.state,
+      // Beta.8 (ADR 0027): a freshly-minted ownership secret is returned ONLY on the first
+      // protected award for this identity (reused, not rotated, on later renames). The client
+      // persists it to reclaim the name+inbox after a session-id change.
+      ...(r.ownerSecret != null ? { ownerSecret: r.ownerSecret } : {}),
+    }, frame.requestId);
   }
 
   private onRegisterAlias(conn: ServerConn, frame: Frame): void {

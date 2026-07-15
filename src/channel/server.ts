@@ -61,6 +61,9 @@ export function main(): void {
     endpoint,
     rootSecret,
     agentType,
+    // Beta.8 (ADR 0027): the ACL-protected data dir where the durable-identity ownership
+    // secret is persisted, so a NEW session id can reclaim this name + inbox automatically.
+    dataDir,
     ...(suggestion !== null ? { requestedSessionName: suggestion } : {}),
     // Zero-friction: auto-start the broker if none is running (race-safe, degraded-
     // tolerant). A failure is non-fatal — the MCP connect will surface a clean error.

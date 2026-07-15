@@ -12,8 +12,8 @@ export const PROTOCOL_VERSION = 1 as const;
 /** Minimum protocol version this build can still talk to. */
 export const MIN_SUPPORTED_PROTOCOL_VERSION = 1 as const;
 
-/** XBus product version (kept in sync with package.json at build time). */
-export const XBUS_VERSION = '0.1.0-beta.7' as const;
+/** AgenTel (formerly XBus) product version (kept in sync with package.json at build time). */
+export const XBUS_VERSION = '0.1.0-beta.8' as const;
 
 /**
  * Decide whether a peer's advertised protocol version is acceptable.

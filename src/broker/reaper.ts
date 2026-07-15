@@ -152,6 +152,11 @@ export class Reaper {
       if (res.changes === 0) continue; // already expired by a concurrent/earlier pass
       // Release any live alias rows (name returns to the pool for reuse).
       this.db.prepare(`UPDATE aliases SET active=0, retired_at=? WHERE session_id=? AND active=1`).run(now, s.session_id);
+      // Beta.8 (ADR 0027): release the durable name-ownership row in the SAME sweep so the two
+      // name representations never diverge (no orphan 'active' name_ownership blocking reuse).
+      // The owner_secret_hash is preserved (a released identity keeps its secret) — only the
+      // routing (normalized_name/state) is cleared, matching the sessions-row retire above.
+      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, updated_at=? WHERE current_session_id=? AND name_state IN ('active','pending')`).run(now, s.session_id);
       // Dead-letter EVERY non-terminal delivery to this tombstoned recipient —
       // queued, retry_wait AND transport_written (see the transport_written rationale
       // in the doc-comment). Clearing lease_expires_at makes the terminal rows

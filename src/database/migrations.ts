@@ -681,6 +681,78 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX idx_schedule_runs_slot ON schedule_runs(state, scheduled_for);
     `,
   },
+  {
+    version: 10,
+    name: 'durable_logical_identity_and_name_ownership',
+    sql: `
+      -- ADR 0027 (beta.8): durable logical identity + secret-gated, liveness-gated name
+      -- reclaim across a NEW Claude Code session id (fork / clear / compact / crash-recreate).
+      -- ALL ADDITIVE. Moves SCHEMA_VERSION 9 -> 10, so the wire tuple becomes xbus-p1-stp1-s10
+      -- (protocol + STP frozen at 1). Fail-closed: an s9 (beta.7) component meeting a v10 broker
+      -- is rejected 'upgrade_component' at the handshake; beta.8 is a controlled whole-install
+      -- upgrade (ADR 0019). No ledger table is touched (append-only triggers preserved). No
+      -- existing row is destroyed; every backfill is INSERT/ADD-COLUMN/UPDATE on non-ledger data.
+
+      -- ===== The durable logical identity of a session =====
+      -- Every session gains a logical_identity_id. For an existing (beta.7) session it IS its
+      -- own session_id (each physical session becomes its own logical identity — no historical
+      -- grouping exists, so this is exact and lossless). New sessions mint a fresh id at
+      -- register unless a reclaim proof matches an existing identity, in which case the
+      -- successor is REDIRECTED onto the canonical session_id (see physical_session_map) and
+      -- flows through the existing supersede path — the inbox is NEVER moved or re-keyed.
+      ALTER TABLE sessions ADD COLUMN logical_identity_id TEXT;
+      UPDATE sessions SET logical_identity_id = session_id WHERE logical_identity_id IS NULL;
+      CREATE INDEX idx_sessions_logical ON sessions(logical_identity_id);
+
+      -- ===== physical_session_map: NEW Claude session id -> canonical (durable) session id =====
+      -- When a successor reclaims, its NEW physical CC session id is recorded here pointing at
+      -- the canonical session_id that owns the inbox. register() consults this map FIRST and
+      -- routes the registration to the canonical id (reusing the tested supersede path). A
+      -- fresh session with no reclaim has no row here and is its own canonical id.
+      CREATE TABLE physical_session_map (
+        physical_session_id TEXT PRIMARY KEY,   -- the NEW Claude Code session id the successor presented
+        canonical_session_id TEXT NOT NULL,     -- the durable session_id that owns name + inbox
+        logical_identity_id  TEXT NOT NULL,
+        created_at           TEXT NOT NULL
+      );
+      CREATE INDEX idx_physmap_canonical ON physical_session_map(canonical_session_id);
+
+      -- ===== name_ownership: the SINGLE authority for a routable session NAME =====
+      -- Keyed by logical_identity_id (the durable identity), NOT session_id. Carries the
+      -- ownership secret hash (broker-minted; NULL = legacy-unprotected, exact beta.7 semantics)
+      -- and the current canonical session_id the name routes to. resolveRecipient /
+      -- claimNameForRegister / renameSession / the reaper all treat this as the source of truth;
+      -- the sessions.session_name columns are a strict same-transaction projection (1:1, cannot
+      -- diverge). name_state mirrors the sessions name lifecycle {active,pending,released}.
+      CREATE TABLE name_ownership (
+        logical_identity_id TEXT PRIMARY KEY,
+        normalized_name     TEXT,
+        display_name        TEXT,
+        owner_secret_hash   TEXT,               -- sha256(secret); NULL = legacy-unprotected
+        name_state          TEXT NOT NULL,       -- 'active' | 'pending' | 'released'
+        current_session_id  TEXT,
+        superseded_at       TEXT,
+        created_at          TEXT NOT NULL,
+        updated_at          TEXT NOT NULL
+      );
+      -- Mirrors ux_session_name_active (migrations.ts, v6): a name is locked while active/pending.
+      CREATE UNIQUE INDEX ux_name_ownership_active ON name_ownership(normalized_name)
+        WHERE normalized_name IS NOT NULL AND name_state IN ('active','pending');
+
+      -- REQUIRED backfill (else every name a beta.7 DB already holds is un-reclaimable, and the
+      -- two name representations diverge from first boot). One row per session currently holding
+      -- a name. owner_secret_hash NULL => legacy-unprotected (beta.7 first-writer-wins preserved
+      -- until a client opts in with a secret). Lossless: ux_session_name_active already
+      -- guarantees the source names are unique across active/pending.
+      INSERT INTO name_ownership
+        (logical_identity_id, normalized_name, display_name, owner_secret_hash,
+         name_state, current_session_id, created_at, updated_at)
+      SELECT logical_identity_id, normalized_session_name, session_name, NULL,
+             session_name_state, session_id, created_at, updated_at
+      FROM sessions
+      WHERE normalized_session_name IS NOT NULL AND session_name_state IN ('active','pending');
+    `,
+  },
 ];
 
 function checksum(sql: string): string {

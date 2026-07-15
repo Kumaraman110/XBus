@@ -16,6 +16,8 @@ import { XBUS_VERSION } from '../protocol/version.js';
 import { buildChannelInstructions } from './instructions.js';
 import { doHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
+import { normalizeSessionName } from '../identity/session-name.js';
+import { loadOwnerSecret, saveOwnerSecret } from './owner-secret-store.js';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -41,6 +43,10 @@ export interface McpServerDeps {
   /** Beta.4: ensure a broker is running before connecting (zero-friction
    *  auto-start). Injected so tests can stub it; defaults to a no-op. */
   ensureBroker?: () => Promise<void>;
+  /** Beta.8 (ADR 0027): the ACL-protected data dir where the durable-identity ownership
+   *  secret is persisted (so a new session id can reclaim the name+inbox). Optional — when
+   *  absent, reclaim persistence is skipped (a fresh first-claim still works). */
+  dataDir?: string;
   write: (line: string) => void;
   log?: (line: string) => void;
 }
@@ -152,7 +158,16 @@ export class McpServer {
     this.client.onClose(() => { this.connected = false; });
     await this.client.connect();
     await doHello(this.client, ComponentRole.MCP);
-    await this.client.request('register_session', {
+    // Beta.8 (ADR 0027): if we've previously been awarded this name and persisted its owner
+    // secret, present it so a NEW Claude Code session id reclaims the durable identity's
+    // name + inbox automatically (no manual resend). Best-effort: a missing secret just means
+    // a normal first-claim. Anchor = project_id + normalized requested name.
+    let ownerSecret: string | undefined;
+    if (this.deps.dataDir !== undefined && this.deps.requestedSessionName !== undefined) {
+      try { ownerSecret = loadOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(this.deps.requestedSessionName)); }
+      catch { /* invalid name / IO — skip reclaim */ }
+    }
+    const ack = await this.client.request('register_session', {
       sessionId: this.deps.sessionId,
       instanceId: this.deps.instanceId,
       processId: process.pid,
@@ -166,7 +181,16 @@ export class McpServer {
       // ignore the extra fields).
       ...(this.deps.requestedSessionName !== undefined ? { requestedSessionName: this.deps.requestedSessionName } : {}),
       ...(this.deps.agentType !== undefined ? { agentType: this.deps.agentType } : {}),
+      ...(ownerSecret !== undefined ? { ownerSecret } : {}),
     });
+    // Beta.8: persist a freshly-minted owner secret (returned only on a new protected award /
+    // successful reclaim) so future session ids can reclaim. Never logged.
+    try {
+      const p = (ack.payload ?? {}) as { ownerSecret?: string; awardedSessionName?: string; logicalIdentityId?: string };
+      if (this.deps.dataDir !== undefined && typeof p.ownerSecret === 'string' && typeof p.awardedSessionName === 'string') {
+        saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.awardedSessionName), p.ownerSecret, p.logicalIdentityId, new Date().toISOString());
+      }
+    } catch { /* best-effort persistence */ }
     // §2: the MCP server is the component that can ack/reply, so once it has
     // registered the session can take delivery. Signal readiness explicitly with
     // concrete capability hints — the broker derives ready_checkpoint (Bedrock).
@@ -267,6 +291,15 @@ export class McpServer {
       }
       case 'xbus_rename': {
         const f = await this.client.request('rename_session', args);
+        // Beta.8 (ADR 0027): a rename can mint the first owner secret for this identity —
+        // persist it (keyed by project_id + the new normalized name) so the name is
+        // reclaimable after a session-id change. Best-effort; never logged.
+        try {
+          const p = (f.payload ?? {}) as { ownerSecret?: string; name?: string };
+          if (this.deps.dataDir !== undefined && typeof p.ownerSecret === 'string' && typeof p.name === 'string') {
+            saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.name), p.ownerSecret, this.deps.sessionId, new Date().toISOString());
+          }
+        } catch { /* best-effort */ }
         return this.unwrap(f);
       }
       case 'xbus_status': {

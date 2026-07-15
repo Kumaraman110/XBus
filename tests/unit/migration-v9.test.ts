@@ -46,10 +46,11 @@ function insertLegacySession(db: SqliteDriver, id: string, now: string): void {
 }
 
 describe('migration v9 — schema/version bump', () => {
-  it('the global schema is exactly 9 and the wire tuple is xbus-p1-stp1-s9', () => {
-    expect(SCHEMA_VERSION).toBe(9);
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s9');
+  it('the v9 migration still exists (session titles + lifecycle + scheduling)', () => {
+    // beta.8 (ADR 0027) added migration v10, so the HEAD schema is now 10 (see migration-v10
+    // test). v9 remains a real, applied migration — assert it is present and unchanged.
     expect(MIGRATIONS.some((m) => m.version === 9 && m.name === 'session_titles_lifecycle_and_scheduling')).toBe(true);
+    expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(9);
   });
 
   it('applying up to v9 on a fresh DB creates the schedule tables + session columns', () => {
@@ -95,7 +96,8 @@ describe('migration v9 — 8→9 on a populated DB', () => {
     db.close();
     const db2 = openDatabase(p, { applyPragmas: true });
     const r = runMigrations(db2, now);
-    expect(r.appliedNow).toEqual([9]);
+    // beta.8 added v10, so a v8 DB now forward-migrates through 9 AND 10 to head — both additive.
+    expect(r.appliedNow).toEqual([9, 10]);
     expect((db2.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c).toBe(before);
     const row = db2.prepare('SELECT claude_title, claude_title_source, managed_by_xbus, pinned, archived FROM sessions WHERE session_id=?').get('aaaa9999-0000-4000-8000-000000000009') as { claude_title: string | null; claude_title_source: string | null; managed_by_xbus: number; pinned: number; archived: number };
     expect(row.claude_title).toBeNull();
@@ -106,16 +108,19 @@ describe('migration v9 — 8→9 on a populated DB', () => {
     db2.close();
   });
 
-  it('the 8→9 migration is idempotent-safe (re-run applies nothing, checksum verified)', () => {
+  it('migrations are idempotent-safe (re-run applies nothing, checksum verified)', () => {
     const { db, path: p } = freshDb();
     const now = '2026-01-01T00:00:00.000Z';
-    runMigrations(db, now);
-    expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(9);
+    const first = runMigrations(db, now);
+    // Head is the current SCHEMA_VERSION (10 as of beta.8); the point of this test is the
+    // idempotent RE-RUN, not the exact head number.
+    expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(SCHEMA_VERSION);
+    expect(first.currentVersion).toBe(SCHEMA_VERSION);
     db.close();
     const db2 = openDatabase(p, { applyPragmas: true });
     const r = runMigrations(db2, now);
     expect(r.appliedNow).toEqual([]);
-    expect(r.currentVersion).toBe(9);
+    expect(r.currentVersion).toBe(SCHEMA_VERSION);
     db2.close();
   });
 });
