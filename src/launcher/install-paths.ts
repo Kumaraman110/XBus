@@ -8,10 +8,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { readConfigEnv } from '../shared/env-config.js';
 
-/** Default user-scope install root: ~/.claude/xbus-install (NOT the data dir). */
+/** Default user-scope install root: ~/.claude/xbus-install (NOT the data dir). The env
+ *  OVERRIDE accepts AGENTEL_INSTALL_ROOT (primary) or XBUS_INSTALL_ROOT (deprecated alias);
+ *  the on-disk DEFAULT path keeps its `xbus-install` name so existing installs never strand
+ *  (ADR 0028 Category B: on-disk layout preserved). */
 export function defaultInstallRoot(): string {
-  return process.env.XBUS_INSTALL_ROOT ?? path.join(os.homedir(), '.claude', 'xbus-install');
+  return readConfigEnv('INSTALL_ROOT') ?? path.join(os.homedir(), '.claude', 'xbus-install');
 }
 
 export function manifestPath(installRoot: string): string {
@@ -80,7 +84,8 @@ export function defaultDataDir(): string {
  * Claude session started via `xclaude` resolves the same root deterministically.
  */
 export function resolveDataDir(): string {
-  if (process.env.XBUS_DATA_DIR) return process.env.XBUS_DATA_DIR;
+  const envOverride = readConfigEnv('DATA_DIR'); // AGENTEL_DATA_DIR (primary) | XBUS_DATA_DIR (alias)
+  if (envOverride) return envOverride;
   const manifest = readInstallManifest(defaultInstallRoot());
   if (manifest?.dataDir) return manifest.dataDir;
   return defaultDataDir();

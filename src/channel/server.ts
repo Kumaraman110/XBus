@@ -13,6 +13,7 @@ import { computeProjectId, deriveWorkspaceSuggestion } from '../identity/project
 import { suggestSessionName } from '../identity/session-name.js';
 import { ensureBrokerDefault } from '../broker/ensure.js';
 import { resolveDataDir as resolveCanonicalDataDir } from '../launcher/install-paths.js';
+import { readConfigEnv } from '../shared/env-config.js';
 
 /**
  * The MCP server resolves the SINGLE canonical data root (env override →
@@ -46,11 +47,11 @@ export function main(): void {
     process.exit(0);
   }
   const projectId = computeProjectId(cwd);
-  const agentType = process.env.XBUS_AGENT_TYPE ?? 'claude';
+  const agentType = readConfigEnv('AGENT_TYPE') ?? 'claude';
   // Beta.4 (ADR 0012 D3): derive a suggested session name from the workspace
   // (git repo / dir / agent+project). The broker awards it if valid+unclaimed,
   // else the session enters pending_name and the model is prompted to choose one.
-  const savedName = process.env.XBUS_SESSION_NAME; // explicit override / saved pref
+  const savedName = readConfigEnv('SESSION_NAME'); // explicit override / saved pref (AGENTEL_/XBUS_)
   const suggestion = suggestSessionName(deriveWorkspaceSuggestion(cwd, { agentType, projectId, ...(savedName !== undefined ? { savedName } : {}) }));
 
   const server = new McpServer({

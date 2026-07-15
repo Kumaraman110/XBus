@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { readInstallManifest, defaultInstallRoot, resolveDataDir } from './install-paths.js';
+import { readConfigEnv } from '../shared/env-config.js';
 import { assertSupportedNode } from '../shared/node-support.js';
 import { resolveClaudeExecutable, isResolved } from './resolve-claude.js';
 
@@ -30,18 +31,19 @@ function fail(msg: string): never {
 
 function resolvePluginDir(): string {
   // Prefer an explicit override (testing / non-default installs).
-  const override = process.env.XBUS_PLUGIN_DIR;
+  // AGENTEL_PLUGIN_DIR (primary) | XBUS_PLUGIN_DIR (deprecated alias) — ADR 0028.
+  const override = readConfigEnv('PLUGIN_DIR');
   if (override) {
     if (!fs.existsSync(path.join(override, '.claude-plugin', 'plugin.json'))) {
-      fail(`XBUS_PLUGIN_DIR=${override} does not contain a .claude-plugin/plugin.json`);
+      fail(`AGENTEL_PLUGIN_DIR/XBUS_PLUGIN_DIR=${override} does not contain a .claude-plugin/plugin.json`);
     }
     return override;
   }
-  // Otherwise read the install manifest written by `xbus install`.
+  // Otherwise read the install manifest written by `agentel install` (alias: `xbus install`).
   const root = defaultInstallRoot();
   const manifest = readInstallManifest(root);
   if (!manifest) {
-    fail(`XBus is not installed (no manifest under ${root}).\n  Run: node <checkout>/dist/cli/main.js install  (install is PATH-free; there is no global 'xbus' command)\n  Or set XBUS_PLUGIN_DIR to a plugin directory.`);
+    fail(`AgenTel is not installed (no manifest under ${root}).\n  Run: node <checkout>/dist/cli/main.js install  (install is PATH-free; there is no global 'agentel' command)\n  Or set AGENTEL_PLUGIN_DIR to a plugin directory.`);
   }
   const pluginDir = manifest.pluginDir;
   if (!fs.existsSync(path.join(pluginDir, '.claude-plugin', 'plugin.json'))) {
@@ -138,6 +140,11 @@ function main(): void {
 // Run only as the CLI entry (argv[1] is the compiled launcher).
 if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('launcher/xclaude.js')) {
   assertSupportedNode(); // §8: actionable unsupported-Node error before spawning anything
+  // Beta.8 (ADR 0028): `xclaude` is a DEPRECATED alias of the primary `agenclaude` launcher,
+  // kept functional for >=2 releases. If invoked via the legacy bin name, print a one-line note.
+  if (/[\\/]xclaude(\.(cmd|exe|ps1))?$/i.test(process.argv[1] ?? '')) {
+    process.stderr.write("[agentel] note: 'xclaude' is a deprecated alias of 'agenclaude'; use 'agenclaude'.\n");
+  }
   main();
 }
 

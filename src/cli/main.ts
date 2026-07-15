@@ -22,6 +22,7 @@ import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../laun
 import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, inspectUserScopeHooks } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
+import { readConfigEnv } from '../shared/env-config.js';
 import { bundledNodePath, hasBundledRuntime, BUNDLED_NODE_VERSION } from '../shared/bundled-runtime.js';
 import { dashboardAlive } from '../broker/dashboard/browser.js';
 
@@ -449,8 +450,9 @@ async function cmdStart(): Promise<CliResult> {
   // dormant import. Both are best-effort inside the host (a failure never fails broker start,
   // I5), so turning them on here cannot regress messaging. Opt-OUT via env for constrained
   // environments (headless CI that only needs messaging), never opt-in-for-tests.
-  const dashboardOff = process.env.XBUS_DASHBOARD === '0' || process.env.XBUS_NO_DASHBOARD === '1';
-  const importOff = process.env.XBUS_IMPORT_DORMANT === '0';
+  // AGENTEL_* primary, XBUS_* deprecated alias (ADR 0028 Category C).
+  const dashboardOff = readConfigEnv('DASHBOARD') === '0' || readConfigEnv('NO_DASHBOARD') === '1';
+  const importOff = readConfigEnv('IMPORT_DORMANT') === '0';
   const broker = await startBrokerHost({
     dataDir: dir,
     onStopped: () => process.exit(0),
@@ -712,5 +714,11 @@ if (process.argv[1] && process.argv[1].endsWith('main.js')) {
   // §8: fail fast with an actionable message on an unsupported Node, BEFORE any
   // install/broker machinery runs (rather than failing deep inside it).
   assertSupportedNode();
+  // Beta.8 (ADR 0028): `xbus` is a DEPRECATED alias of the primary `agentel` command, kept
+  // functional for >=2 releases. If invoked via the legacy bin name, print a one-line note
+  // (stderr, never blocks) then behave identically.
+  if (/[\\/]xbus(\.(cmd|exe|ps1))?$/i.test(process.argv[1] ?? '')) {
+    process.stderr.write("[agentel] note: 'xbus' is a deprecated alias of 'agentel' and will be removed in a future release; use 'agentel'.\n");
+  }
   void run(process.argv.slice(2));
 }

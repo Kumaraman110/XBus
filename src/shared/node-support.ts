@@ -62,8 +62,9 @@ export function assertSupportedNode(opts: { version?: string; exit?: (code: numb
   const exit = opts.exit ?? ((code: number) => process.exit(code));
   const support = evaluateNodeSupport(version);
   if (support.ok) return support;
-  if (process.env.XBUS_ALLOW_UNSUPPORTED_NODE === '1') {
-    warn(`[xbus] WARNING (unsupported Node bypassed via XBUS_ALLOW_UNSUPPORTED_NODE): ${support.message}`);
+  // AGENTEL_ALLOW_UNSUPPORTED_NODE (primary) | XBUS_ALLOW_UNSUPPORTED_NODE (alias) — ADR 0028.
+  if (process.env.AGENTEL_ALLOW_UNSUPPORTED_NODE === '1' || process.env.XBUS_ALLOW_UNSUPPORTED_NODE === '1') {
+    warn(`[agentel] WARNING (unsupported Node bypassed via AGENTEL_ALLOW_UNSUPPORTED_NODE): ${support.message}`);
     return support;
   }
   warn(`[xbus] ${support.message}`);
