@@ -37,6 +37,9 @@ export const PLUGIN_PAYLOAD_FILES = [
   'dist/broker/dashboard/static/app.js',
   'dist/broker/dashboard/static/style.css',
   'dist/broker/dashboard/static/theme.js', // beta.7 light/dark theme switch (inert; CSP-safe)
+  'dist/broker/dashboard/static/fonts/fraunces.woff2',     // beta.7 self-hosted display font (SIL OFL)
+  'dist/broker/dashboard/static/fonts/sora.woff2',         // beta.7 self-hosted UI font (SIL OFL)
+  'dist/broker/dashboard/static/fonts/jetbrains-mono.woff2', // beta.7 self-hosted mono/telemetry font (SIL OFL)
   'package.json',                 // runtime manifest (bin + deps + engines)
   'provenance.json',              // exact build identity, read at runtime (see ADR 0011)
 ] as const;
