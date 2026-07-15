@@ -149,6 +149,37 @@ function renderSessions(sessions) {
   if (note) { note.textContent = hiddenCount > 0 && !showInternal ? hiddenCount + ' internal session(s) hidden' : ''; }
   renderSessionSelect(sessions);
 }
+/* Hero + KPI band: live counts derived from the same authenticated payloads the table
+ * uses (no new endpoint, no client-set state). Active = all sessions; visible/internal
+ * split via isInternal; queued/failed = sums across delivery counts; audit from /api/audit. */
+function renderHeroKpis(sessions, audit) {
+  const list = sessions || [];
+  const total = list.length;
+  const internal = list.filter((s) => isInternal(s)).length;
+  const visible = total - internal;
+  let queued = 0, failed = 0;
+  for (const s of list) { const d = s.delivery || {}; queued += d.queued || 0; failed += d.failed || 0; }
+  const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+  set('hero-count', String(total));
+  set('hero-noun', total === 1 ? 'session' : 'sessions');
+  const auditOk = audit ? audit.ok : null;
+  const caption = document.getElementById('hero-caption');
+  if (caption) {
+    caption.textContent = total === 0
+      ? 'No Claude Code sessions on the bus yet.'
+      : 'on one bus — ' + queued + ' queued for delivery, ' + failed + ' failed'
+        + (auditOk === true ? ', and an audit chain that verifies itself end-to-end.' : (auditOk === false ? ', and an audit chain that needs attention.' : '.'));
+  }
+  set('kpi-active', String(total));
+  set('kpi-active-sub', visible + ' visible · ' + internal + ' internal');
+  set('kpi-queued', String(queued));
+  set('kpi-failed', String(failed));
+  // KPI accent: the Failed tile turns warning when non-zero.
+  const failTile = document.getElementById('kpi-failed'); if (failTile && failTile.parentElement) failTile.parentElement.classList.toggle('kpi-alert', failed > 0);
+  set('kpi-audit', auditOk === true ? 'OK' : auditOk === false ? 'BROKEN' : '—');
+  set('kpi-audit-sub', audit && typeof audit.checked === 'number' ? audit.checked + ' verified · hash-linked' : 'hash-linked');
+  const auditTile = document.getElementById('kpi-audit'); if (auditTile && auditTile.parentElement) auditTile.parentElement.classList.toggle('kpi-alert', auditOk === false);
+}
 function renderAudit(a) {
   const elx = document.getElementById('audit');
   if (!a) { elx.textContent = ''; elx.className = 'audit'; return; }
@@ -389,7 +420,9 @@ async function refresh() {
     api('/api/audit').catch(() => null),
     api('/api/threads').catch(() => ({ threads: [] })),
   ]);
+  window.__audit = audit || null; // cache for the stream path (sessions events carry no audit)
   renderSessions(sessions);
+  renderHeroKpis(sessions, audit);
   renderLedger(ledger.events || []);
   if (banner) renderBanner(banner);
   renderAudit(audit);
@@ -415,7 +448,7 @@ async function stream() {
         if (!line.trim()) continue;
         try {
           const evt = JSON.parse(line);
-          if (evt.type === 'sessions') renderSessions(evt.sessions);
+          if (evt.type === 'sessions') { renderSessions(evt.sessions); renderHeroKpis(evt.sessions, window.__audit); }
           else if (evt.type === 'threads') { renderThreadList(evt.threads || []); if (consoleState.selectedThreadId) void loadThreadQuiet(consoleState.selectedThreadId); }
         } catch { /* ignore a partial line */ }
       }

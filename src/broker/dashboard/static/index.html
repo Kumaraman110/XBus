@@ -11,16 +11,41 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <div class="masthead">
-      <h1>XBus <span class="tag">communication console</span></h1>
+  <div class="wrap">
+  <!-- topbar: brand mark + connection status + operator chip + theme toggle -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"></circle><circle cx="18" cy="6" r="2.4"></circle><circle cx="12" cy="18" r="2.4"></circle><path d="M6 8.4v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3M12 13.4v2.2"></path></svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-name">XBus <span class="tag">communication console</span></div>
+        <p id="status" class="status">Connecting…</p>
+      </div>
+    </div>
+    <div class="top-right">
+      <span class="chip">operator · local-operator</span>
       <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle light/dark theme" title="Toggle light/dark theme">
         <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>
         <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>
       </button>
     </div>
-    <p id="status" class="status">Connecting…</p>
   </header>
+
+  <!-- hero + KPI band (populated by app.js from live counts; static fallback text below) -->
+  <section class="hero" aria-label="Overview">
+    <div class="hero-eyebrow">Communication Console · Live</div>
+    <div class="hero-line">
+      <div class="hero-figure"><b id="hero-count">—</b> <span id="hero-noun">sessions</span></div>
+      <p id="hero-caption" class="hero-caption">Every Claude Code session on this machine, speaking on one bus.</p>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi"><div class="kpi-label">Active sessions</div><div class="kpi-val" id="kpi-active">—</div><div class="kpi-sub" id="kpi-active-sub">&nbsp;</div></div>
+      <div class="kpi kpi-q"><div class="kpi-label">Queued</div><div class="kpi-val" id="kpi-queued">—</div><div class="kpi-sub">awaiting delivery</div></div>
+      <div class="kpi"><div class="kpi-label">Failed</div><div class="kpi-val" id="kpi-failed">—</div><div class="kpi-sub">delivery errors</div></div>
+      <div class="kpi kpi-ok"><div class="kpi-label">Audit chain</div><div class="kpi-val" id="kpi-audit">—</div><div class="kpi-sub" id="kpi-audit-sub">hash-linked</div></div>
+    </div>
+  </section>
 
   <section id="banner" class="banner" hidden></section>
   <section id="audit" class="audit"></section>
@@ -102,6 +127,7 @@
       <tbody id="ledger-body"><tr><td colspan="5">Loading…</td></tr></tbody>
     </table>
   </main>
+  </div>
 
   <script src="/app.js"></script>
 </body>
