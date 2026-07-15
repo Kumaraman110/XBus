@@ -70,13 +70,13 @@ describe('build-identity model', () => {
     expect(STP_VERSION).toBe(1);
     expect(SECURE_TRANSPORT_VERSION).toBe(STP_VERSION);
     // The wire-bound compatibility value is the STABLE tuple, not the product
-    // version. Beta.7 Phase 3's migration v9 moved the SCHEMA component 8 -> 9
-    // (ADR 0019, a deliberate fail-closed bump; beta.6's v8 had moved 7 -> 8);
-    // protocol + STP are still 1, so the wire BYTES/key-schedule are unchanged —
-    // only the schema integer in the tuple moves.
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s9');
+    // version. Beta.8's migration v10 moved the SCHEMA component 9 -> 10 (ADR 0027
+    // durable logical identity, a deliberate fail-closed bump; beta.7's v9 had moved
+    // 8 -> 9); protocol + STP are still 1, so the wire BYTES/key-schedule are
+    // unchanged — only the schema integer in the tuple moves.
+    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s10');
     expect(WIRE_COMPATIBILITY_ID).toBe(compatibilityId(SCHEMA_VERSION));
-    expect(SCHEMA_VERSION).toBe(9);
+    expect(SCHEMA_VERSION).toBe(10);
     // The pure arithmetic for OLD schemas is unchanged (version-independent fn).
     expect(compatibilityId(5)).toBe('xbus-p1-stp1-s5');
     expect(compatibilityId(6)).toBe('xbus-p1-stp1-s6');
