@@ -19,7 +19,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"></circle><circle cx="18" cy="6" r="2.4"></circle><circle cx="12" cy="18" r="2.4"></circle><path d="M6 8.4v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3M12 13.4v2.2"></path></svg>
       </div>
       <div class="brand-text">
-        <div class="brand-name">XBus <span class="tag">communication console</span></div>
+        <div class="brand-name">XBus</div>
         <p id="status" class="status">Connecting…</p>
       </div>
     </div>
@@ -48,15 +48,15 @@
   </section>
 
   <section id="banner" class="banner" hidden></section>
-  <section id="audit" class="audit"></section>
 
   <main>
     <!-- Communication console (beta.6 Phase 2): operator ↔ session threads. -->
+    <div class="sec-head"><h2>Console</h2><span class="sec-note">operator ↔ session threads</span></div>
     <section class="console">
       <div class="console-grid">
         <!-- Left: thread list + "new thread" composer target. -->
         <aside class="threads-pane">
-          <h2>Threads</h2>
+          <h2 class="pane-label">Threads</h2>
           <div class="new-thread">
             <label class="field">
               <span>New thread to</span>
@@ -93,13 +93,8 @@
       </div>
     </section>
 
+    <div class="sec-head"><h2 id="sessions-heading">Sessions</h2><span class="sec-note">delivery state by session</span></div>
     <section class="sessions-section" aria-labelledby="sessions-heading">
-      <div class="section-head">
-        <h2 id="sessions-heading">Sessions</h2>
-        <label class="toggle">
-          <input type="checkbox" id="show-internal"> <span>Internal sessions</span>
-        </label>
-      </div>
       <div class="table-scroll">
         <table id="sessions">
           <thead>
@@ -111,21 +106,37 @@
               <th scope="col">ACK</th>
               <th scope="col">Replied</th>
               <th scope="col">Failed</th>
-              <th scope="col">Project</th>
               <th scope="col"><span class="sr-only">Details</span></th>
             </tr>
           </thead>
-          <tbody id="sessions-body"><tr><td colspan="9" class="state-cell">Loading…</td></tr></tbody>
+          <tbody id="sessions-body"><tr><td colspan="8" class="state-cell">Loading…</td></tr></tbody>
         </table>
       </div>
-      <p id="sessions-hidden-note" class="muted hidden-note" aria-live="polite"></p>
+      <div class="tbl-foot">
+        <label class="toggle">
+          <input type="checkbox" id="show-internal"> <span>Internal sessions</span>
+        </label>
+        <p id="sessions-hidden-note" class="muted hidden-note" aria-live="polite"></p>
+      </div>
     </section>
 
-    <h2>Audit ledger <span class="muted">(append-only, hash-chained)</span></h2>
-    <table id="ledger">
-      <thead><tr><th>#</th><th>Event</th><th>Actor</th><th>Subject</th><th>When</th></tr></thead>
-      <tbody id="ledger-body"><tr><td colspan="5">Loading…</td></tr></tbody>
-    </table>
+    <div class="cols-2">
+      <div>
+        <div class="sec-head"><h2>Audit ledger</h2><span class="sec-note">hash-chained</span></div>
+        <section id="ledger" class="ledger-panel">
+          <div id="audit" class="ledger-ok"></div>
+          <div id="ledger-body" class="ledger-rows"></div>
+        </section>
+      </div>
+      <div>
+        <div class="sec-head"><h2>States</h2><span class="sec-note">loading · empty · error</span></div>
+        <section class="states-panel">
+          <div class="spec"><h3>Loading</h3><div class="skel"></div><div class="skel s3"></div><div class="skel s2"></div></div>
+          <div class="spec"><h3>Empty</h3><div class="empty-ico">∅</div><div class="empty-txt">No threads yet. Select a session and start one.</div></div>
+          <div class="spec"><h3>Error</h3><div class="err-spec"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 8v5M12 16.5v.5"></path></svg> Lost contact — retrying…</div></div>
+        </section>
+      </div>
+    </div>
   </main>
   </div>
 

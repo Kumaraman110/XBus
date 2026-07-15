@@ -63,6 +63,12 @@ function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.appendChild(text(txt)); return e; }
 function cell(row, value) { const td = document.createElement('td'); td.appendChild(text(value)); row.appendChild(td); return td; }
 function hhmmss(iso) { return iso ? String(iso).slice(11, 19) : ''; }
+/** A 2-char monogram for the session avatar: initials of a hyphenated name, else first 2 chars. */
+function monogram(name) {
+  const parts = String(name || '').split(/[-_ ]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toLowerCase();
+  return String(name || '?').slice(0, 2).toLowerCase();
+}
 
 /* ── sessions table (beta.7: separate delivery columns, friendly status, internal filter) ── */
 
@@ -126,13 +132,20 @@ function renderSessions(sessions) {
   const hiddenCount = (sessions || []).length - shown.length;
   if (!shown.length) {
     const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
-    c.colSpan = 9; c.className = 'state-cell';
+    c.colSpan = 8; c.className = 'state-cell';
   } else for (const s of shown) {
     const r = document.createElement('tr');
     if (isInternal(s)) r.className = 'row-internal';
+    // Session cell: a monogram avatar + the name + a muted project/description subtitle
+    // (matches the locked mock — a plain two-line identity cell, not a bordered badge).
+    const nameStr = s.name || s.sessionId.slice(0, 8);
     const label = document.createElement('td');
-    const badge = el('span', 'badge badge-' + s.label); badge.appendChild(text(s.name || s.sessionId.slice(0, 8)));
-    label.appendChild(badge); r.appendChild(label);
+    const svc = el('div', 'svc');
+    const ico = el('span', 'svc-ico badge-' + s.label, monogram(nameStr)); // state class tints the avatar edge
+    const main = el('div', 'svc-main');
+    main.appendChild(el('span', 'svc-name', nameStr));
+    if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
+    svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
     const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
     const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
     deliveryCell(r, d.queued, 'queued');
@@ -140,13 +153,12 @@ function renderSessions(sessions) {
     deliveryCell(r, d.acknowledged, 'ack');
     deliveryCell(r, d.replied, 'replied');
     deliveryCell(r, d.failed, 'failed');
-    cell(r, s.project);
     detailsCell(r, s);
     body.appendChild(r);
   }
   // A muted footer note when internal sessions are hidden, so the filter is discoverable.
   const note = document.getElementById('sessions-hidden-note');
-  if (note) { note.textContent = hiddenCount > 0 && !showInternal ? hiddenCount + ' internal session(s) hidden' : ''; }
+  if (note) { note.textContent = hiddenCount > 0 && !showInternal ? hiddenCount + (hiddenCount === 1 ? ' internal session hidden' : ' internal sessions hidden') : ''; }
   renderSessionSelect(sessions);
 }
 /* Hero + KPI band: live counts derived from the same authenticated payloads the table
@@ -165,10 +177,16 @@ function renderHeroKpis(sessions, audit) {
   const auditOk = audit ? audit.ok : null;
   const caption = document.getElementById('hero-caption');
   if (caption) {
-    caption.textContent = total === 0
-      ? 'No Claude Code sessions on the bus yet.'
-      : 'on one bus — ' + queued + ' queued for delivery, ' + failed + ' failed'
-        + (auditOk === true ? ', and an audit chain that verifies itself end-to-end.' : (auditOk === false ? ', and an audit chain that needs attention.' : '.'));
+    caption.replaceChildren();
+    if (total === 0) { caption.appendChild(text('No Claude Code sessions on the bus yet.')); }
+    else {
+      caption.appendChild(text('on one bus. '));
+      caption.appendChild(el('strong', null, queued + (queued === 1 ? ' queued' : ' queued')));
+      caption.appendChild(text(' for delivery, '));
+      caption.appendChild(el('strong', null, failed + ' failed'));
+      caption.appendChild(text(auditOk === true ? ', and an audit chain that verifies itself end‑to‑end.'
+        : auditOk === false ? ', and an audit chain that needs attention.' : '.'));
+    }
   }
   set('kpi-active', String(total));
   set('kpi-active-sub', visible + ' visible · ' + internal + ' internal');
@@ -180,21 +198,55 @@ function renderHeroKpis(sessions, audit) {
   set('kpi-audit-sub', audit && typeof audit.checked === 'number' ? audit.checked + ' verified · hash-linked' : 'hash-linked');
   const auditTile = document.getElementById('kpi-audit'); if (auditTile && auditTile.parentElement) auditTile.parentElement.classList.toggle('kpi-alert', auditOk === false);
 }
+/** The concise chain-status pill inside the ledger card (green OK / red broken), with a
+ *  shield glyph — the verbose broker detail is conveyed via title for screen readers. */
 function renderAudit(a) {
   const elx = document.getElementById('audit');
-  if (!a) { elx.textContent = ''; elx.className = 'audit'; return; }
-  if (a.ok) { elx.className = 'audit audit-ok'; elx.textContent = `Audit ledger: chain OK (${a.checked} events verified${a.lastVerifiedAt ? ', last broker verify ' + a.lastVerifiedAt.slice(0, 19) : ''}).`; }
-  else { elx.className = 'audit audit-broken'; elx.textContent = `Audit ledger: CHAIN BROKEN at seq ${a.firstBreakSeq}. Historical audit integrity is compromised — routing/delivery are unaffected, but investigate the ledger.`; }
+  if (!elx) return;
+  elx.replaceChildren();
+  if (!a) { elx.className = 'ledger-ok'; return; }
+  const shield = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  shield.setAttribute('viewBox', '0 0 24 24'); shield.setAttribute('fill', 'none'); shield.setAttribute('stroke', 'currentColor');
+  shield.setAttribute('stroke-width', '2'); shield.setAttribute('stroke-linecap', 'round'); shield.setAttribute('aria-hidden', 'true');
+  const p1 = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p1.setAttribute('d', 'M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z'); shield.appendChild(p1);
+  if (a.ok) {
+    const p2 = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p2.setAttribute('d', 'M9 12l2 2 4-4'); shield.appendChild(p2);
+    elx.className = 'ledger-ok';
+    elx.appendChild(shield);
+    elx.appendChild(el('span', null, `Chain OK · ${a.checked} verified`));
+    elx.title = `Audit ledger: chain OK (${a.checked} events verified${a.lastVerifiedAt ? ', last broker verify ' + a.lastVerifiedAt.slice(0, 19) : ''}).`;
+  } else {
+    const p2 = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p2.setAttribute('d', 'M12 8v4M12 15.5v.5'); shield.appendChild(p2);
+    elx.className = 'ledger-ok ledger-broken';
+    elx.appendChild(shield);
+    elx.appendChild(el('span', null, `CHAIN BROKEN at seq ${a.firstBreakSeq}`));
+    elx.title = `Historical audit integrity is compromised — routing/delivery are unaffected, but investigate the ledger.`;
+  }
 }
+/** Compact ledger rows (mock: a 3-col grid per row — seq · "EVENT · actor" · truncated
+ *  hash + a green ok-dot). #ledger-body is a <div>, not a table. */
 function renderLedger(events) {
   const body = document.getElementById('ledger-body');
   body.replaceChildren();
-  if (!events.length) { const r = body.insertRow(); const c = cell(r, 'No events yet.'); c.colSpan = 5; return; }
+  if (!events.length) { body.appendChild(el('div', 'empty', 'No events yet.')); return; }
+  const shortHash = (e) => {
+    const h = e.subject && (e.subject.threadId || e.subject.sessionId);
+    if (!h) return '—';
+    const s = String(h);
+    return s.length > 8 ? s.slice(0, 4) + '…' + s.slice(-2) : s;
+  };
   for (const e of events) {
-    const r = document.createElement('tr');
-    cell(r, e.seq); cell(r, e.eventType); cell(r, e.actor);
-    cell(r, e.subject && (e.subject.threadId || e.subject.sessionId) ? String(e.subject.threadId || e.subject.sessionId).slice(0, 8) : '—');
-    cell(r, e.createdAt); body.appendChild(r);
+    const row = el('div', 'led-row');
+    row.appendChild(el('span', 'led-seq', '#' + String(e.seq).padStart(2, '0')));
+    const ev = el('div', 'led-ev');
+    ev.appendChild(text(e.eventType + ' · '));
+    ev.appendChild(el('b', null, e.actor));
+    row.appendChild(ev);
+    const hash = el('div', 'led-hash');
+    hash.appendChild(text(shortHash(e)));
+    hash.appendChild(el('span', 'ok-dot'));
+    row.appendChild(hash);
+    body.appendChild(row);
   }
 }
 function renderBanner(banner) {
@@ -428,7 +480,7 @@ async function refresh() {
   renderAudit(audit);
   renderThreadList(threads.threads || []);
   showError(null); // clear any prior error on a good refresh
-  setStatus('Connected · ' + sessions.length + ' session(s)', 'ok');
+  setStatus('Connected · ' + sessions.length + (sessions.length === 1 ? ' session' : ' sessions'), 'ok');
 }
 
 async function stream() {
