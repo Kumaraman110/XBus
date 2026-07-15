@@ -1,10 +1,42 @@
 # Changelog
 
-All notable changes to XBus are documented here. The format is based on
+All notable changes to AgenTel (formerly XBus) are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project is in
 pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
+
+## [0.1.0-beta.8] — AgenTel rebrand + durable session identity
+
+The rebrand + session-continuity milestone. **No net-new product features** — this release
+repairs a confirmed lifecycle defect, hardens regressions, and renames XBus → **AgenTel**
+("The communications network for AI agents.").
+
+- **Durable logical identity + secret-gated name reclaim** (ADR 0027, migration v10, schema
+  `xbus-p1-stp1-s9` → `xbus-p1-stp1-s10`). Fixes the confirmed defect where a Claude Code
+  session that resumed/forked/cleared/compacted/crashed under a **new session id** could not
+  reclaim its stable name or its queued inbox — registration would report success while the
+  name stayed `pending`/null and messages stranded on the dead session id. Now the broker
+  mints a stable **ownership secret** at first name award; a legitimate successor presenting it
+  is redirected onto the canonical durable identity and inherits the name + entire inbox with
+  **zero message movement** (the existing exactly-once ack/reply machinery is untouched).
+  Liveness-gated: a **live incumbent is never evicted**; a wrong/absent secret falls back to
+  the exact beta.7 first-writer-wins + pending behavior. `name_ownership` is the single name
+  authority (register/rename/operator-rename/reaper all route through it). The secret is
+  broker-minted, hash-at-rest, and **never** written to the audit ledger or logs. Reclaim is
+  audited (`identity.reclaimed`). Existing data is preserved; every v10 change is additive and
+  backfilled in-transaction.
+- **Regression hardening.** A full lifecycle audit with adversarial per-finding verification.
+  Fixed: a `once` **schedule** whose target was only *transiently* unresolvable (not yet
+  registered) was permanently exhausted (message loss) instead of deferred + retried — now
+  transient recipient errors defer, permanent ones stay terminal.
+- **Rename XBus → AgenTel.** Primary CLI is now `agentel` (launcher `agenclaude`); `xbus` and
+  `xclaude` remain **deprecated aliases** (functional ≥2 releases, print a one-line note).
+  Configuration env vars read `AGENTEL_*` first, falling back to legacy `XBUS_*`. The
+  dashboard, CLI help, and banners are AgenTel-branded. **Preserved for compatibility:** the
+  wire tuple, the `XBUS-STP` secure-transport protocol, the on-disk layout (data dir,
+  `xbus.sqlite`, owner tag), the `xbus_*` MCP tool names, and the `XBUS_*`-prefixed protocol
+  error-code strings — all unchanged, so existing installs and in-flight sessions keep working.
 
 ## [0.1.0-beta.7] — Phase 3: frictionless runtime, professional console, session control, managed execution
 
