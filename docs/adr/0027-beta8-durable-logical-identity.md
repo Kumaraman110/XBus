@@ -252,6 +252,31 @@ fields — a beta.7 client that never sends a secret gets exact beta.7 behavior.
   name to the pool. The client silently re-persists the new secret; no data is lost (the
   expired inbox was already dead-lettered at expiry). Accepted as-is for beta.8.
 
+## Phase 3 regression audit (beta.8) — outcome
+
+A 5-area lifecycle audit (registration/naming/resume, delivery/ack/reply/restart,
+scheduler/idle-wake, install/upgrade/rollback, dashboard) with adversarial per-finding
+verification produced: 7 major candidates refuted as false positives (e.g. no runtime path
+writes a `cancelled` delivery state; reply-implies-ack is intentional; the operator row is
+filtered; dead-letter redrive already re-presents correctly), and **3 confirmed, all narrow
+pre-existing beta.7 minors** — none related to session continuity, none introduced by this
+work:
+
+- **FIXED — scheduler transient-recipient exhaustion:** a `once` schedule whose target was
+  only *transiently* unresolvable (`UNKNOWN_RECIPIENT`/`AMBIGUOUS_RECIPIENT` — not yet
+  registered / momentarily ambiguous) was terminally exhausted instead of deferred. Now such
+  errors DEFER (retry next tick, schedule stays alive), mirroring quiet-hours deferral;
+  genuinely permanent errors (expired/blocked/self) stay terminal. Regression-tested.
+- **DEFERRED (documented) — migration-backup root-secret copy:** the one-time data-migration
+  backup dir retains a copy of the root secret. It inherits the same owner-only ACL as the
+  live secret (`hardenDir` runs first) and the legacy source retains the secret anyway, so
+  there is no *additional* cross-user exposure — a hygiene gap, not a vuln. Reclaim/cleanup
+  hardening deferred to avoid install-path surgery late in this cycle.
+- **DEFERRED (documented) — legacy-root broker not stopped before its DB is copied:** guarded
+  by a post-copy hash compare + `PRAGMA integrity_check` that abort fail-closed on a
+  detectably-inconsistent copy, and the legacy source is never mutated/deleted (recoverable by
+  retry). Narrow torn-copy window; fix deferred for the same reason.
+
 ## Consequences
 
 - **Positive:** a legitimate successor recovers its name + inbox automatically and exactly once

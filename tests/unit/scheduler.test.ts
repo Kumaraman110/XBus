@@ -113,6 +113,42 @@ describe('scheduler gates', () => {
     expect(inQuietHours(next, JSON.stringify({ windows: [{ start: '22:00', end: '06:00' }] }))).toBe(false); // advanced OUT of quiet hours
   });
 
+  it('regression: a "once" schedule to a TRANSIENTLY-unresolvable name DEFERS (stays alive), then fires when the target appears', () => {
+    // Beta.8 regression fix: previously ANY recipient error terminally exhausted a 'once'
+    // schedule, so a schedule created before its target registered was permanently killed
+    // (message loss). UNKNOWN_RECIPIENT is transient → defer + retry, never exhaust.
+    const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'not-yet-here', payloadText: 'wake up', kind: 'once', requiresAck: true, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    const r1 = scheduler.tick();
+    expect(r1.fired).toBe(0);
+    expect(msgCount()).toBe(0); // target unresolved → nothing sent
+    // The schedule is STILL ACTIVE (deferred), not exhausted, with a future next_run.
+    const after1 = db.prepare('SELECT state, next_run FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string; next_run: string | null };
+    expect(after1.state).toBe('active');
+    expect(after1.next_run).not.toBeNull();
+    const runs = db.prepare('SELECT state, skip_reason FROM schedule_runs WHERE schedule_id=?').all(scheduleId) as Array<{ state: string; skip_reason: string | null }>;
+    expect(runs.some((x) => x.skip_reason === 'recipient_unresolved_transient')).toBe(true);
+    // The target registers with the awaited name; advance to the deferred next_run and tick.
+    store.register({ sessionId: 'nnnn0000-0000-4000-8000-00000000000f', instanceId: 'iN', connectionId: 'cN', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', requestedSessionName: 'not-yet-here' });
+    clock.set(Date.parse(after1.next_run!));
+    const r2 = scheduler.tick();
+    expect(r2.fired).toBe(1);          // now it fires exactly once
+    expect(msgCount()).toBe(1);
+    // and a 'once' that has fired is now exhausted.
+    expect((db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string }).state).toBe('exhausted');
+  });
+
+  it('a PERMANENT recipient error (expired session) still terminally exhausts a "once" (no infinite retry)', () => {
+    // Register + expire a target so resolveRecipient throws RECIPIENT_SESSION_EXPIRED (permanent).
+    const exp = 'eeee0000-0000-4000-8000-00000000000e';
+    store.register({ sessionId: exp, instanceId: 'iE', connectionId: 'cE', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack'], role: 'mcp', requestedSessionName: 'goner' });
+    const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: exp, payloadText: 'x', kind: 'once', requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
+    // Force the target expired (15-day tombstone) so the send is a PERMANENT failure.
+    db.prepare(`UPDATE sessions SET expired_at=?, session_name_state='retired', normalized_session_name=NULL WHERE session_id=?`).run(clock.nowIso(), exp);
+    const r = scheduler.tick();
+    expect(r.fired).toBe(0);
+    expect((db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string }).state).toBe('exhausted');
+  });
+
   it('max_fires exhausts the schedule after N fires', () => {
     const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'target-svc', payloadText: 'x', kind: 'interval', scheduleExpr: '60000', minIntervalMs: 60000, maxFires: 2, requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
     scheduler.tick(); clock.advance(60_000);
@@ -136,13 +172,17 @@ describe('scheduler gates', () => {
     expect(msgCount()).toBe(1); // cancelled → never fires again
   });
 
-  it('a schedule to an UNKNOWN recipient records a failed run + advances, never crashing the tick', () => {
+  it('a schedule to an UNKNOWN recipient records a failed run + DEFERS (transient), never crashing the tick', () => {
     const { scheduleId } = store.createSchedule({ createdByActor: 'local-operator', targetAddress: 'no-such-target', payloadText: 'x', kind: 'once', requiresAck: false, requiresReply: false, nextRunAtIso: clock.nowIso() });
     expect(() => scheduler.tick()).not.toThrow();
     expect(msgCount()).toBe(0);
     const run = db.prepare('SELECT state, skip_reason FROM schedule_runs WHERE schedule_id=?').get(scheduleId) as { state: string; skip_reason: string | null };
     expect(run.state).toBe('failed');
-    expect(run.skip_reason).toBe('recipient_error');
+    // Beta.8 regression fix: an unknown/not-yet-registered recipient is TRANSIENT, so the run
+    // is recorded with the transient reason and the schedule DEFERS (stays alive to retry) —
+    // it is no longer terminally exhausted the way a permanent recipient error is.
+    expect(run.skip_reason).toBe('recipient_unresolved_transient');
+    expect((db.prepare('SELECT state FROM schedules WHERE schedule_id=?').get(scheduleId) as { state: string }).state).toBe('active');
   });
 
   it('a "once" schedule blocked by quiet-hours is DEFERRED past the window (not dropped) and later fires exactly once', () => {

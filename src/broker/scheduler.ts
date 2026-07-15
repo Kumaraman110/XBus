@@ -20,7 +20,7 @@
 import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import type { BrokerStore } from './store.js';
-import { isXBusError } from '../protocol/errors.js';
+import { isXBusError, XBusErrorCode } from '../protocol/errors.js';
 
 export interface SchedulerTickResult {
   fired: number;
@@ -230,12 +230,17 @@ export class Scheduler {
           .run(wakesToday + 1, today, s.schedule_id);
       } catch (e) {
         const code = isXBusError(e) ? e.code : 'internal';
-        setRun('failed', { skip_reason: 'recipient_error', error_code: code });
-        // A hard recipient error (expired/unknown/self) is terminal for THIS slot — advance
-        // normally (a 'once' exhausts; an interval moves to its next slot). We don't infinitely
-        // retry a permanently-bad address.
-        this.advance(s, now, 'terminal');
-        this.audit('SCHEDULE_FIRE_FAILED', { scheduleId: s.schedule_id, code });
+        // Beta.8 (regression fix): a recipient that is only TRANSIENTLY unresolvable — the
+        // target name is not yet registered, is momentarily in pending_name, or resolves
+        // ambiguously this instant — must NOT permanently exhaust a 'once' schedule. Those are
+        // retryable, so DEFER (keep the schedule alive with a future next_run, even for 'once',
+        // mirroring the quiet-hours deferral). Genuinely PERMANENT recipient errors (the session
+        // expired after 15 days, the sender is blocked, a self-send) stay terminal — we don't
+        // infinitely retry a permanently-bad address.
+        const transient = code === XBusErrorCode.UNKNOWN_RECIPIENT || code === XBusErrorCode.AMBIGUOUS_RECIPIENT;
+        setRun('failed', { skip_reason: transient ? 'recipient_unresolved_transient' : 'recipient_error', error_code: code });
+        this.advance(s, now, transient ? 'deferred' : 'terminal');
+        this.audit('SCHEDULE_FIRE_FAILED', { scheduleId: s.schedule_id, code, deferred: transient });
         return 'skipped';
       }
 
