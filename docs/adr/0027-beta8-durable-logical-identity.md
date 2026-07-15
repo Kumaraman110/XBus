@@ -200,15 +200,29 @@ audit/ledger path never sees (only its sha256 hash is persisted, in `owner_secre
 ## Ownership-proof delivery (client side) — agent-unique anchor
 
 The MCP server persists the awarded `ownerSecret` to a file under the ACL-protected data dir,
-keyed by an **agent-unique** anchor: `project_id` **+ a persisted per-awarded-identity id**
-(the `logical_identity_id` the broker returns at first award), **never** the workspace-derived
-suggested name. Both the write and the read key on the **awarded** identity, so:
-- a session that was only ever `pending` cannot select the true owner's secret;
-- two different agents in the same repo do not collide (each has its own awarded identity id);
-- **`--fork-session` gets a NEW identity, never reclaims the parent** — the fork has no awarded
-  identity id yet, and the liveness gate refuses reclaim of the still-live parent anyway;
-- if `>1` live session shares the anchor, the MCP server refuses to auto-present (no ambiguous
-  reclaim).
+keyed by `project_id` **+ the normalized session name** being (re)claimed. (The awarded
+`logical_identity_id` is also stored in the record as a secondary marker, but the LOOKUP key is
+`project_id`+name — a successor under a brand-new session id must find its secret *before* it
+knows its logical identity, which only the name it is requesting can anchor. Keying the lookup
+on the identity id would be un-bootstrappable.) Consequences of the name anchor, and why it is
+safe:
+- a session that was only ever `pending` never receives an `ownerSecret` in its ack, so it
+  never persists one and cannot select the true owner's secret;
+- two agents in the same repo requesting **different** names get **distinct** files;
+- two agents requesting the **same** auto-derived name in one repo DO share the file — this is
+  the genuinely ambiguous case. The broker's **liveness gate is the authoritative backstop**:
+  a reclaim is refused while the current holder has a live mcp component (`resolveReclaim` →
+  `hasLiveMcp`), so the second session lands `pending`+`nameReclaimFailed`, exactly as beta.7 —
+  the live owner is never evicted;
+- **`--fork-session`** mints a new session id whose MCP would request the same auto-name and
+  could load the parent's secret, but the parent is still LIVE, so the liveness gate refuses the
+  reclaim — the fork lands `pending`, never supersedes its parent.
+
+> **Design note (revised after impl review):** an earlier draft mandated anchoring the lookup
+> on the awarded `logical_identity_id` "never the name". That is un-bootstrappable (a fresh
+> session id has no identity id to look up by), so the implemented + correct anchor is
+> `project_id`+name with the liveness gate as the security-relevant backstop. The identity id is
+> retained in the record for diagnostics and a future exact-match tightening.
 
 > **Same-user framing (honest — Major fix).** One broker == one OS user == one dataDir; the
 > ACL protects the secret only against **other** OS users (`acl.ts`). Every actor that can
@@ -227,6 +241,16 @@ controlled whole-install upgrade, ADR 0019). **The adapter-SDK `FROZEN_PROTOCOL_
 baseline (s5) is deliberately independent of the dynamic tuple and MUST NOT be bumped** for
 beta.8. `ownerSecret` / `nameReclaimFailed` are additive, unknown-field-tolerant payload
 fields — a beta.7 client that never sends a secret gets exact beta.7 behavior.
+
+## Known minor behaviors (accepted)
+
+- **Reclaim of an EXPIRED predecessor.** Once the 15-day reaper expires a session it releases
+  the `name_ownership` row (`name_state='released'`, `normalized_name=NULL`). `resolveReclaim`
+  only matches `active`/`pending` rows, so a successor presenting the old secret for a
+  long-expired name does **not** reclaim — it falls through to a fresh first-claim (a new
+  identity + new secret). This is correct: an identity idle for 15 days legitimately lost its
+  name to the pool. The client silently re-persists the new secret; no data is lost (the
+  expired inbox was already dead-lettered at expiry). Accepted as-is for beta.8.
 
 ## Consequences
 

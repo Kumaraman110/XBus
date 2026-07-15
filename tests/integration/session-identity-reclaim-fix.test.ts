@@ -138,6 +138,73 @@ describe('durable identity reclaim — the fix', () => {
     expect(hits).toBe(0);
   });
 
+  it('BLOCKER regression: after reclaim, the secret-less HOOK under the new physical id is redirected onto canonical', () => {
+    // This is the path automatic delivery actually uses: the checkpoint HOOK registers with
+    // role='hook', NO ownerSecret, NO requestedSessionName. It must still land on the canonical
+    // identity (via physical_session_map) so it pulls the reclaimed inbox — not a fresh empty one.
+    const sidA = sid();
+    const a = reg({ sessionId: sidA, requestedSessionName: 'worker' });
+    const secret = a.ownerSecret!;
+    const sender = reg({ requestedSessionName: 'ops2' });
+    store.send(sender, { to: 'worker', text: 'do it', kind: 'request', requiresAck: true, requiresReply: false });
+    expect(queuedFor(sidA)).toBe(1);
+    disconnect(sidA);
+
+    // 1) MCP of the fork reclaims (redirected onto canonical sidA).
+    const sidB = sid();
+    const b = reg({ sessionId: sidB, requestedSessionName: 'worker', ownerSecret: secret });
+    expect(b.sessionId).toBe(sidA);
+
+    // 2) The fork's HOOK now registers under the NEW physical id sidB, secret-less.
+    const hook = store.register({ sessionId: sidB, instanceId: 'hook-i', connectionId: `c-hook-${sidB}`, processId: 9, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    // It must be redirected onto the canonical identity — NOT create a fresh empty session.
+    expect(hook.sessionId).toBe(sidA);
+    // No standalone row was created for sidB (only the canonical + the sender + ops2).
+    const sidBRow = db.prepare('SELECT session_id FROM sessions WHERE session_id=?').get(sidB);
+    expect(sidBRow).toBeUndefined();
+    // The inherited inbox is visible to the canonical identity the hook now drives.
+    expect(queuedFor(sidA)).toBe(1);
+  });
+
+  it('BLOCKER regression: the redirected physical row does not appear as a phantom in the dashboard listing', async () => {
+    const { DashboardReadModel } = await import('../../src/broker/dashboard/read-model.js');
+    const sidA = sid();
+    const a = reg({ sessionId: sidA, requestedSessionName: 'dash-worker' });
+    disconnect(sidA);
+    const sidB = sid();
+    reg({ sessionId: sidB, requestedSessionName: 'dash-worker', ownerSecret: a.ownerSecret! });
+    const rm = new DashboardReadModel(db);
+    const listed = rm.sessions().map((s) => s.sessionId);
+    // sidB is a physical_session_map key → excluded; canonical sidA is listed once.
+    expect(listed).toContain(sidA);
+    expect(listed).not.toContain(sidB);
+  });
+
+  it('real ordering: HOOK-first under the new physical id, THEN MCP reclaim — reclaim still redirects, physical row hidden', () => {
+    // At SessionStart the hook can fire BEFORE the MCP registers. So the new physical id sidB
+    // first gets a standalone (unnamed) row; then the MCP presents the secret and reclaims onto
+    // canonical sidA. The reclaim must still succeed (redirect), and sidB must be a map key so it
+    // never shows as a phantom.
+    const sidA = sid();
+    const a = reg({ sessionId: sidA, requestedSessionName: 'race-worker' });
+    const secret = a.ownerSecret!;
+    disconnect(sidA);
+    const sidB = sid();
+    // 1) hook-first: sidB registers unnamed, no secret → its own fresh row (broker can't yet know it's a fork).
+    const hook1 = store.register({ sessionId: sidB, instanceId: 'hk', connectionId: `c-hk-${sidB}`, processId: 3, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    expect(hook1.sessionId).toBe(sidB); // no map entry yet → own id
+    // 2) MCP reclaims with the secret → redirected onto canonical sidA.
+    const b = reg({ sessionId: sidB, requestedSessionName: 'race-worker', ownerSecret: secret });
+    expect(b.sessionId).toBe(sidA);
+    // 3) a subsequent hook checkpoint under sidB now redirects to canonical (map read).
+    const hook2 = store.register({ sessionId: sidB, instanceId: 'hk2', connectionId: `c-hk2-${sidB}`, processId: 3, projectId: 'proj-hook', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
+    expect(hook2.sessionId).toBe(sidA);
+    // canonical owns the name; sidB is a map key (hidden from listings).
+    expect(nameState(sidA).name).toBe('race-worker');
+    const mapped = db.prepare(`SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?`).get(sidB) as { c: string };
+    expect(mapped.c).toBe(sidA);
+  });
+
   it('reaper releases name_ownership in the same sweep (no orphan active ownership)', () => {
     const sidA = sid();
     reg({ sessionId: sidA, requestedSessionName: 'legacy' });

@@ -182,7 +182,13 @@ export class DashboardReadModel {
               agent_type AS agentType, project_alias AS projectAlias, project_id AS projectId,
               state AS connState, readiness, expired_at AS expiredAt,
               first_seen_at AS firstSeenAt, last_seen_source_at AS lastSeenSourceAt
-         FROM sessions ORDER BY COALESCE(first_seen_at, created_at) DESC`,
+         FROM sessions
+         -- Beta.8 (ADR 0027): a physical session id that has been REDIRECTED onto a canonical
+         -- durable identity (name+inbox reclaimed by a new Claude session id) must not appear as
+         -- a separate row — the console shows the ONE canonical session, never a phantom
+         -- superseded twin. The canonical row itself is never a map KEY, so it is unaffected.
+         WHERE session_id NOT IN (SELECT physical_session_id FROM physical_session_map)
+         ORDER BY COALESCE(first_seen_at, created_at) DESC`,
     ).all() as Array<Record<string, unknown>>;
 
     // BOUNDED aggregates (blocker #6): a FIXED number of set-wide GROUP BY queries, NOT one

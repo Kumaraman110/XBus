@@ -263,6 +263,11 @@ export class BrokerStore {
     const pendingTtl = new Date(this.clock.nowMs() + 5 * 60_000).toISOString();
     this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='pending', pending_name_expires_at=?, updated_at=? WHERE session_id=?`)
       .run(pendingTtl, now, sessionId);
+    // Beta.8 (ADR 0027): keep name_ownership 1:1 with the sessions name — a session dropping to
+    // 'pending' holds NO name, so release its ownership routing (the secret hash is preserved so
+    // the same identity can re-acquire). Prevents a stale 'active' name_ownership row diverging
+    // from an unrouted sessions row.
+    this.setNameOwnershipReleased(this.logicalIdOf(sessionId), now);
   }
 
   // ─── Beta.8 (ADR 0027): durable logical identity + name ownership ──────────────────────
@@ -394,12 +399,23 @@ export class BrokerStore {
       // or a LIVE incumbent ⇒ no redirect: the caller registers under its own id and gets the
       // beta.7 taken→pending outcome (with nameReclaimFailed surfaced when a secret was tried).
       const physicalSessionId = inputRaw.sessionId;
+      // First, an ALREADY-ESTABLISHED redirect: once a physical id has reclaimed a canonical
+      // identity, EVERY later component registering under that physical id (crucially the HOOK,
+      // which presents no secret and drives checkpoint delivery) must resolve to the SAME
+      // canonical session — otherwise the hook would pull an empty inbox against the phantom
+      // physical id. The map is authoritative and read on every register.
+      const mapped = this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(physicalSessionId) as { c: string } | undefined;
+      // A fresh secret-bearing reclaim (mcp only): decide the canonical target + liveness gate.
       const reclaim = role === ComponentRole.MCP
         ? this.resolveReclaim(inputRaw.requestedSessionName, inputRaw.ownerSecret, physicalSessionId)
         : null;
       const reclaimAttempted = inputRaw.ownerSecret !== undefined && inputRaw.requestedSessionName !== undefined;
-      const input: RegisterInput & { supersede?: boolean } = reclaim
-        ? { ...inputRaw, sessionId: reclaim.canonicalSessionId, supersede: true }
+      // The canonical id this registration targets: a fresh reclaim wins; else a prior mapping;
+      // else the physical id itself. A fresh reclaim is a NEW lifecycle (supersede); a mapped
+      // reconnect is a normal join/reconnect onto the canonical row (no forced supersede).
+      const canonicalTarget = reclaim ? reclaim.canonicalSessionId : (mapped && mapped.c !== physicalSessionId ? mapped.c : null);
+      const input: RegisterInput & { supersede?: boolean } = canonicalTarget
+        ? { ...inputRaw, sessionId: canonicalTarget, ...(reclaim ? { supersede: true } : {}) }
         : inputRaw;
       if (reclaim && physicalSessionId !== reclaim.canonicalSessionId) {
         this.db.prepare('INSERT OR REPLACE INTO physical_session_map (physical_session_id, canonical_session_id, logical_identity_id, created_at) VALUES (?,?,?,?)')
@@ -428,10 +444,13 @@ export class BrokerStore {
         const auto = automaticAlias(input.sessionId);
         this.db
           .prepare(
-            `INSERT INTO sessions (session_id, active_instance_id, generation, high_water_generation, active_epoch, fencing_token, bound_connection_id, automatic_alias, project_id, cwd, repository_root, claude_code_version, xbus_version, capabilities_json, receive_mode, state, agent_type, connected_at, last_seen_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'connected', ?,?,?,?,?)`,
+            `INSERT INTO sessions (session_id, logical_identity_id, active_instance_id, generation, high_water_generation, active_epoch, fencing_token, bound_connection_id, automatic_alias, project_id, cwd, repository_root, claude_code_version, xbus_version, capabilities_json, receive_mode, state, agent_type, connected_at, last_seen_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'connected', ?,?,?,?,?)`,
           )
           .run(
-            input.sessionId, componentInstanceId, epoch, epoch, epoch, epoch, input.connectionId,
+            // Beta.8 (ADR 0027): a fresh session IS its own durable logical identity — stamp it
+            // at insert so the column is never NULL for a post-v10 row (idx_sessions_logical
+            // stays useful and logicalIdOf never falls back).
+            input.sessionId, input.sessionId, componentInstanceId, epoch, epoch, epoch, epoch, input.connectionId,
             auto.display, input.projectId, input.cwd, input.repositoryRoot ?? null, input.claudeCodeVersion ?? null,
             XBUS_VERSION, JSON.stringify(input.capabilities), input.receiveMode, input.agentType ?? null, now, now, now, now,
           );
@@ -450,6 +469,11 @@ export class BrokerStore {
         // expiry sweep already dead-lettered it, and we only re-home transport_written
         // rows (in-flight to the prior live owner), which an expired session has none of.
         this.db.prepare(`UPDATE sessions SET active_epoch=?, generation=?, high_water_generation=?, fencing_token=?, state='connected', readiness='initializing', readiness_updated_at=?, expired_at=NULL, expiration_reason=NULL, session_name_state='unnamed', session_name=NULL, normalized_session_name=NULL, pending_name_expires_at=NULL, last_seen_at=?, updated_at=? WHERE session_id=?`).run(epoch, epoch, epoch, epoch, now, now, now, input.sessionId);
+        // Beta.8 (ADR 0027): the sessions name just went 'unnamed'; keep name_ownership 1:1 by
+        // releasing it here. If a requestedSessionName is present, claimNameForRegister below
+        // re-acquires it (setNameOwnershipActive) in the SAME transaction — so a reclaim ends
+        // 'active' and a no-name resume ends 'released', never diverging. Secret hash preserved.
+        this.setNameOwnershipReleased(this.logicalIdOf(input.sessionId), now);
         this.db.prepare(`UPDATE component_instances SET state='superseded', disconnected_at=? WHERE session_id=? AND state='live'`).run(now, input.sessionId);
         // Re-queue any in-flight injection of the PRIOR (now replaced) live owner.
         // For an expired resume there are none (the sweep dead-lettered the queue),
@@ -1300,6 +1324,11 @@ export class BrokerStore {
         this.db.prepare(`UPDATE sessions SET session_name=?, normalized_session_name=?, session_name_state='active', pending_name_expires_at=NULL, updated_at=? WHERE session_id=?`)
           .run(norm.display, norm.normalized, now, sessionId);
       } catch { throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display }); }
+      // Beta.8 (ADR 0027): mirror into name_ownership (the durable name authority) in the SAME
+      // transaction — exactly as renameSession/claimNameForRegister do — so an operator rename
+      // never diverges the two name representations (a stale 'active' name_ownership row would
+      // otherwise misdirect a secret-bearing reclaim).
+      this.setNameOwnershipActive(this.logicalIdOf(sessionId), sessionId, norm, now);
       this.ledger('OPERATOR_ALIAS_RENAMED', OPERATOR_LEDGER_ACTOR, { sessionId }, { alias: norm.display });
       return { state: 'active', name: norm.display };
     });
