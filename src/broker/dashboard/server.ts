@@ -474,4 +474,4 @@ export class DashboardServer {
 }
 
 /** Inert placeholder shell (no secrets, no session data). Real UI ships in the UI slice. */
-const BUILTIN_INDEX_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>XBus</title></head><body><p>XBus control plane. Open via <code>xbus dashboard</code>.</p></body></html>`;
+const BUILTIN_INDEX_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>AgenTel</title></head><body><p>AgenTel control plane. Open via <code>agentel dashboard</code>.</p></body></html>`;

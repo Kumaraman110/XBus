@@ -38,7 +38,7 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
   const r = await install({ dryRun });
   if (dryRun) {
     const lines = [
-      `xbus install (dry-run) — no changes made.`,
+      `agentel install (dry-run) — no changes made.`,
       `  source:      ${r.plan.source}`,
       `  install root:${r.plan.installRoot}`,
       `  plugin dir:  ${r.plan.pluginDir}`,
@@ -50,7 +50,7 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
     return { human: lines.join('\n'), json: { ...r }, exitCode: 0 };
   }
   if (!r.ok) {
-    return { human: `xbus install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: ${invocationHint('doctor')}`, json: { ...r }, exitCode: 1 };
+    return { human: `agentel install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: ${invocationHint('doctor')}`, json: { ...r }, exitCode: 1 };
   }
   // Beta.4 (ADR 0012 D8): with user-scope registration, plain `claude` from any
   // directory loads XBus + auto-starts the broker + auto-registers a named session.
@@ -473,8 +473,8 @@ async function cmdStart(): Promise<CliResult> {
   };
   process.on('SIGINT', () => { void gracefulExit(); });
   process.on('SIGTERM', () => { void gracefulExit(); });
-  const dashLine = broker.dashboardUrl ? `Dashboard: ${broker.dashboardUrl} (open with: xbus dashboard)\n` : '';
-  process.stdout.write(`XBus broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\n${dashLine}PID: ${process.pid}\nPress Ctrl+C to stop.\n`);
+  const dashLine = broker.dashboardUrl ? `Dashboard: ${broker.dashboardUrl} (open with: ${invocationHint('dashboard')})\n` : '';
+  process.stdout.write(`AgenTel broker started (instance ${broker.brokerInstanceId}, build ${BUILD_ID}).\nEndpoint: ${broker.endpoint}\n${dashLine}PID: ${process.pid}\nPress Ctrl+C to stop.\n`);
   await new Promise(() => {}); // run until killed
   return { human: '', json: {}, exitCode: 0 };
 }
@@ -685,8 +685,8 @@ export async function run(argv: string[]): Promise<void> {
       }
       default:
         return emit({ human: [
-          'xbus <command> [--json]',
-          '  install [--dry-run]               install the XBus plugin (user scope)',
+          'agentel <command> [--json]   (alias: xbus, deprecated)',
+          '  install [--dry-run]               install the AgenTel plugin (user scope)',
           '  uninstall [--dry-run] [--remove-data]',
           '  doctor                            health + installed-plugin contract check',
           '  status                            broker connectivity + versions',

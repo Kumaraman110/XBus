@@ -74,7 +74,7 @@ describe('dashboard HTTP server — security by construction', () => {
     const res = await fetch(`${base}/`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html.toLowerCase()).toContain('xbus');
+    expect(html.toLowerCase()).toContain('agentel'); // beta.8 rebrand (was 'xbus')
     expect(html).not.toContain('cccc0001'); // no session id baked into inert asset
   });
 

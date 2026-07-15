@@ -36,7 +36,7 @@ describe('dashboard UI — inert client assets', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
     const html = await res.text();
-    expect(html).toContain('XBus');
+    expect(html).toContain('AgenTel'); // beta.8 rebrand (was 'XBus')
     expect(html).toContain('/app.js');   // loads the external script (script-src 'self')
     expect(html).toContain('/style.css'); // external stylesheet (style-src 'self')
   });
