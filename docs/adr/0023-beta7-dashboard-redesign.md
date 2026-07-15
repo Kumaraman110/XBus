@@ -3,21 +3,34 @@
 **Status:** Accepted for Phase-3 build · **Date:** 2026-07-14 · beta.7 · builds on
 ADR 0015/0018/0020 (dashboard + security + read-model) and ADR 0021 (operator console).
 
-## Design skill used (honest record)
+## Design skill used (honest record — corrected)
 
 The goal directs: *"invoke the official Anthropic frontend-design skill available in Claude
 Code and record its name/source in PR evidence. If unavailable, use the closest official
 Anthropic UI/design skill and state that honestly; never invent usage."*
 
-- A skill literally named **`frontend-design`** is **NOT installed** on this machine (the
-  Claude Code skill registry surfaced to this session contains no such skill).
-- The closest official Anthropic-shipped design skill **that is installed** is **`dataviz`**
-  (source: bundled skill `dataviz`, `bundled-skills/2.1.207/.../dataviz`), which covers
-  dashboard layout, stat tiles / KPI cells, status palettes, accessible color, and
-  loading/empty/error components.
-- **`dataviz` was actually invoked** for this redesign and its palette **validator was run**
-  (`scripts/validate_palette.js`) against the real dark panel surface — not eyeballed. This is
-  stated plainly; no usage of a non-existent skill is claimed.
+**Correction (honesty).** The first version of this ADR claimed `frontend-design` was "NOT
+installed." **That was wrong** — I checked only one skill cache (`bundled-skills/…`) and
+concluded absence without searching the plugin marketplaces. The official Anthropic
+**`frontend-design`** skill **IS installed** at
+`~/.claude/plugins/marketplaces/claude-plugins-official/plugins/frontend-design/skills/frontend-design/SKILL.md`
+(plugin author: Anthropic). The user caught this; the record is corrected here rather than
+left standing.
+
+- **`frontend-design` (official, Anthropic) was invoked** for the final visual redesign — its
+  guidance drove committing to a bold, distinctive aesthetic direction, distinctive type
+  treatment, atmosphere/depth, and motion, while avoiding generic AI aesthetics. The chosen
+  direction and its rationale are recorded below.
+- **`dataviz` (bundled skill) was ALSO used**, specifically for the delivery-state color system:
+  its palette **validator was run** (`scripts/validate_palette.js`) against the real dark panel
+  surface (not eyeballed) to prove the five delivery-state hues are ≥3:1 contrast and
+  CVD-separated. The two skills are complementary — `frontend-design` for the aesthetic
+  point-of-view, `dataviz` for the validated status palette.
+- The redesign preserves the strict CSP by construction (external `/style.css` + `/app.js`
+  only; no inline styles, no remote fonts/images/CDN — `default-src 'none'`), so the sci-fi
+  look is built entirely from CSS (gradients, `perspective`/`transform` 3D depth, keyframes,
+  `clip-path`) over a system-font stack treated for a distinctive identity, never a shipped
+  binary font.
 
 ## Decision
 

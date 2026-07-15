@@ -15,12 +15,14 @@ The adoption/control/execution milestone. Five areas, all same-machine:
   the bundled runtime and **ignores system Node/PATH** — users never install/select/configure
   Node. It rides the existing atomic install swap + DB-snapshot rollback; `doctor` + provenance
   report the runtime version; the reproducible STORE zip stays byte-identical.
-- **Professional dashboard** (ADR 0023, built with the `dataviz` skill — the closest official
-  Anthropic design skill installed; the named `frontend-design` skill is not present, stated
-  honestly): delivery renders as **separate columns Queued | Delivered | ACK | Replied | Failed**
-  (no combined string) as validated colored state pills; an **Internal sessions** filter hides
-  `cli-*`/operator/installer sessions by default; friendly statuses + a keyboard drill-down;
-  responsive + focus-visible + loading/empty/error states. Strict CSP preserved.
+- **Professional dashboard** (ADR 0023, built with the official Anthropic **`frontend-design`**
+  skill for the aesthetic direction + the **`dataviz`** skill for the validated delivery-state
+  palette): a distinctive sci-fi operator console — delivery renders as **separate columns
+  Queued | Delivered | ACK | Replied | Failed** (no combined string) as ≥3:1-contrast colored
+  state pills; an **Internal sessions** filter hides `cli-*`/operator/installer sessions by
+  default; friendly statuses + a keyboard drill-down; responsive + focus-visible +
+  loading/empty/error states; pure-CSS depth/atmosphere/motion. Strict CSP preserved (external
+  CSS/JS only, no inline styles, no remote fonts/images).
 - **Title sync + session controls** (ADR 0024): the Claude-native `session_title` is captured
   OBSERVE-ONLY (documented SessionStart field) into `claude_title`, stored **separately** from
   the xbus alias (never routable, never claimed as a Claude-title change). Operator controls
