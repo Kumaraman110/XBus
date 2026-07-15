@@ -36,6 +36,7 @@ export const PLUGIN_PAYLOAD_FILES = [
   'dist/broker/dashboard/static/index.html', // beta.5 dashboard UI (inert; no secrets/data)
   'dist/broker/dashboard/static/app.js',
   'dist/broker/dashboard/static/style.css',
+  'dist/broker/dashboard/static/theme.js', // beta.7 light/dark theme switch (inert; CSP-safe)
   'package.json',                 // runtime manifest (bin + deps + engines)
   'provenance.json',              // exact build identity, read at runtime (see ADR 0011)
 ] as const;
