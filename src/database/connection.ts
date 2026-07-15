@@ -44,10 +44,10 @@ export interface OpenOptions {
 /** Open (or create) a database with XBus's standard durability pragmas. */
 export function openDatabase(filename: string, opts: OpenOptions = {}): SqliteDriver {
   // `readOnly` is supported by the node:sqlite RUNTIME (landed 22.12/22.13 — the reason the
-  // floor is >=22.13) but @types/node@22.13 hasn't yet added it to DatabaseSyncOptions, so
-  // cast the options past the stale type. Verified at runtime on Node 22.13+ and 24/25.
+  // floor is >=22.13) and is declared on @types/node's DatabaseSyncOptions, so it is passed
+  // directly. Verified at runtime on Node 22.13+ and 24/25.
   const db = opts.readOnly === true
-    ? new DatabaseSync(filename, { readOnly: true } as unknown as import('node:sqlite').DatabaseSyncOptions)
+    ? new DatabaseSync(filename, { readOnly: true })
     : new DatabaseSync(filename);
   const busy = opts.busyTimeoutMs ?? 5000;
 
