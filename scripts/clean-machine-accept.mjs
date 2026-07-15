@@ -125,6 +125,16 @@ try {
   if ((sub.status ?? 1) !== 0) fail(`two-session exchange failed (exit ${sub.status}):\n${subOut.slice(0, 1200)}`);
   log('  ' + subOut.trim().split('\n').filter(Boolean).slice(-6).join('\n  '));
 
+  // 5b) durable-identity RECLAIM (beta.8, ADR 0027) through the installed MCP + broker: a
+  //     successor under a NEW session id reclaims a killed predecessor's name + inbox.
+  log('[6b] durable-identity reclaim (new session id inherits name + inbox)');
+  const rec = spawnSync(process.execPath, [path.join(sourceDir, 'scripts', 'accept-identity-reclaim.mjs'), installedServer, dataDir], {
+    env: { ...baseEnv, XBUS_DATA_DIR: dataDir }, encoding: 'utf8', timeout: 120000,
+  });
+  const recOut = (rec.stdout ?? '') + (rec.stderr ?? '');
+  if ((rec.status ?? 1) !== 0 || !/IDENTITY_RECLAIM_ACCEPT_PASS/.test(recOut)) fail(`identity-reclaim acceptance failed (exit ${rec.status}):\n${recOut.slice(0, 1200)}`);
+  log('  ' + recOut.trim().split('\n').filter(Boolean).slice(-4).join('\n  '));
+
   // 6) stop the broker
   log('[7] stop broker'); r = runCli(installedCli, ['stop', '--json'], { XBUS_DATA_DIR: dataDir });
   log('  stop exit ' + r.code);
