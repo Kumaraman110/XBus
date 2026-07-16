@@ -25,6 +25,13 @@ import { assertSupportedNode } from '../shared/node-support.js';
 import { readConfigEnv } from '../shared/env-config.js';
 import { bundledNodePath, hasBundledRuntime, BUNDLED_NODE_VERSION } from '../shared/bundled-runtime.js';
 import { dashboardAlive } from '../broker/dashboard/browser.js';
+// NOTE: verify / release-check / govern are DEVELOPMENT + RELEASE commands. Their
+// implementations live under `dist/tools/`, which package-win intentionally STRIPS from the
+// shipped end-user artifact (packaging/bench/verify tooling is not shipped). So they are loaded
+// via DYNAMIC import inside their handlers — the installed CLI (which never runs them) never
+// needs `dist/tools/` present, and importing them statically here would break `agentel <anything>`
+// on an installed artifact with ERR_MODULE_NOT_FOUND. Run these from a source checkout only.
+type GovernanceModule = typeof import('../tools/governance.js');
 
 /** This process's exact identity: prefer the packaged provenance.json next to the
  *  installed binaries (works with no git/source), else a labelled source identity.
@@ -557,6 +564,108 @@ async function cmdStop(): Promise<CliResult> {
   }
 }
 
+/**
+ * Beta.9 (ADR 0029): `agentel verify` — the one frictionless verification command. Resolves an
+ * approved Node runtime (no PATH/NVM dependence), installs deps on it, runs the full gate +
+ * acceptance + audit, proves the deterministic artifact SHA, and fails closed with a precise,
+ * class-tagged remediation. This runs OUTSIDE an installed context (in a checkout), so it resolves
+ * the repo root from the CLI location, not the install manifest.
+ */
+async function cmdVerify(args: string[]): Promise<CliResult> {
+  // The verify command must run from a source checkout (it builds + tests). Dynamic-import the
+  // tool so an installed artifact (no dist/tools/) never fails to load the CLI.
+  const repoRoot = resolveRepoRoot();
+  let runVerify: typeof import('../tools/verify.js').runVerify;
+  try { ({ runVerify } = await import('../tools/verify.js')); }
+  catch { return { human: '`agentel verify` runs from a source checkout only (the dev/release tools are not shipped in the installed artifact).', json: { ok: false, reason: 'tools-not-available' }, exitCode: 2 }; }
+  const report = runVerify({ repoRoot, skipAcceptance: args.includes('--skip-acceptance') });
+  const human = report.ok
+    ? `AgenTel verify PASSED — ${report.stages.length} stages, runtime ${report.runtime.version} (${report.runtime.source}), artifact SHA-256 ${report.artifactSha256 ?? '—'}.\nReport: ${path.join(repoRoot, '.agentel', 'verify-report.json')}`
+    : `AgenTel verify FAILED at [${report.failure?.class}] ${report.failure?.stage}.\n${report.failure?.remediation}\nReport: ${path.join(repoRoot, '.agentel', 'verify-report.json')}`;
+  return { human, json: report, exitCode: report.ok ? 0 : 1 };
+}
+
+/**
+ * Beta.9 (ADR 0029): `agentel release-check` — pre-tag readiness + reproducible artifact SHA.
+ * `--bundled-node <path>` supplies the vetted node.exe so the PUBLISHABLE (bundled) SHA is computed.
+ */
+async function cmdReleaseCheck(args: string[]): Promise<CliResult> {
+  const repoRoot = resolveRepoRoot();
+  const bnIdx = args.indexOf('--bundled-node');
+  const bundledNode = bnIdx > -1 ? args[bnIdx + 1] : undefined;
+  let runReleaseCheck: typeof import('../tools/release-check.js').runReleaseCheck;
+  try { ({ runReleaseCheck } = await import('../tools/release-check.js')); }
+  catch { return { human: '`agentel release-check` runs from a source checkout only (the dev/release tools are not shipped in the installed artifact).', json: { ok: false, reason: 'tools-not-available' }, exitCode: 2 }; }
+  const report = runReleaseCheck({ repoRoot, ...(bundledNode ? { bundledNode } : {}) });
+  const lines = [
+    `AgenTel release-check ${report.ok ? 'READY' : 'NOT READY'} — commit ${report.commit?.slice(0, 12) ?? '(unknown)'}, tree-clean ${report.treeClean}.`,
+    report.runtimeFree ? `  runtime-free SHA-256: ${report.runtimeFree.sha256} (${report.runtimeFree.bytes} B, reproducible=${report.runtimeFree.reproducible})` : '',
+    report.bundled ? `  bundled (PUBLISH) SHA-256: ${report.bundled.sha256} (${report.bundled.bytes} B, reproducible=${report.bundled.reproducible}, node ${report.bundled.bundledNodeVersion})` : '  bundled artifact: skipped (pass --bundled-node <path>)',
+    ...report.problems.map((p) => `  ! ${p}`),
+  ].filter(Boolean);
+  return { human: lines.join('\n'), json: report, exitCode: report.ok ? 0 : 1 };
+}
+
+/** Beta.9 (ADR 0029): the subcommands whose job is to LOCATE + re-exec an approved runtime, so the
+ *  entry-point Node-floor guard must NOT block them (they run under any Node, e.g. a global Node 25
+ *  first on PATH). Exported + used by the entry guard AND unit-tested. */
+export const RUNTIME_RESOLVING_COMMANDS = new Set(['verify', 'release-check', 'govern']);
+
+/** The subcommand in a raw argv tail = the first NON-flag token. `--json` (and any flag) may
+ *  appear before it (`agentel --json verify`), so a positional argv[2] check is wrong. Pure. */
+export function detectSubcommand(argvTail: readonly string[]): string | undefined {
+  return argvTail.find((a) => !a.startsWith('-'));
+}
+
+/** Should the Node-floor guard be skipped for this invocation? True for runtime-resolving cmds. */
+export function shouldSkipNodeGuard(argvTail: readonly string[]): boolean {
+  return RUNTIME_RESOLVING_COMMANDS.has(detectSubcommand(argvTail) ?? '');
+}
+
+/** Resolve the source-checkout repo root from the CLI location (shared by verify/release-check/govern). */
+function resolveRepoRoot(): string {
+  const here = process.argv[1] ? path.dirname(process.argv[1]) : process.cwd();
+  for (const cand of [path.resolve(here, '..', '..', '..'), path.resolve(here, '..', '..'), process.cwd()]) {
+    if (fs.existsSync(path.join(cand, 'package.json')) && fs.existsSync(path.join(cand, 'tsconfig.json'))) return cand;
+  }
+  return process.cwd();
+}
+
+/**
+ * Beta.9 (ADR 0029): `agentel govern <status|install-reviewer>` — opt-in governance helpers.
+ *   status           — is this repo governed? which reviewer resolves? is evidence emitted?
+ *   install-reviewer — discover + install the Stage-1 code-reviewer agent into .claude/agents/
+ */
+async function cmdGovern(args: string[]): Promise<CliResult> {
+  const repoRoot = resolveRepoRoot();
+  const sub = args[0] ?? 'status';
+  let gov: GovernanceModule;
+  try { gov = await import('../tools/governance.js'); }
+  catch { return { human: '`agentel govern` runs from a source checkout only (the dev/release tools are not shipped in the installed artifact).', json: { ok: false, reason: 'tools-not-available' }, exitCode: 2 }; }
+  const { isGovernanceEnabled, readGovernanceConfig, discoverReviewerAgent, installReviewerAgent, GOVERNANCE_CONFIG_REL } = gov;
+  const enabled = isGovernanceEnabled(repoRoot);
+  if (sub === 'install-reviewer') {
+    // Search this repo (env override → .claude/agents → agents/), plus any dirs the operator
+    // supplies via AGENTEL_REVIEWER_SEARCH (os-path-delimited). No machine-specific paths are
+    // hardcoded — the reviewer is either vendored in-repo, named by env, or on a supplied dir.
+    const extra = (process.env.AGENTEL_REVIEWER_SEARCH ?? '').split(path.delimiter).filter(Boolean);
+    const disc = discoverReviewerAgent(repoRoot, process.env, (p) => fs.existsSync(p), extra);
+    const res = installReviewerAgent(repoRoot, disc);
+    return { human: res.ok ? `Reviewer agent: ${res.detail}\n  → ${res.installedTo}` : `Reviewer install FAILED: ${res.detail}`, json: { ...res, discovery: disc }, exitCode: res.ok ? 0 : 1 };
+  }
+  // status
+  const cfg = readGovernanceConfig(repoRoot);
+  const disc = discoverReviewerAgent(repoRoot, process.env, (p) => fs.existsSync(p), []);
+  const lines = [
+    `AgenTel governance for ${repoRoot}`,
+    `  enabled:        ${enabled}${enabled ? '' : ` (create ${GOVERNANCE_CONFIG_REL} to opt in)`}`,
+    `  config:         ${cfg ? JSON.stringify(cfg) : '(none)'}`,
+    `  reviewer agent: ${disc.found ? `${disc.origin} → ${disc.sourcePath}` : 'not installed (run: agentel govern install-reviewer)'}`,
+    `  evidence:       ${enabled ? 'emitted under .preflight/gate/ after a passing `agentel verify`' : 'inert (repo not governed)'}`,
+  ];
+  return { human: lines.join('\n'), json: { enabled, config: cfg, reviewer: disc, repoRoot }, exitCode: 0 };
+}
+
 export async function run(argv: string[]): Promise<void> {
   const asJson = argv.includes('--json');
   const args = argv.filter((a) => a !== '--json');
@@ -569,6 +678,12 @@ export async function run(argv: string[]): Promise<void> {
         return emit(cmdUninstall(args.includes('--dry-run'), args.includes('--remove-data')), asJson);
       case 'repair':
         return emit(cmdRepair(), asJson);
+      case 'verify':
+        return emit(await cmdVerify(args.slice(1)), asJson);
+      case 'release-check':
+        return emit(await cmdReleaseCheck(args.slice(1)), asJson);
+      case 'govern':
+        return emit(await cmdGovern(args.slice(1)), asJson);
       case 'doctor':
         return emit(await cmdDoctor(), asJson);
       case 'status':
@@ -688,6 +803,9 @@ export async function run(argv: string[]): Promise<void> {
           'agentel <command> [--json]   (alias: xbus, deprecated)',
           '  install [--dry-run]               install the AgenTel plugin (user scope)',
           '  uninstall [--dry-run] [--remove-data]',
+          '  verify [--skip-acceptance]        one-command full verification on an approved runtime',
+          '  release-check [--bundled-node <p>] pre-tag readiness + reproducible artifact SHA-256',
+          '  govern [status|install-reviewer]  opt-in governance: reviewer install + push-gate evidence',
           '  doctor                            health + installed-plugin contract check',
           '  status                            broker connectivity + versions',
           '  sessions                          list registered sessions',
@@ -713,7 +831,16 @@ export async function run(argv: string[]): Promise<void> {
 if (process.argv[1] && process.argv[1].endsWith('main.js')) {
   // §8: fail fast with an actionable message on an unsupported Node, BEFORE any
   // install/broker machinery runs (rather than failing deep inside it).
-  assertSupportedNode();
+  // Beta.9 (ADR 0029): EXEMPT the runtime-resolving commands (verify / release-check / govern).
+  // These are the commands whose whole job is to LOCATE + re-exec an approved runtime, so they
+  // must be launchable under ANY Node (e.g. a global Node 25 first on PATH) — otherwise the
+  // frictionless entry point is unreachable on exactly the machines it exists to help. Their own
+  // resolver enforces the floor for the actual build/test work.
+  // Detect the subcommand by scanning ALL user args for the first non-flag token — `run()` itself
+  // filters `--json` from any position, so `agentel --json verify` is valid and its command is
+  // still `verify`. A positional-only (argv[2]) check would miss that and wrongly block verify
+  // under Node 25. (Pure helper, unit-tested.)
+  if (!shouldSkipNodeGuard(process.argv.slice(2))) assertSupportedNode();
   // Beta.8 (ADR 0028): `xbus` is a DEPRECATED alias of the primary `agentel` command, kept
   // functional for >=2 releases. If invoked via the legacy bin name, print a one-line note
   // (stderr, never blocks) then behave identically.

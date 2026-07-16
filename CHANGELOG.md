@@ -6,6 +6,33 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] — frictionless operations (carries the beta.8 durable-identity foundation)
+
+Make install, verification, release, and governance usable without manual environment repair
+(ADR 0029). **No net-new product capabilities** — this is operability tooling. beta.8 (the
+rebrand + durable session identity, below) was **not released separately**; it is the internal
+foundation carried forward into this combined beta.9 release, so there is exactly ONE version to
+install and validate end to end.
+
+- **`agentel verify`** — one command after cloning: resolves an APPROVED Node runtime (a full
+  dist with npm, in `[22.13, 25)`) independent of global Node/npm/NVM/PATH ordering, installs
+  deps on it, then runs the full gate (build, lint, typecheck, all shards, security tests,
+  `npm audit`) + clean-machine and identity-reclaim acceptance + a reproducible artifact build,
+  prints the artifact SHA-256, and writes a machine-readable report to `.agentel/verify-report.json`.
+  Every stage is tagged with a failure CLASS (`environment | repo-policy | test | security |
+  product | packaging`) and fails closed with precise remediation. Verified: runs with a global
+  **Node 25 first on PATH** (the entry guard exempts the runtime-resolving commands so they can
+  re-resolve an approved runtime) and leaves the tree clean (writes only under gitignored
+  `.agentel/`).
+- **`agentel release-check`** — pre-tag readiness: confirms a clean tree, builds the artifact
+  twice to prove the deterministic ZIP is byte-identical, and prints BOTH the runtime-free SHA
+  and the bundled-runtime (publishable) SHA when `--bundled-node <vetted>` is supplied.
+- **`agentel govern [status|install-reviewer]`** — OPT-IN governance (inert unless a repo has
+  `.agentel/governance.json`): discovers + installs the Stage-1 `code-reviewer` agent into
+  `.claude/agents/`, and after a passing `agentel verify` in a governed repo, stamps
+  `.preflight/gate/` evidence in the exact format the preflight push gate reads (never fabricated
+  for a failing verify). Governance never gates a repo that did not opt in.
+
 ## [0.1.0-beta.8] — AgenTel rebrand + durable session identity
 
 The rebrand + session-continuity milestone. **No net-new product features** — this release

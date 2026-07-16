@@ -21,10 +21,11 @@ const readJson = (p: string) => JSON.parse(fs.readFileSync(path.join(REPO, p), '
 // (beta.N) is a deliberate, reviewed act: change this literal and every surface
 // below must move with it. Compatibility + schema are INDEPENDENT of the product
 // version and must NOT move just because the prerelease label did.
-const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.8';
-// beta.8 (migration v10 — ADR 0027 durable logical identity + name ownership) bumps the
-// schema 9 -> 10, so the wire tuple moves to xbus-p1-stp1-s10. Protocol + STP stay 1.
-// Product version is now 0.1.0-beta.8 (rebrand + session-continuity milestone).
+const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.9';
+// beta.9 (frictionless operations — ADR 0029) is ADDITIVE tooling only (agentel verify /
+// release-check / govern). NO schema or wire change: it stays schema 10 / xbus-p1-stp1-s10 (the
+// beta.8 durable-identity migration v10 is the foundation carried forward). Protocol + STP stay 1.
+// Product version is now 0.1.0-beta.9 (beta.8 was superseded into this combined release).
 const EXPECTED_COMPATIBILITY_ID = 'xbus-p1-stp1-s10';
 const EXPECTED_SCHEMA_VERSION = 10;
 
