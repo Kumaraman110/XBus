@@ -25,6 +25,8 @@ function isExcluded(norm: string): boolean {
     || /tests\/integration\/content-scan\.test\.ts$/.test(norm) // this file
     || /\/build\//.test(norm)                          // transient packaging output
     || /\/dist\//.test(norm)                           // generated output — scanned separately over the built artifact
+    || /\/\.agentel\//.test(norm)                      // transient `agentel verify`/`release-check` reports (gitignored)
+    || /\/\.preflight\//.test(norm)                    // transient governance push-gate evidence (gitignored)
     || /\/tests\//.test(norm);                         // fixtures build real temp paths at runtime
 }
 

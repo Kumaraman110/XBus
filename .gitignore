@@ -1,6 +1,8 @@
 node_modules/
 dist/
 build/
+.agentel/
+.preflight/
 *.log
 .xbus-test-home/
 .xbus-spike-home/

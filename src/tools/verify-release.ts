@@ -202,6 +202,10 @@ async function main(): Promise<void> {
         const verified = /round-trip: VERIFIED/.test(rz1.out) && /round-trip: VERIFIED/.test(rz2.out);
         zipOk = s1 === s2 && verified;
         zipDetail = zipOk ? `reproducible (SHA ${s1.slice(0, 12)}…), round-trip VERIFIED` : `nondeterministic or unverified (s1=${s1.slice(0, 12)} s2=${s2.slice(0, 12)} verified=${verified})`;
+        // Emit the FULL sha-256 on its own machine-parseable line (additive; the human detail above
+        // stays truncated for readability). `agentel verify` parses this so its report prints the
+        // COMPLETE artifact SHA-256, not a truncated prefix.
+        if (zipOk) process.stdout.write(`  ARTIFACT_SHA256=${s1}\n`);
       }
       record('release-zip-deterministic', zipOk, zipDetail);
     } else {
