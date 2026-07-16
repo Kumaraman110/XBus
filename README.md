@@ -247,12 +247,30 @@ after regression acceptance; clone/redirect compatibility is preserved where Git
 
 ## Contributing & release verification
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Before a release we run, and
-contributors can reproduce:
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Verify from a fresh clone — one command, nothing preinstalled** (Windows-first). With only an
+unsupported Node (e.g. Node 25) on PATH and no build yet:
+
+```powershell
+node scripts/agentel.mjs verify
+```
+
+The committed bootstrap (`scripts/agentel.mjs`, Node built-ins only) provisions a COMPLETE approved
+Node 22/24 runtime into `.agentel/node` — using an existing approved Node or `AGENTEL_VERIFY_NODE`
+if present, else downloading the **pinned** official Node ZIP into `.agentel/cache` and verifying it
+against a committed SHA-256 before extracting — then runs `npm ci`, builds, and runs the full
+`agentel verify` gate under it. No admin / NVM / PATH edit / manual download; offline once cached;
+concurrency-safe; recovers from interrupted downloads/extractions; fails closed with exact
+proxy/TLS remediation. Everything it writes lives under the gitignored `.agentel/`.
+
+If you already have an approved Node 22/24 + a built `dist/`, the underlying steps are also runnable
+directly:
 
 ```powershell
 npm run build && npm test          # full unit + integration + security suite
 npm run verify:release             # reproducible-artifact + content-scan checks (run twice)
+node .\dist\cli\main.js verify     # the one-command gate (resolve runtime → gate → acceptance)
 node .\dist\cli\main.js doctor     # green on a clean install
 npm audit                          # zero high/critical
 ```

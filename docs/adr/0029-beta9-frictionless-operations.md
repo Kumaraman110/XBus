@@ -44,6 +44,37 @@ the full test/acceptance run would otherwise hit it. With `--skip-acceptance` an
 accepted (no fixture spawns npm/npx). Empirically confirmed: the same integration shard that fails
 under a partial vendored dist passes 415+/418 under a COMPLETE vendored dist with no system Node.
 
+### 1b. TRUE one-command bootstrap (`scripts/agentel.mjs` + `scripts/agentel-runtime-pins.json`)
+
+The runtime RESOLVER only *locates* an approved Node; it does not *provision* one, and a fresh
+clone has no `dist/` — so `node dist/cli/main.js verify` cannot be the fresh-clone entry point. The
+committed bootstrap closes both gaps. From a clean clone with ONLY an unsupported Node (e.g. Node
+25) on PATH:
+
+```
+node scripts/agentel.mjs verify
+```
+
+runs under any Node WITHOUT the product floor (it is a bootstrapper, using Node built-ins only,
+importing nothing from `dist/` or TS source), then: locates a COMPLETE approved Node 22/24 dist
+(env override `AGENTEL_VERIFY_NODE` → pre-vendored `.agentel/node` → provision); if absent,
+DOWNLOADS the pinned official Node Windows ZIP into `.agentel/cache`, verifies its bytes against the
+committed SHA-256 pin (`scripts/agentel-runtime-pins.json`, cross-checked against
+`https://nodejs.org/dist/<v>/SHASUMS256.txt`), and extracts it ATOMICALLY into `.agentel/node`
+(staging dir → rename); verifies `node.exe` + `npm.cmd` + `npx.cmd` + `npm-cli.js`; runs `npm ci`
+then `npm run build` through the provisioned runtime; and re-execs the real `agentel verify` under
+it (passing `AGENTEL_VERIFY_NODE` so the downstream resolver reuses the same runtime).
+
+Guarantees: no admin / NVM / PATH edit / manual download; NEVER executes an unverified download
+(SHA re-checked immediately before extraction); writes ONLY under `.agentel/` (gitignored) + OS
+temp; leaves tracked files clean; a mkdir-based LOCK (`.agentel/bootstrap.lock`, stale-broken after
+~20 min) makes concurrent bootstraps safe; partial downloads (`*.part` → atomic rename) and partial
+extractions (staging → atomic rename) are discarded + retried; a cached verified ZIP enables OFFLINE
+second runs; a pre-vendored `.agentel/node` or `AGENTEL_VERIFY_NODE` supports offline/corporate use;
+fails closed with EXACT proxy/TLS/download remediation (the built-in downloader cannot traverse an
+`HTTPS_PROXY`, so it refuses rather than silently bypassing a corporate proxy, and points at the
+pre-vendor/preseed paths). The pin file is auditable and bumping it is a reviewed act.
+
 ### 2. `agentel verify` (`src/tools/verify.ts`)
 
 One command: resolve runtime → `npm ci` on it → build → full release gate (`verify:release`:
