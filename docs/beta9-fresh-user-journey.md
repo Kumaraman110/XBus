@@ -8,14 +8,27 @@ The one-command entry point is `agentel verify`. The product is Windows-first an
 is no global `agentel` on PATH; you invoke the CLI as `node <checkout>/dist/cli/main.js <cmd>` (or
 via the installed launcher). `xbus`/`xclaude` remain working deprecated aliases.
 
-## 1. Clone → verify (the frictionless entry point)
+## 1. Clone → verify (the TRUE one-command entry point)
+
+From a fresh clone, with only an unsupported Node (e.g. global Node 25) on PATH, ONE command:
 
 ```
 git clone <repo> && cd <repo>
-node dist/cli/main.js verify          # after an initial `npm ci && npm run build` to have dist/
+node scripts/agentel.mjs verify
 ```
 
-`agentel verify` runs, in order, each stage tagged with a failure CLASS:
+`scripts/agentel.mjs` is the committed bootstrap (Node built-ins only; imports nothing from
+`dist/`). It runs under any Node without the product floor, then provisions a COMPLETE approved
+Node 22/24 runtime (env override `AGENTEL_VERIFY_NODE` → pre-vendored `.agentel/node` → download the
+pinned official Node ZIP into `.agentel/cache`, verify its committed SHA-256, extract atomically
+into `.agentel/node`), runs `npm ci` + `npm run build` on it, then re-execs the real `agentel
+verify` under it. No admin / NVM / PATH edit / manual download; offline once cached; concurrency-safe;
+recovers from interrupted downloads/extractions; fails closed with exact proxy/TLS remediation.
+
+(If you already have an approved Node 22/24 and a built `dist/`, `node dist/cli/main.js verify`
+works directly — but the bootstrap above is the fresh-clone path that needs nothing preinstalled.)
+
+`agentel verify` then runs, in order, each stage tagged with a failure CLASS:
 
 | Stage | Class | What it does |
 |---|---|---|
@@ -36,9 +49,13 @@ On success it prints the reproducible artifact SHA-256 and writes `.agentel/veri
   `verify`/`release-check`/`govern`), the resolver rejects Node 25 and selects an approved Node 22,
   and the full gate passes 6/6 (release-gate 15/15, 914+ tests, npm audit 0, clean-machine + reclaim
   PASS).
-- **No system Node** — with a COMPLETE Node dist vendored into `.agentel/node/` and PATH containing
-  only that dir + `System32` (no other Node anywhere), the resolver selects `vendored`, the
-  runtime-completeness stage passes, and deps + build proceed on the vendored runtime.
+- **Fresh clone, no system Node, one command** — `node scripts/agentel.mjs verify` launched under
+  Node 25 in a clean copied checkout (no `dist/`, no `node_modules/`, empty `.agentel/`) PROVISIONS
+  a complete approved Node 22 (SHA-verified pinned ZIP → atomic extract), installs, builds, and
+  completes all verify stages. Proven by `scripts/accept-bootstrap.mjs` (15 checks): fresh-clone
+  provision, offline cached run, corrupted-ZIP rejection, wrong-SHA rejection, partial-extraction
+  recovery, incomplete-runtime fail-closed, `AGENTEL_VERIFY_NODE` override, and writes-only-under-
+  `.agentel`.
 - **Repo stays clean** — verify writes only under gitignored `.agentel/`; `git status` after a run
   shows no tracked changes.
 - **Idempotent / reproducible** — two separate `agentel release-check` runs print an identical
