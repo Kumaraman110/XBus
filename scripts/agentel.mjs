@@ -134,6 +134,35 @@ function acquireLock(staleMs = 20 * 60_000) {
 }
 function releaseLock() { try { fs.rmSync(LOCK_DIR, { recursive: true, force: true }); } catch { /* */ } }
 
+/** The three supported ways to provision WITHOUT a working network — named in every download
+ *  failure so the remediation is actionable, never a raw stack. */
+function offlineRemediation() {
+  return [
+    'Supported alternatives (no network / behind a proxy):',
+    `  1. Place the pinned verified ZIP under ${CACHE_DIR} (its SHA-256 is re-checked before use).`,
+    `  2. Pre-vendor a complete Node 22/24 runtime under ${RUNTIME_DIR} (node + npm/npx + npm-cli.js).`,
+    '  3. Set AGENTEL_VERIFY_NODE to a complete approved Node 22/24 distribution.',
+  ].join('\n');
+}
+
+/** Turn a raw download/socket/TLS error into a concise, fail-closed, actionable message. Covers
+ *  ECONNRESET / ECONNREFUSED / ETIMEDOUT / socket hang up / TLS-certificate / proxy classes. Never
+ *  disables TLS, bypasses the SHA, or executes anything — it only explains the offline alternatives. */
+function classifyDownloadError(err, url) {
+  const code = err && err.code ? String(err.code) : '';
+  const msg = err && err.message ? String(err.message) : String(err);
+  const both = `${code} ${msg}`;
+  let cause;
+  if (code === 'ECONNRESET' || /socket hang ?up/i.test(both)) cause = 'the connection was reset (ECONNRESET / socket hang up) — often a proxy or network appliance dropping the connection';
+  else if (code === 'ECONNREFUSED') cause = 'the connection was refused (ECONNREFUSED) — the host/port is unreachable from this network';
+  else if (code === 'ETIMEDOUT' || /TIMEOUT/i.test(both)) cause = 'the connection timed out (ETIMEDOUT) — the network is slow/blocked or a proxy is required';
+  else if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') cause = 'DNS resolution failed (ENOTFOUND/EAI_AGAIN) — no network or a proxy-only environment';
+  else if (/self.signed|unable to (verify|get)|CERT_|DEPTH_ZERO|ERR_TLS|certificate/i.test(both)) cause = 'a TLS/certificate error — a corporate TLS-inspection proxy is likely intercepting the connection (AgenTel will NOT disable TLS verification)';
+  else if (/PROXY_UNSUPPORTED/.test(both)) return err.message; // already a full remediation message
+  else cause = `${code ? code + ': ' : ''}${msg}`;
+  return `Could not download the pinned Node runtime from ${url}: ${cause}.\n${offlineRemediation()}`;
+}
+
 /** Download url → dest with redirects + timeout. Writes to dest.part then renames (atomic). */
 function download(url, dest, redirects = 0) {
   return new Promise((resolve, reject) => {
@@ -143,7 +172,7 @@ function download(url, dest, redirects = 0) {
     const proxy = process.env.HTTPS_PROXY || process.env.https_proxy;
     // Built-in https has no proxy support; if a proxy is set we cannot honor it without a dep —
     // fail closed with exact remediation rather than silently bypassing a corporate proxy.
-    if (proxy) return reject(new Error(`PROXY_UNSUPPORTED: HTTPS_PROXY is set (${proxy}) but the built-in downloader cannot traverse a proxy. Pre-vendor a complete Node dist into ${RUNTIME_DIR}, or place the pinned ZIP in ${CACHE_DIR}, or set AGENTEL_VERIFY_NODE to an installed Node 22/24.`));
+    if (proxy) return reject(new Error(`PROXY_UNSUPPORTED: HTTPS_PROXY is set (${proxy}) but the built-in downloader cannot traverse a proxy.\n${offlineRemediation()}`));
     const req = https.get(url, { timeout: 60_000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -155,12 +184,8 @@ function download(url, dest, redirects = 0) {
       out.on('error', reject);
       out.on('finish', () => out.close(() => { try { fs.renameSync(part, dest); resolve(); } catch (e) { reject(e); } }));
     });
-    req.on('timeout', () => { req.destroy(new Error(`TIMEOUT fetching ${url} (60s). Check network/TLS/proxy.`)); });
-    req.on('error', (e) => {
-      const tls = /self.signed|unable to (verify|get)|CERT_|DEPTH_ZERO/i.test(e.message)
-        ? ` TLS error — a corporate TLS-inspection proxy may be intercepting the connection. Pre-vendor a complete Node dist into ${RUNTIME_DIR} or place the pinned ZIP in ${CACHE_DIR}.` : '';
-      reject(new Error(`${e.message}${tls}`));
-    });
+    req.on('timeout', () => { const e = new Error('ETIMEDOUT'); e.code = 'ETIMEDOUT'; req.destroy(e); });
+    req.on('error', (e) => { reject(new Error(classifyDownloadError(e, url))); });
   });
 }
 
@@ -343,4 +368,17 @@ async function main() {
   process.exit(code);
 }
 
-main().catch((e) => { releaseLock(); die(e && e.stack ? e.stack : String(e)); });
+// Exported for unit tests (classification is pure). The bootstrap only RUNS when invoked directly
+// as a script (process.argv[1] is this file), not when imported by a test.
+export { classifyDownloadError, offlineRemediation };
+
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) {
+  main().catch((e) => {
+    releaseLock();
+    // Download/provision failures already carry a concise, actionable remediation as their message
+    // (see classifyDownloadError). Print the MESSAGE, not a raw stack. Fall back to the stack only for
+    // genuinely unexpected errors that lack a message.
+    die(e && e.message ? e.message : (e && e.stack ? e.stack : String(e)));
+  });
+}
