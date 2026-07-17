@@ -52,11 +52,20 @@ function freshCheckout(withSrc = false) {
   // Explicitly NO dist/, NO node_modules/, empty (absent) .agentel/.
   return dir;
 }
-/** Run the bootstrap in `dir` under the (unsupported) launcher Node, provision-only. */
+/** Run the bootstrap in `dir` under the (unsupported) launcher Node, provision-only.
+ *  The baseline provisioning scenarios (1–6) must NOT inherit an ambient AGENTEL_VERIFY_NODE /
+ *  XBUS_VERIFY_NODE — otherwise the bootstrap would resolve that override instead of exercising the
+ *  download/extract/cache path, silently invalidating the test. Build a SANITIZED base env that
+ *  strips both, so `AGENTEL_VERIFY_NODE=<node> npm run accept:bootstrap` still runs the real
+ *  provisioning cases. Scenario 7 explicitly re-adds its own AGENTEL_VERIFY_NODE via `extraEnv` to
+ *  prove the override still wins. */
 function runProvision(dir, extraEnv = {}, extraArgs = []) {
+  const baseEnv = { ...process.env };
+  delete baseEnv.AGENTEL_VERIFY_NODE;
+  delete baseEnv.XBUS_VERIFY_NODE;
   const r = spawnSync(launcher, [path.join(dir, 'scripts', 'agentel.mjs'), 'verify', '--provision-only', ...extraArgs], {
     cwd: dir, encoding: 'utf8', timeout: 180_000,
-    env: { ...process.env, ...extraEnv },
+    env: { ...baseEnv, ...extraEnv },
   });
   return { code: r.status ?? 1, out: (r.stdout || '') + (r.stderr || '') };
 }
