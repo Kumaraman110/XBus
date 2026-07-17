@@ -1,7 +1,7 @@
-XBus — Windows release asset
-=============================
+AgenTel — Windows release asset
+===============================
 
-XBus is a durable local coordination layer that lets independently-launched
+AgenTel is a durable local coordination layer that lets independently-launched
 Claude Code CLI sessions on ONE computer, under ONE OS user, discover each other
 and exchange messages. It is an independent, unofficial open-source project by
 Aman Kumar; it is not affiliated with or endorsed by Anthropic.
@@ -15,31 +15,35 @@ folder.
 Requirements
 ------------
   - Windows.
-  - Node.js >= 22.13 and < 25  (Node 22.13+ LTS or Node 24; Node 25+ is NOT yet
-    supported and will be refused with an actionable message). beta.5 raised the
-    floor to 22.13 so the read-only dashboard worker can open the database with a
-    physically read-only handle.
-  - Do NOT set XBUS_ALLOW_UNSUPPORTED_NODE — supported runtimes do not need it.
+  - NOTHING else. This official release ZIP includes its OWN pinned Node runtime
+    (runtime\node.exe). You do NOT need to install Node, npm, or NVM; you do NOT
+    need admin rights; and you do NOT need to change PATH. A Node already on your
+    PATH (even an unsupported one like Node 25) is IGNORED — the installer always
+    uses the bundled, integrity-verified runtime.
+  - (Source checkouts only, not this ZIP: a complete supported Node 22.13+ LTS or
+    Node 24 on PATH is used as a development fallback. Node 25+ is not yet
+    validated.)
 
-Check your Node:
-    node --version
 
-
-Install (PATH-free)
--------------------
+Install (bundled runtime; PATH-free)
+------------------------------------
 From a PowerShell window opened IN this extracted folder:
 
     .\install.ps1
 
-That is the whole install. It verifies Node, then runs the bundled CLI's
-`install` from this folder. It is reversible and it does NOT modify PATH, the
-registry, or your PowerShell profile.
+That is the whole install. The installer VERIFIES the bundled runtime's SHA-256
+against this asset's SHA256SUMS, then uses that runtime (by absolute path) to run
+the bundled CLI's `install` from this folder. It is reversible and it does NOT
+modify PATH, the registry, or your PowerShell profile. It prints the runtime
+source (bundled or PATH fallback), the runtime version, and the action.
 
 To preview first without writing anything:
 
     .\install.ps1 -DryRun
 
-If you prefer to call the CLI directly (equivalent to the above):
+(If runtime\node.exe were ever missing — e.g. a source checkout, not this ZIP —
+the installer would fall back to a complete supported Node 22/24 on PATH, and
+the equivalent direct commands would be:)
 
     node .\dist\cli\main.js install --dry-run    # preview, writes nothing
     node .\dist\cli\main.js install              # user-scope install
@@ -47,17 +51,18 @@ If you prefer to call the CLI directly (equivalent to the above):
 
 What install does
 -----------------
-  1. Copies the XBus plugin to a user-scope install root
-     (default: %USERPROFILE%\.claude\xbus-install\plugin).
-  2. Registers the XBus MCP server + lifecycle hooks for Claude Code (user scope):
-     a SessionStart hook (so every session auto-registers and appears in the
-     dashboard) plus the UserPromptSubmit/Stop checkpoint-delivery hooks.
+  1. Copies the AgenTel plugin to a user-scope install root
+     (default: %USERPROFILE%\.claude\xbus-install\plugin — the on-disk path keeps
+     its `xbus-install` name for upgrade compatibility with existing installs).
+  2. Registers the AgenTel MCP server + lifecycle hooks for Claude Code (user
+     scope): a SessionStart hook (so every session auto-registers and appears in
+     the dashboard) plus the UserPromptSubmit/Stop checkpoint-delivery hooks.
   3. Creates an ACL-restricted per-user data directory with a per-install secret
      (default: %USERPROFILE%\.claude\xbus-install\data).
 
 It writes ONLY under your user scope. It does NOT change PATH, the registry, or
-any shell profile. There is intentionally no global `xbus` command in this
-preview — you invoke XBus with `node <path>` as shown below.
+any shell profile. There is intentionally no global `agentel` command in this
+preview — you invoke AgenTel with `node <path>` as shown below.
 
 
 Verify the install
@@ -68,11 +73,12 @@ Verify the install
 compatibilityId, installedArtifactManifestSha256) and broker health.
 
 
-Launch Claude Code with XBus enabled
-------------------------------------
+Launch Claude Code with AgenTel enabled
+---------------------------------------
     node .\dist\launcher\xclaude.js
 
-`xclaude` spawns your own `claude` with `--plugin-dir <installed plugin>` and
+`xclaude` (the launcher's kept alias) spawns your own `claude` with
+`--plugin-dir <installed plugin>` and
 forwards your arguments verbatim. If `claude` is not on your PATH, set
 CLAUDE_CODE_EXECPATH to its full path first, e.g.:
 
@@ -98,8 +104,8 @@ get its URL without opening a browser:
 The dashboard is loopback-only (127.0.0.1) and every request is authenticated.
 
 
-Invoke an installed XBus by absolute path
------------------------------------------
+Invoke an installed AgenTel by absolute path
+--------------------------------------------
 After install you can run the installed copy directly (no need to keep this
 extracted folder):
 
@@ -123,9 +129,14 @@ install never made one.
 
 Integrity
 ---------
-SHA256SUMS lists a SHA-256 for every payload file in this asset. To verify a
-file on Windows:
+SHA256SUMS lists a SHA-256 for every payload file in this asset, including the
+bundled runtime (runtime/node.exe). .\install.ps1 automatically verifies the
+bundled runtime against SHA256SUMS BEFORE executing it, and fails closed
+(refusing to run) if the entry is missing or the bytes do not match — it never
+silently falls back to a global Node when a bundled runtime is present but fails
+verification. To verify any file yourself on Windows:
 
+    Get-FileHash .\runtime\node.exe -Algorithm SHA256
     Get-FileHash .\dist\cli\main.js -Algorithm SHA256
 
 provenance.json records the exact, deterministic build identity (productVersion,
