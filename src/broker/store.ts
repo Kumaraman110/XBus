@@ -420,7 +420,11 @@ export class BrokerStore {
       if (reclaim && physicalSessionId !== reclaim.canonicalSessionId) {
         this.db.prepare('INSERT OR REPLACE INTO physical_session_map (physical_session_id, canonical_session_id, logical_identity_id, created_at) VALUES (?,?,?,?)')
           .run(physicalSessionId, reclaim.canonicalSessionId, reclaim.logicalIdentityId, now);
-        this.audit('IDENTITY_RECLAIMED', { sessionId: reclaim.canonicalSessionId, physicalSessionId });
+        // Beta.10 Stage 0 (ADR-0027 D7): a cross-id reclaim is an identity-AUTHORITY transition and
+        // MUST be hash-chained (was best-effort audit() — the least tamper-evident path for the most
+        // security-sensitive event). actor = the canonical (durable) identity reclaimed onto; subject
+        // ids-only; payload no secret/body. In the register() txn → shares the mutation's fate.
+        this.ledger('identity.reclaimed', reclaim.canonicalSessionId, { sessionId: reclaim.canonicalSessionId }, { physicalSessionId });
       }
 
       const existing = this.db
@@ -487,7 +491,9 @@ export class BrokerStore {
           // automatic_alias'); reactivate it (re-upsert if the row was pruned). The
           // session's prior USER name stays released (re-claimed below if requested).
           this.upsertAutomaticAliasSafe(automaticAlias(input.sessionId), input.sessionId, now);
-          this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
+          // Beta.10 Stage 0 (ADR-0027 D7): expired-resume is a committed identity-lifecycle transition
+          // → hash-chained (was audit()). actor = the resumed session's own id; in the register() txn.
+          this.ledger('session.expired_resumed', input.sessionId, { sessionId: input.sessionId }, { epoch });
         }
       } else {
         // Split-brain guard (ADR 0008): at most ONE live writable (mcp) component
@@ -888,7 +894,10 @@ export class BrokerStore {
       // authority — in the same transaction; mint a stable owner secret on first protected award
       // (reused, not rotated, on subsequent renames so the client cannot be self-locked-out).
       const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
-      this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
+      // Beta.10 Stage 0 (ADR-0027 D7): a rename is a committed name-authority transition → hash-chained
+      // (was audit()). actor = the renaming session; payload carries the display name only (NEVER the
+      // ownerSecret — D7 invariant: the plaintext secret must not appear in ledger_events/audit_events).
+      this.ledger(wasExpired ? 'session.expired_resumed_via_rename' : 'session.rename', auth.sessionId, { sessionId: auth.sessionId }, { name: norm.display });
       return { state: 'active', name: norm.display, ownerSecret };
     });
   }

@@ -16,9 +16,18 @@ import { BUILD_ID } from '../../src/protocol/handshake.js';
 
 let dataDir: string;
 
+// Beta.10 Stage 0: a synthetic state file uses a fixed processCreatedAt marker; `provenLive`
+// injects a liveness reader that returns that SAME marker for the pid, so classifyLiveness sees a
+// creation-time MATCH → PROVEN_LIVE_BROKER (the "identity-valid + alive broker" cases these tests
+// simulate). Without proof, an alive-but-unverifiable pid is now correctly INCONCLUSIVE→refuse
+// (that IS the recycled-PID hardening — see the dedicated liveness-proof tests). Deterministic,
+// no real broker / PID collision needed.
+const FAKE_CREATED_MS = 1700000000000;
+const provenLive = { readCreationTimeMs: (_pid: number) => FAKE_CREATED_MS };
+
 function writeState(over: Partial<BrokerStateFile>): void {
   writeStateFile(dataDir, {
-    pid: process.pid, processStartedAt: new Date(1700000000000).toISOString(),
+    pid: process.pid, processStartedAt: new Date(1700000000000).toISOString(), processCreatedAt: FAKE_CREATED_MS,
     brokerInstanceId: 'inst-test', buildId: BUILD_ID, endpoint: 'ep', ownerIdentityHash: ownerIdentityHash(),
     ...over,
   });
@@ -66,8 +75,8 @@ describe('broker shutdown classification (ADR 0007) — no unrelated process is 
     // pid alive (ours) but caller expects a specific instance; mismatch -> refuse.
     writeState({ pid: process.pid, brokerInstanceId: 'reused-pid-broker' });
     expect(classifyShutdown(dataDir, 'the-real-broker').action).toBe('refuse');
-    // matching instance -> ipc (would be safe to signal)
-    expect(classifyShutdown(dataDir, 'reused-pid-broker').action).toBe('ipc');
+    // matching instance + PROVEN liveness -> ipc (would be safe to signal)
+    expect(classifyShutdown(dataDir, 'reused-pid-broker', provenLive).action).toBe('ipc');
   });
 
   it('5. broker instance ID mismatch -> refuse', () => {
@@ -93,7 +102,25 @@ describe('broker shutdown classification (ADR 0007) — no unrelated process is 
     // identity-valid + alive -> classify says ipc (the CLI tries IPC first, then
     // forced ONLY on IPC failure with a still-verified pid).
     writeState({ pid: process.pid, brokerInstanceId: 'inst-test' });
-    expect(classifyShutdown(dataDir, 'inst-test').action).toBe('ipc');
+    expect(classifyShutdown(dataDir, 'inst-test', provenLive).action).toBe('ipc');
+  });
+
+  it('S0-B7 (beta.10): OLD-style state file (no processCreatedAt) + no handshake -> INCONCLUSIVE -> refuse (never signal an unprovable pid)', () => {
+    // Regression-lock the degrade path (Adversarial ask): a pre-upgrade state file has no
+    // processCreatedAt marker. With the pid alive but NO way to prove it is our broker (no
+    // creation-time to compare, no handshake arm wired), the verdict is INCONCLUSIVE and the
+    // KILL path fails closed -> 'refuse'. This is fail-SAFE (a real old-file broker can't be
+    // gracefully IPC-stopped via the new path until it re-writes a marker on next start), and it
+    // MUST NEVER become 'ipc' (that was the recycled-PID bug). readCreationTimeMs->null models
+    // the pid being unreadable / no marker recorded.
+    const alivePid = process.pid; // definitely alive, but not our broker
+    writeStateFile(dataDir, {
+      pid: alivePid, processStartedAt: new Date(1700000000000).toISOString(), // NO processCreatedAt
+      brokerInstanceId: 'inst-test', buildId: BUILD_ID, endpoint: 'ep', ownerIdentityHash: ownerIdentityHash(),
+    });
+    const d = classifyShutdown(dataDir, 'inst-test', { readCreationTimeMs: () => null });
+    expect(d.action).toBe('refuse');
+    expect(d.reason).toMatch(/inconclusive|cannot prove/i);
   });
 
   it('9. forced shutdown precondition: pid must still be alive + owned (signal 0 probe, no kill)', () => {
@@ -105,8 +132,8 @@ describe('broker shutdown classification (ADR 0007) — no unrelated process is 
 
   it('10. concurrent stop attempts: both classify safely; none targets an unrelated pid', () => {
     writeState({ pid: process.pid, brokerInstanceId: 'inst-test' });
-    const d1 = classifyShutdown(dataDir, 'inst-test');
-    const d2 = classifyShutdown(dataDir, 'inst-test');
+    const d1 = classifyShutdown(dataDir, 'inst-test', provenLive);
+    const d2 = classifyShutdown(dataDir, 'inst-test', provenLive);
     expect(d1.action).toBe('ipc');
     expect(d2.action).toBe('ipc');
     // After the file is gone (one winner cleaned up), the other sees 'none'.
