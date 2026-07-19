@@ -11,7 +11,7 @@
  * Sender identity is ALWAYS derived from the authenticated session passed by the
  * broker connection layer — never from caller-supplied fields.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
@@ -35,6 +35,23 @@ export type OperatorSendInput = SendInput & { threadId?: string; parentMessageId
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
+
+/** beta.9.1 credential hardening: bytes of CSPRNG entropy behind an identity-reclaim
+ *  credential (the owner secret). 32 bytes = 256 bits, hex-encoded to a 64-char opaque
+ *  string — the same string shape the prior sha256-hex derivation produced, so the client
+ *  representation and the persisted `hashSecret(secret)` verification contract are unchanged. */
+export const CREDENTIAL_SECRET_BYTES = 32;
+
+/** beta.9.1: the SINGLE production source of credential-grade entropy. A reclaim credential
+ *  MUST be unpredictable — the prior derivation (sha256 over the public brokerInstanceId + a
+ *  monotonic fencing counter + wall-clock ms) was reconstructable by anyone who observed the
+ *  public brokerInstanceId and bounded the counter + mint window, so it was NOT unguessable.
+ *  This draws from Node's cryptographic RNG (`crypto.randomBytes`), the same primitive the
+ *  receipt-capability path already uses. It is the DEFAULT for the store's `randomFn` seam;
+ *  tests may inject a deterministic seam but can NEVER change this production default. */
+export function cryptoCredentialSecret(): string {
+  return randomBytes(CREDENTIAL_SECRET_BYTES).toString('hex');
+}
 
 /**
  * Beta.5 Phase 1 (ADR 0013 D2): SessionStart `source` → the ledger event type recorded
@@ -154,7 +171,15 @@ export class BrokerStore {
     private readonly db: SqliteDriver,
     private readonly clock: Clock,
     private readonly ids: IdGen,
+    // beta.9.1: retained for positional call-site compatibility only. It USED to seed the
+    // owner-secret derivation; that derivation is gone (secrets now come from a CSPRNG), so this
+    // is no longer read. Kept as a positional param to avoid churning 30+ construction sites.
     private readonly brokerInstanceId: string,
+    // beta.9.1: injectable credential-entropy seam (mirrors ReceiptsStore's randomFn). The
+    // DEFAULT is the production CSPRNG; a test may pass a deterministic function to make a
+    // minted secret predictable, but omitting it ALWAYS yields cryptographic entropy — there is
+    // no production code path that reaches a non-CSPRNG default.
+    private readonly randomFn: () => string = cryptoCredentialSecret,
   ) {
     this.controls = new ControlsStore(db, clock);
   }
@@ -278,13 +303,16 @@ export class BrokerStore {
     return createHash('sha256').update(`owner:${secret}`, 'utf8').digest('hex');
   }
 
-  /** Mint a fresh opaque ownership secret (returned to the client verbatim, once). */
+  /** Mint a fresh opaque ownership secret (returned to the client verbatim, once).
+   *  beta.9.1: drawn from a CSPRNG (`randomFn`, default `cryptoCredentialSecret`). The prior
+   *  derivation — sha256 over the PUBLIC brokerInstanceId + monotonic fencing counter +
+   *  wall-clock ms — was reconstructable and therefore guessable; it is replaced here. The
+   *  returned string is still a 64-char hex value, so the client representation and the
+   *  persisted `hashSecret(secret)` verification are unchanged (already-issued secrets keep
+   *  verifying). No fencing-counter bump: uniqueness now comes from 256 bits of entropy, not
+   *  the counter, so this mint no longer perturbs the shared fence used by epoch tokens. */
   private mintOwnerSecret(): string {
-    // Derive from the monotonic fencing counter so it is unguessable + unique without a RNG
-    // dependency in the store (tests use a deterministic clock; the value must still be opaque).
-    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
-    const v = (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
-    return createHash('sha256').update(`owner-secret:${this.brokerInstanceId}:${v}:${this.clock.nowMs()}`, 'utf8').digest('hex');
+    return this.randomFn();
   }
 
   /** The durable logical identity of a canonical session row (defaults to the id itself for a
