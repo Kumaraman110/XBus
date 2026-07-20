@@ -130,11 +130,12 @@ export function postMutationStatus(action, resultBody, refreshResult) {
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const C = window.XBusCollections; // Collections module (roster grouping)
   const filterState = { search: '', status: 'all', control: 'all', collectionSelector: 'all' };
-  // Persistence backend (WS3 cutover seam): default to localStorage. To move Collections onto
-  // the broker DB once WS3 lands, change ONLY this one line to `C.makeServerStore(window.XBusApi)`
-  // — every mutation path already goes through the async store, so nothing else changes.
-  const collectionsStore = C ? C.makeLocalStorageStore(window.localStorage) : null;
+  // Persistence backend (WS3 cutover seam): default to localStorage; AUTOMATICALLY switches to the
+  // broker DB (makeServerStore) at init() the instant the capability probe finds GET/POST
+  // /api/collections. No manual flip needed — the probe drives it; localStorage stays until then.
+  let collectionsStore = C ? C.makeLocalStorageStore(window.localStorage) : null;
   let collectionsState = C ? C.emptyState() : null; // hydrated async at init() via the store
+  let caps = window.XBusCaps ? window.XBusCaps.emptyCaps() : { health: false, redeliver: false, instances: false, collectionsServer: false };
   let inspectorSessionId = null; // the session currently open in the inspector (persist across refresh)
 
   // Persist through the swappable store (async). Best-effort: a failure never throws here; the
@@ -287,6 +288,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // failed (delivery errors). Failed is emphasized when non-zero.
     panel.appendChild(buildWorkPanel(s));
 
+    // #2 instance history (pre-staged, WS1): renders ONLY when the session projection carries
+    // instances[] (i.e. after WS1 ships it on /api/session/:id). Pre-WS1 → empty → nothing renders.
+    const instHost = buildInstanceHistory(s);
+    if (instHost) panel.appendChild(instHost);
+
     // Collections membership (local grouping).
     if (C) panel.appendChild(buildCollectionsChips(s));
 
@@ -334,6 +340,37 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     wrap.appendChild(tiles);
     return wrap;
   }
+
+  /**
+   * #2 (pre-staged, WS1): instance history for the inspected agent — current + past runtime
+   * instances (role/state/pid/connected/last-seen), current-first. Returns null when the session
+   * projection carries NO instances[] (pre-WS1) so nothing renders — respecting the zero-dead-control
+   * gate. Physical/epoch stay diagnostics-only (not shown here). Pure render over prestage rows.
+   */
+  function buildInstanceHistory(s) {
+    if (!window.XBusPrestage) return null;
+    const rows = window.XBusPrestage.instanceHistoryRows(s);
+    if (!rows.length) return null; // pre-WS1: no instances[] on the projection → render nothing
+    const wrap = el('div', 'insp-instances');
+    wrap.appendChild(el('span', 'insp-k', 'Instances'));
+    const list = el('div', 'inst-list');
+    for (const r of rows) {
+      const row = el('div', 'inst-row' + (r.current ? ' inst-current' : ''));
+      row.appendChild(el('span', 'inst-role', r.role));
+      row.appendChild(el('span', 'inst-state state-inst-' + r.state, r.state));
+      row.appendChild(el('span', 'inst-pid', r.pid != null ? ('pid ' + r.pid) : '—'));
+      const when = r.current ? ('since ' + hhmmssSafe(r.connectedAt)) : (hhmmssSafe(r.connectedAt) + '–' + hhmmssSafe(r.disconnectedAt));
+      const w = el('span', 'inst-when', when); if (r.lastSeenAt) w.title = 'last seen ' + r.lastSeenAt;
+      row.appendChild(w);
+      if (r.current) row.appendChild(el('span', 'inst-badge', 'current'));
+      list.appendChild(row);
+    }
+    wrap.appendChild(list);
+    return wrap;
+  }
+
+  /** hh:mm:ss slice of an ISO instant, or '—'. (Local mirror; app.js hhmmss isn't module-scoped here.) */
+  function hhmmssSafe(iso) { return iso ? String(iso).slice(11, 19) : '—'; }
 
   function buildCollectionsChips(s) {
     const wrap = el('div', 'insp-collections');
@@ -525,19 +562,62 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     document.body.appendChild(overlay);
   }
 
-  /* ---- lifecycle: hydrate collections from the store, build the toolbar, keep inspector fresh ---- */
+  /* ---- lifecycle: probe caps, pick the collections backend, hydrate, build toolbar, keep fresh ---- */
   function init() {
     buildToolbar(); // immediate (empty collections) so the roster filters render without waiting
-    // Hydrate Collections from the swappable persistence backend (localStorage now; broker DB
-    // after the WS3 cutover). Async so the server store works unchanged; on resolve, rebuild the
-    // toolbar (collection selector) + re-render the roster so grouping applies.
-    if (collectionsStore) {
-      void collectionsStore.load().then((st) => {
-        if (st) { collectionsState = st; buildToolbar(); if (window.XBusApi) window.XBusApi.rerender(); }
-      }).catch(() => { /* store.load never throws, but be defensive */ });
-    }
+    void bootProbeAndHydrate();
     // app.js re-renders sessions on every stream frame / poll; the interval below keeps the open
     // inspector in sync with the latest authenticated payload (survives live updates + restart).
+  }
+
+  /**
+   * Capability-gated boot: probe the broker for optional endpoints (WS1 batch), then (a) switch
+   * Collections onto the server store if /api/collections exists (else keep localStorage), (b)
+   * hydrate Collections from the chosen store, (c) render the health panel if /api/health exists.
+   * Everything is DEFENSIVE — pre-WS1 the probe finds nothing and no optional control renders.
+   */
+  async function bootProbeAndHydrate() {
+    try {
+      if (window.XBusCaps && window.XBusApi) caps = await window.XBusCaps.probeCapabilities(window.XBusApi);
+    } catch { /* probe never throws, but be defensive */ }
+    window.__caps = caps; // expose for diagnostics / other modules
+    // Collections cutover: the instant the server endpoint exists, use it (shared across browsers);
+    // otherwise stay on localStorage. One place, driven by the probe — no manual flag flip.
+    if (C && caps.collectionsServer && C.makeServerStore) collectionsStore = C.makeServerStore(window.XBusApi);
+    if (collectionsStore) {
+      try { const st = await collectionsStore.load(); if (st) { collectionsState = st; buildToolbar(); if (window.XBusApi) window.XBusApi.rerender(); } }
+      catch { /* store.load never throws */ }
+    }
+    // #5 health panel — renders only when /api/health exists (else stays hidden; no dead panel).
+    if (caps.health) void renderHealthPanel();
+  }
+
+  /**
+   * #5 — fetch + render the broker/build/runtime/ledger health panel. Capability-gated (only
+   * called when caps.health). Defensive: a failed fetch or empty model hides the panel. Refreshed
+   * on demand (a small refresh button) rather than polled, to stay cheap.
+   */
+  async function renderHealthPanel() {
+    const host = document.getElementById('health-panel');
+    if (!host || !window.XBusPrestage) return;
+    let model = { ok: false, alert: false, rows: [] };
+    try { model = window.XBusPrestage.healthPanelModel(await window.XBusApi.get('/api/health')); }
+    catch { /* endpoint vanished / read failed → hide */ }
+    if (!model.ok) { host.hidden = true; host.replaceChildren(); return; }
+    host.hidden = false;
+    host.replaceChildren();
+    const head = el('div', 'sec-head');
+    head.appendChild(el('h2', null, 'System health'));
+    head.appendChild(el('span', 'sec-note' + (model.alert ? ' err' : ''), model.alert ? 'ledger needs attention' : 'build · runtime · ledger'));
+    host.appendChild(head);
+    const grid = el('div', 'health-grid');
+    for (const row of model.rows) {
+      const cellEl = el('div', 'health-cell');
+      cellEl.appendChild(el('span', 'health-k', row.label));
+      cellEl.appendChild(el('span', 'health-v' + (row.label === 'Ledger' && model.alert ? ' err' : ''), row.value));
+      grid.appendChild(cellEl);
+    }
+    host.appendChild(grid);
   }
 
   window.XBusAgents = {
@@ -546,7 +626,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     describeControlResult,
     postMutationStatus,
     // exposed for tests / debugging
-    _state: () => ({ filterState, collectionsState }),
+    _state: () => ({ filterState, collectionsState, caps }),
   };
 
   // Re-render the inspector whenever the sessions cache changes. app.js updates window.__sessions

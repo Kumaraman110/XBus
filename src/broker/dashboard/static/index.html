@@ -129,6 +129,10 @@
       </div>
     </section>
 
+    <!-- Beta.10 (Train B), #5 pre-staged: system-health panel (build/runtime/ledger/read-worker).
+         Capability-gated on GET /api/health — hidden until WS1 ships it (zero dead controls). -->
+    <section id="health-panel" class="health-panel" aria-label="System health" hidden></section>
+
     <div class="cols-2">
       <div>
         <div class="sec-head"><h2>Audit ledger</h2><span class="sec-note">hash-chained</span></div>
@@ -149,12 +153,14 @@
   </main>
   </div>
 
-  <!-- Load order: collections (local grouping helpers) → app (auth + core render, publishes
-       XBusApi/XBusFriendlyStatus) → agents (roster mgmt + inspector, consumes both). All are
-       external files (strict CSP: script-src 'self'; no inline JS). collections.js + agents.js
-       are ES modules; app.js is a classic script. -->
+  <!-- Load order: helper ES modules (collections/timeline/capabilities/prestage) publish their
+       window.XBus* APIs → app (auth + core render, publishes XBusApi/XBusFriendlyStatus) → agents
+       (roster mgmt + inspector; probes caps, consumes the helpers). All external (strict CSP:
+       script-src 'self'; no inline JS). The helpers + agents are ES modules; app.js is classic. -->
   <script type="module" src="/collections.js"></script>
   <script type="module" src="/timeline.js"></script>
+  <script type="module" src="/capabilities.js"></script>
+  <script type="module" src="/prestage.js"></script>
   <script src="/app.js"></script>
   <script type="module" src="/agents.js"></script>
 </body>

@@ -527,6 +527,18 @@ function renderTimeline(thread) {
       btn.addEventListener('click', () => retryTurn(thread, turn, btn));
       st.appendChild(btn);
     }
+    // #1 (pre-staged, WS1): explicit REDELIVERY — re-present this turn's body to the recipient.
+    // Gated on BOTH the redeliver capability (endpoint exists) AND eligibility (operator turn that
+    // reached/attempted the recipient). Pre-WS1 caps.redeliver is false → nothing renders (no dead
+    // control). Distinct from Retry: redelivery re-injects the SAME message id, not a fresh send.
+    const caps = window.__caps || {};
+    const P = window.XBusPrestage;
+    if (caps.redeliver && P && P.canRedeliverTurn(turn, tstate)) {
+      const rbtn = el('button', 'secondary redeliver-btn', 'Redeliver'); rbtn.type = 'button';
+      rbtn.title = 'Re-present this message to the recipient (the model may process it again).';
+      rbtn.addEventListener('click', () => redeliverTurn(thread, turn, rbtn));
+      st.appendChild(rbtn);
+    }
     div.appendChild(st);
     tl.appendChild(div);
   }
@@ -586,6 +598,24 @@ async function retryTurn(thread, turn, btn) {
     to: thread.peerSessionId, text: turn.text, requiresAck: turn.requiresAck, requiresReply: turn.requiresReply, idempotencyKey: newIdempotencyKey(),
   });
   if (!r.ok) { btn.disabled = false; return; }
+  await loadThread(thread.threadId);
+  refreshThreads();
+}
+
+/* #1 (pre-staged, WS1): explicit operator REDELIVERY — POST /api/message/:id/redeliver {reason?}.
+ * Re-presents the SAME message body to the recipient (distinct from Retry's fresh send). Only
+ * wired when caps.redeliver (endpoint exists). Shows pending/success/failure inline; re-reads the
+ * thread so the timeline reflects the authoritative delivery state. Never claims success on a
+ * non-ok response. The endpoint stamps local-operator + audits OPERATOR_REDELIVERY broker-side. */
+async function redeliverTurn(thread, turn, btn) {
+  btn.disabled = true;
+  const prior = btn.textContent; btn.textContent = 'Redelivering…';
+  const r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console' });
+  if (!r.ok) {
+    btn.disabled = false; btn.textContent = prior;
+    composerError('Redelivery failed (' + r.status + '): ' + (r.body.message || r.body.error || 'error'));
+    return;
+  }
   await loadThread(thread.threadId);
   refreshThreads();
 }

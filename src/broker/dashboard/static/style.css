@@ -527,3 +527,26 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
   border:1px solid var(--glass-border); border-radius:var(--r-pill); padding:5px 10px; cursor:pointer; }
 .attn-chip:hover{ border-color:var(--accent-line); }
 .attn-chip:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* Beta.10 (Train B) pre-staged (WS1): system-health panel (#5), instance history (#2), redeliver (#1). */
+.health-panel{ margin:0 0 var(--sp4); padding:var(--sp4) var(--sp5); border-radius:var(--r);
+  background:var(--glass-fill); border:1px solid var(--glass-border); }
+.health-panel[hidden]{ display:none; }
+.sec-note.err{ color:var(--st-failed); }
+.health-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:var(--sp2) var(--sp5); margin-top:var(--sp2); }
+.health-cell{ display:flex; flex-direction:column; gap:2px; }
+.health-k{ font:600 10px/1 var(--font-ui); letter-spacing:.1em; text-transform:uppercase; color:var(--text-3); }
+.health-v{ font:500 13px/1.4 var(--font-mono); color:var(--text-1); }
+.health-v.err{ color:var(--st-failed); }
+.insp-instances{ margin:var(--sp3) 0; }
+.insp-instances .insp-k{ display:block; margin-bottom:var(--sp2); }
+.inst-list{ display:flex; flex-direction:column; gap:4px; }
+.inst-row{ display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp3); padding:6px 10px; border-radius:var(--r-sm); background:var(--field); font:500 12px/1 var(--font-mono); }
+.inst-row.inst-current{ border-left:2px solid var(--ok); }
+.inst-role{ font-weight:700; color:var(--text-1); text-transform:uppercase; letter-spacing:.05em; }
+.inst-state{ color:var(--text-2); }
+.state-inst-connected{ color:var(--ok); } .state-inst-disconnected{ color:var(--text-3); }
+.inst-pid, .inst-when{ color:var(--text-3); }
+.inst-badge{ font:600 9.5px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--ok); background:var(--accent-soft); padding:3px 7px; border-radius:var(--r-pill); }
+.redeliver-btn{ margin-left:8px; font:500 10.5px/1 var(--font-ui); color:var(--st-delivered); background:var(--st-delivered-bg); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:5px 10px; cursor:pointer; }
+.redeliver-btn:hover{ border-color:var(--accent-line); }
