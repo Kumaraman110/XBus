@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, receiveControlLabel,
+  applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, receiveControlLabel, describeControlResult,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS static asset, intentionally untyped
 } from '../../src/broker/dashboard/static/agents.js';
@@ -76,5 +76,31 @@ describe('control-action surface + KNOWN-3 gate', () => {
     expect(receiveControlLabel('paused')).toMatch(/queue/i);
     expect(receiveControlLabel('do_not_disturb')).toMatch(/disturb/i);
     expect(receiveControlLabel('manual_checkpoint')).toMatch(/[Mm]anual/);
+  });
+});
+
+describe('describeControlResult — honest, authoritative-result wording (esp. stop_managed)', () => {
+  it('a stop that signalled a live process says so + names the pid', () => {
+    const msg = describeControlResult('stop_managed', { stopped: true, killed: true, pid: 4242, killable: true });
+    expect(msg).toMatch(/signalled/i);
+    expect(msg).toContain('4242');
+  });
+  it('a stop with NO live handle is HONEST — markers cleared, no false kill claim', () => {
+    const msg = describeControlResult('stop_managed', { stopped: true, killed: false, pid: 4242, killable: false });
+    expect(msg).toMatch(/markers cleared/i);
+    expect(msg).not.toMatch(/signalled/i);      // must NOT claim a kill that did not happen
+    expect(msg).toMatch(/recycled|restarted|already exited/i); // explains WHY
+  });
+  it('a stop that cleared markers with no process (killable unknown) never claims a kill', () => {
+    const msg = describeControlResult('stop_managed', { stopped: true, killed: false });
+    expect(msg).toMatch(/markers cleared/i);
+    expect(msg).not.toMatch(/signalled/i);
+  });
+  it('other actions render their expected confirmations', () => {
+    expect(describeControlResult('rename_alias', { name: 'svc-x' })).toContain('svc-x');
+    expect(describeControlResult('set_control', { mode: 'paused' })).toContain('paused');
+    expect(describeControlResult('pin', {})).toMatch(/pinned/i);
+    expect(describeControlResult('archive', {})).toMatch(/archived/i);
+    expect(describeControlResult('remove_record', {})).toMatch(/transcript preserved/i);
   });
 });

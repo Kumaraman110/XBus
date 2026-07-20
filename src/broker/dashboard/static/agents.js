@@ -76,6 +76,33 @@ export function applyRosterFilter(sessions, deps) {
   return out.slice();
 }
 
+/**
+ * Human, HONEST success message for a control action's authoritative broker result. Pure +
+ * exported so the stop_managed honesty is unit-testable: a stop that signalled a live process
+ * says so; a stop that could only clear markers (no live handle — recycled-pid safety) says THAT
+ * instead of falsely claiming a kill.
+ */
+export function describeControlResult(action, body) {
+  const b = body || {};
+  switch (action) {
+    case 'rename_alias': return 'Renamed to “' + (b.name || '?') + '”.';
+    case 'set_control': return 'Receive control set to ' + (b.mode || '?') + '.';
+    case 'pin': return 'Pinned.';
+    case 'unpin': return 'Unpinned.';
+    case 'archive': return 'Archived.';
+    case 'unarchive': return 'Unarchived.';
+    case 'stop_managed':
+      if (b.killed) return 'Managed session stopped (process signalled, pid ' + (b.pid != null ? b.pid : '?') + ').';
+      // Not killed: be honest about WHY — either no live handle (markers cleared only) or a
+      // successful clear with no process to signal. Never claim a kill that did not happen.
+      return b.killable === false
+        ? 'Managed markers cleared. No live handle to signal — the process may have already exited, or the broker restarted since launch (xbus will not signal a possibly-recycled pid).'
+        : 'Managed markers cleared (no live process to stop).';
+    case 'remove_record': return 'Record removed (transcript preserved).';
+    default: return 'Done.';
+  }
+}
+
 /* ─────────────────────────────── browser wiring ─────────────────────────────── */
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
@@ -227,10 +254,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     fact('Runtime', s.connection + ' / ' + s.readiness + ' · ' + s.managementState);
     fact('Delivery capability', s.routable ? 'Routable (accepts injection)' : 'Not routable now');
     fact('Receive control', receiveControlLabel(s.receiveControl));
-    const d = s.delivery || {};
-    fact('Pending work', `${d.queued || 0} queued · ${d.delivered || 0} delivered · ${d.failed || 0} failed`);
     fact('Lifecycle', `${s.pinned ? 'pinned' : 'not pinned'} · ${s.archived ? 'archived' : 'not archived'}${s.managed ? ' · managed by xbus' : ''}`);
+    // Managed-session HONESTY: show the recorded pid so the operator knows exactly what a Stop
+    // would target, and that a stale record (no live broker handle) can only clear markers.
+    if (s.managed) fact('Managed process', s.managedPid != null ? ('pid ' + s.managedPid + ' (recorded)') : 'no recorded pid');
     panel.appendChild(facts);
+
+    // Failures + pending work — PROMINENT block (not a muted fact line). Surfaces what needs
+    // attention for this agent: queued (awaiting checkpoint), delivered (injected, unacked),
+    // failed (delivery errors). Failed is emphasized when non-zero.
+    panel.appendChild(buildWorkPanel(s));
 
     // Collections membership (local grouping).
     if (C) panel.appendChild(buildCollectionsChips(s));
@@ -241,6 +274,43 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // Action status line (pending/success/failure).
     const status = el('div', 'insp-status'); status.id = 'insp-status'; status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
     panel.appendChild(status);
+  }
+
+  /**
+   * Prominent work/failures panel for the inspected agent. Renders the delivery breakdown as
+   * labeled tiles (queued / injected / acknowledged / replied / failed) with the FAILED tile
+   * emphasized when non-zero, plus an at-a-glance "needs attention" line. Values come straight
+   * from the authenticated session projection (s.delivery) — no client-invented state.
+   */
+  function buildWorkPanel(s) {
+    const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
+    const wrap = el('div', 'insp-work');
+    const head = el('div', 'insp-work-head');
+    head.appendChild(el('span', 'insp-k', 'Work'));
+    const failed = d.failed || 0;
+    const pending = (d.queued || 0) + (d.delivered || 0);
+    // A concise attention summary: failures first (they need action), then pending (in-flight).
+    const summary = failed > 0
+      ? el('span', 'insp-work-attn err', failed + (failed === 1 ? ' failed delivery' : ' failed deliveries') + ' — needs attention')
+      : pending > 0
+        ? el('span', 'insp-work-attn', pending + ' in flight (' + (d.queued || 0) + ' queued · ' + (d.delivered || 0) + ' unacked)')
+        : el('span', 'insp-work-attn ok', 'No pending or failed work');
+    head.appendChild(summary);
+    wrap.appendChild(head);
+    const tiles = el('div', 'insp-work-tiles');
+    const tile = (label, n, state) => {
+      const t = el('div', 'work-tile work-' + state + (n ? '' : ' work-zero') + (state === 'failed' && n ? ' work-alert' : ''));
+      t.appendChild(el('span', 'work-n', String(n || 0)));
+      t.appendChild(el('span', 'work-l', label));
+      tiles.appendChild(t);
+    };
+    tile('Queued', d.queued, 'queued');
+    tile('Injected', d.delivered, 'delivered');
+    tile('Acked', d.acknowledged, 'ack');
+    tile('Replied', d.replied, 'replied');
+    tile('Failed', d.failed, 'failed');
+    wrap.appendChild(tiles);
+    return wrap;
   }
 
   function buildCollectionsChips(s) {
@@ -293,10 +363,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     wrap.appendChild(actionButton(s.archived ? 'Unarchive' : 'Archive', false, () =>
       runControl(s.sessionId, { action: s.archived ? 'unarchive' : 'archive' }, s.archived ? 'Unarchiving…' : 'Archiving…')));
 
-    // Stop managed session — only meaningful for a managed session; destructive → confirm.
+    // Stop managed session — only for a managed session; destructive → confirm. HONESTY: the
+    // dashboard cannot know whether the broker still holds a LIVE in-process handle (the only
+    // pid-recycling-safe kill proof lives in the daemon, not the read model), so we never promise
+    // a kill. The confirm + result wording make clear a stale record only clears markers; the
+    // authoritative {killed, killable} comes back from the broker and is surfaced via describeResult.
     if (s.managed) {
+      const pidNote = s.managedPid != null ? ` (recorded pid ${s.managedPid})` : '';
       wrap.appendChild(actionButton('Stop session', true, async () => {
-        if (!window.confirm(`Stop the managed session “${s.name || s.sessionId.slice(0, 8)}”? This SIGTERMs the process xbus launched (only if xbus still holds a live handle) and clears its managed markers.`)) return;
+        if (!window.confirm(
+          `Stop the managed session “${s.name || s.sessionId.slice(0, 8)}”${pidNote}?\n\n`
+          + `If xbus still holds a live handle to the process it launched, it is signalled (SIGTERM). `
+          + `If not (the broker restarted since launch, or the process already exited), this only clears `
+          + `the managed markers — xbus will NOT signal a bare pid, since it may have been recycled to an `
+          + `unrelated process. The result will tell you which happened.`)) return;
         await runControl(s.sessionId, { action: 'stop_managed' }, 'Stopping managed session…');
       }));
     }
@@ -350,26 +430,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       return false;
     }
     // Authoritative state re-fetch so the UI cannot drift from the broker.
-    setInspStatus(describeResult(payload.action, r.body), 'ok');
+    setInspStatus(describeControlResult(payload.action, r.body), 'ok');
     await window.XBusApi.refresh();
     // If the record was removed, the session disappears → close the inspector.
     if (payload.action === 'remove_record' && !findSession(sessionId)) { inspectorSessionId = null; }
     renderInspector();
     return true;
-  }
-
-  function describeResult(action, body) {
-    switch (action) {
-      case 'rename_alias': return 'Renamed to “' + ((body && body.name) || '?') + '”.';
-      case 'set_control': return 'Receive control set to ' + ((body && body.mode) || '?') + '.';
-      case 'pin': return 'Pinned.'; case 'unpin': return 'Unpinned.';
-      case 'archive': return 'Archived.'; case 'unarchive': return 'Unarchived.';
-      case 'stop_managed': return body && body.killed ? 'Managed session stopped (process signalled).'
-        : (body && body.killable === false ? 'Managed markers cleared (no live handle to signal — the process may have already exited or the broker restarted since launch).'
-          : 'Managed session stopped.');
-      case 'remove_record': return 'Record removed (transcript preserved).';
-      default: return 'Done.';
-    }
   }
 
   function setActionsDisabled(disabled) {
@@ -415,6 +481,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   window.XBusAgents = {
     rosterFilter,
     openInspector,
+    describeControlResult,
     // exposed for tests / debugging
     _state: () => ({ filterState, collectionsState }),
   };
