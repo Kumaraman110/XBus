@@ -53,11 +53,35 @@ writes across R1/R2/R3 — no partial state, retryable).
 vocabulary) lives behind `SessionIdentitySource` (src/adapter/session-identity.ts). `ClaudeCodeAdapter`
 reads `CLAUDE_CODE_SESSION_ID` + `~/.claude/projects` (injectable env+homedir; never invents an id).
 `FakeAdapter` gives deterministic host-neutral values. The AgenTel core (identity, messaging,
-persistence, conversations, Collections, work items) is provider-NEUTRAL.
-**Boundary enforcement.** adapter-boundary-guard.test.ts statically fails if any `src/broker` file
-reads `process.env.CLAUDE_*` or hard-codes a `.claude` path in non-comment code. One documented
-allow-listed exception: `session-import.ts` (dormant-session discovery) via the injectable
-`XBUS_CLAUDE_PROJECTS_DIR` override — the same seam `ClaudeCodeAdapter.transcriptsRoot()` uses.
+persistence, conversations, Collections, work items) is provider-neutral WITHIN `src/broker` (the
+one documented in-broker exception is `session-import.ts`, below); host env is read at the channel
+EDGE, not in broker-core.
+**Boundary enforcement (with HONEST, stated limits).** adapter-boundary-guard.test.ts statically
+fails if any `src/broker` file reads a `CLAUDE_*` env var (dotted, `process.env['CLAUDE_X']` bracket,
+OR `const { CLAUDE_X } = process.env` destructure) or couples to a `.claude` on-disk path (a single
+`'.../.claude/...'` literal OR a segmented `path.join(..., '.claude', ...)` join) in non-comment
+code. The env + path regexes were HARDENED after a Package-B adversarial finding proved the original
+pair evadable (old path regex needed `.claude`+slash in ONE literal, so a segmented join slipped
+past; old env regex matched only dotted access) — verified to bite on both shapes. **Stated limits
+(not silently relied on):** (1) the guard scans `src/broker` ONLY — the host EDGE (`src/channel/*`
+hooks + MCP `server` + `rewaker`) legitimately reads `process.env.CLAUDE_CODE_SESSION_ID` and is
+intentionally out of scope (that is where host env is *supposed* to be read); (2) it is a
+text-pattern tripwire for the COMMON coupling shapes, not a proof of neutrality — a sufficiently
+obfuscated read (aliased env object, computed property name) could still evade it. One allow-listed
+in-`src/broker` exception: `session-import.ts` (dormant-session discovery) resolves the transcripts
+root via the injectable `XBUS_CLAUDE_PROJECTS_DIR` override + a segmented `~/.claude/projects` join —
+this IS a real broker-core coupling to Claude's on-disk layout; it is allow-listed and stated here
+rather than hidden, and is the intended next thing to route through `ClaudeCodeAdapter.transcriptsRoot()`.
+**Adapter is a tested SEAM, not yet WIRED (honest status — "cannot silently erode" was overstated).**
+At this HEAD `SessionIdentitySource`/`ClaudeCodeAdapter`/`FakeAdapter` are constructed ONLY in tests;
+NO production path imports `session-identity.ts`. Production identity discovery still happens at the
+channel edge (`session-start-hook`, `checkpoint-hook`, `server`, `rewaker` each read
+`process.env.CLAUDE_CODE_SESSION_ID` directly and hand the resolved id inward as a plain param, so
+`mcp-server`/broker-core stay clean). So WS4 delivers (a) a tested seam + conformance proof that the
+core CAN run host-neutrally, and (b) a regression tripwire against NEW broker-core Claude coupling —
+NOT a claim that the live path already flows through the adapter. Wiring the channel edge to call
+`adapter.resolveSessionId()` (which would let the guard extend to `src/channel`) is deferred
+follow-up work.
 **Conformance.** adapter-conformance.test.ts proves identity/delivery/reclaim/restart/reply work
 through the FakeAdapter with NO Claude-specific identifier, plus adapter failure/disconnect/reconnect.
 **Non-goal.** NO Codex production support is claimed — this is the seam that makes a future host

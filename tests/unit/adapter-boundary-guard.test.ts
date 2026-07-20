@@ -39,25 +39,37 @@ function tsFiles(dir: string): string[] {
 }
 
 describe('WS4 architecture guard — src/broker core is provider-neutral', () => {
-  it('no src/broker file reads process.env.CLAUDE_* in non-comment code (except allow-listed)', () => {
+  it('no src/broker file reads a CLAUDE_* env var in non-comment code (dotted, bracket, or destructured; except allow-listed)', () => {
+    // Package-B adversarial finding: the original /process\.env\.CLAUDE_[A-Z_]+/ caught only dotted
+    // access and missed process.env['CLAUDE_X'] and `const { CLAUDE_X } = process.env`. Broadened to
+    // all three access shapes so a future bracket/destructure coupling cannot slip in unseen.
+    const patterns: RegExp[] = [
+      /process\.env\.CLAUDE_[A-Z_]+/,                       // process.env.CLAUDE_X
+      /process\.env\s*\[\s*['"`]CLAUDE_[A-Z_]+['"`]\s*\]/,   // process.env['CLAUDE_X']
+      /\{[^}]*\bCLAUDE_[A-Z_]+\b[^}]*\}\s*=\s*process\.env/, // const { CLAUDE_X } = process.env
+    ];
     const offenders: string[] = [];
     for (const f of tsFiles(BROKER)) {
       if (ALLOWED.has(path.basename(f))) continue;
       const code = stripComments(fs.readFileSync(f, 'utf8'));
-      if (/process\.env\.CLAUDE_[A-Z_]+/.test(code)) offenders.push(path.relative(BROKER, f));
+      if (patterns.some((re) => re.test(code))) offenders.push(path.relative(BROKER, f));
     }
     expect(offenders, `broker core reads CLAUDE_* env: ${offenders.join(', ')}`).toEqual([]);
   });
 
-  it('no src/broker file hard-codes a .claude on-disk path in non-comment code (except allow-listed)', () => {
+  it('no src/broker file couples to a .claude on-disk path in non-comment code (single-literal OR segmented join; except allow-listed)', () => {
+    // Package-B adversarial finding: the original single-literal regex required ".claude" + a slash
+    // INSIDE one string literal, so a segmented path.join(homedir(), '.claude', 'projects') — where
+    // '.claude' is its own quoted segment — evaded it. Catch BOTH shapes.
+    const singleLiteral = /['"`][^'"`]*\.claude[/\\][^'"`]*['"`]/;          // '.../.claude/...'
+    const segmentedClaudeSegment = /['"`]\.claude['"`]/;                     // a bare '.claude' path segment (join arg)
     const offenders: string[] = [];
     for (const f of tsFiles(BROKER)) {
       if (ALLOWED.has(path.basename(f))) continue;
       const code = stripComments(fs.readFileSync(f, 'utf8'));
-      // a string literal containing a .claude path segment (not a comment, not the word in prose)
-      if (/['"`][^'"`]*\.claude[/\\][^'"`]*['"`]/.test(code)) offenders.push(path.relative(BROKER, f));
+      if (singleLiteral.test(code) || segmentedClaudeSegment.test(code)) offenders.push(path.relative(BROKER, f));
     }
-    expect(offenders, `broker core hard-codes a .claude path: ${offenders.join(', ')}`).toEqual([]);
+    expect(offenders, `broker core couples to a .claude path: ${offenders.join(', ')}`).toEqual([]);
   });
 
   it('the one allow-listed exception (session-import) resolves its root via the injectable override, not a bare hard-code', () => {
