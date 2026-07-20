@@ -66,6 +66,19 @@ export interface DashboardSession {
   internal: boolean;
   firstSeenAt: string | null;
   lastSeenSourceAt: string | null;
+  /** Beta.10 (Train B): operator-lifecycle + control state surfaced so the console can render
+   *  authoritative state after a mutation (the release gate: state must not contradict the broker
+   *  after refresh/restart). ADDITIVE — the columns already exist (migrations v3 + v10); this only
+   *  projects them. `receiveControl` LEFT-JOINs session_controls (absent row → 'active').
+   *  `managed` is `managed_by_xbus`; `managedPid` is the recorded pid (NOT a liveness proof — the
+   *  daemon's live in-process handle is the only kill-safe liveness signal, returned by stop_managed). */
+  pinned: boolean;
+  archived: boolean;
+  archivedAt: string | null;
+  receiveControl: string; // 'active' | 'paused' | 'do_not_disturb' | 'manual_checkpoint'
+  claudeTitle: string | null; // Claude-native display title (ADR 0024) — NEVER a routable alias
+  managed: boolean;
+  managedPid: number | null;
   /** Delivery-state breakdown for messages addressed TO this session (blocker #6). */
   delivery: { queued: number; delivered: number; acknowledged: number; replied: number; failed: number };
   /** legacy fields kept for existing consumers/tests. */
@@ -158,6 +171,18 @@ export function isInternalSession(sessionId: string, projectId: string): boolean
   return slug === 'proj-cli' || slug === 'proj-install' || slug === 'proj-operator' || slug === '__xbus_operator__';
 }
 
+/** Decode the packed `session_controls.receiving` code into the receive-control mode string.
+ *  Mirrors ControlsStore.getControl (controls.ts): 1/absent=active, 0=paused, 2=dnd, 3=manual.
+ *  A NULL (no session_controls row via the LEFT JOIN) means the ControlsStore default 'active'. */
+function receiveControlFromCode(code: number | null): string {
+  switch (code) {
+    case 0: return 'paused';
+    case 2: return 'do_not_disturb';
+    case 3: return 'manual_checkpoint';
+    default: return 'active'; // 1 or NULL/unknown
+  }
+}
+
 /** Map a raw delivery state to the console's five user-facing states (queued/delivered/
  *  acknowledged/replied/failed) — the same rollup the session read model uses. */
 function mapDeliveryState(state: string): string {
@@ -177,18 +202,24 @@ export class DashboardReadModel {
   /** All sessions with their derived label + safe metadata (newest-first by first_seen). */
   sessions(): DashboardSession[] {
     const rows = this.db.prepare(
-      `SELECT session_id AS sessionId, session_name AS name, session_name_state AS nameState,
-              management_state AS mgmt, source_last AS source, identify_confidence AS conf,
-              agent_type AS agentType, project_alias AS projectAlias, project_id AS projectId,
-              state AS connState, readiness, expired_at AS expiredAt,
-              first_seen_at AS firstSeenAt, last_seen_source_at AS lastSeenSourceAt
-         FROM sessions
+      `SELECT s.session_id AS sessionId, s.session_name AS name, s.session_name_state AS nameState,
+              s.management_state AS mgmt, s.source_last AS source, s.identify_confidence AS conf,
+              s.agent_type AS agentType, s.project_alias AS projectAlias, s.project_id AS projectId,
+              s.state AS connState, s.readiness, s.expired_at AS expiredAt,
+              s.first_seen_at AS firstSeenAt, s.last_seen_source_at AS lastSeenSourceAt,
+              -- Beta.10 (Train B): operator-lifecycle + control projection (ADDITIVE; columns exist).
+              s.pinned AS pinned, s.archived AS archived, s.archived_at AS archivedAt,
+              s.claude_title AS claudeTitle, s.managed_by_xbus AS managed, s.managed_pid AS managedPid,
+              c.receiving AS receiving
+         FROM sessions s
+         -- LEFT JOIN so a session with no explicit control row reads as 'active' (the ControlsStore default).
+         LEFT JOIN session_controls c ON c.session_id = s.session_id
          -- Beta.8 (ADR 0027): a physical session id that has been REDIRECTED onto a canonical
          -- durable identity (name+inbox reclaimed by a new Claude session id) must not appear as
          -- a separate row — the console shows the ONE canonical session, never a phantom
          -- superseded twin. The canonical row itself is never a map KEY, so it is unaffected.
-         WHERE session_id NOT IN (SELECT physical_session_id FROM physical_session_map)
-         ORDER BY COALESCE(first_seen_at, created_at) DESC`,
+         WHERE s.session_id NOT IN (SELECT physical_session_id FROM physical_session_map)
+         ORDER BY COALESCE(s.first_seen_at, s.created_at) DESC`,
     ).all() as Array<Record<string, unknown>>;
 
     // BOUNDED aggregates (blocker #6): a FIXED number of set-wide GROUP BY queries, NOT one
@@ -252,6 +283,13 @@ export class DashboardReadModel {
         internal: isInternalSession(sid, (r.projectId as string) ?? ''),
         firstSeenAt: (r.firstSeenAt as string | null) ?? null,
         lastSeenSourceAt: (r.lastSeenSourceAt as string | null) ?? null,
+        pinned: (r.pinned as number) === 1,
+        archived: (r.archived as number) === 1,
+        archivedAt: (r.archivedAt as string | null) ?? null,
+        receiveControl: receiveControlFromCode(r.receiving as number | null),
+        claudeTitle: (r.claudeTitle as string | null) ?? null,
+        managed: (r.managed as number) === 1,
+        managedPid: (r.managedPid as number | null) ?? null,
         delivery,
         queued: delivery.queued,
         unacknowledged: delivery.delivered,

@@ -128,6 +128,34 @@ describe('read-only handle + read model over a live DB', () => {
     expect(['ready_checkpoint', 'ready_live', 'initializing']).toContain(b.readiness);
   });
 
+  // ── Beta.10 (Train B): operator-lifecycle + control projection ──────────────────────────
+  it('projects pinned/archived/receiveControl/claudeTitle/managed so the console can render authoritative state', () => {
+    const S = 'dddd0006-0000-4000-8000-00000000000d';
+    const auth = store.register({ sessionId: S, instanceId: 'i', connectionId: 'c', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    store.signalReadiness(auth, { ackAvailable: true, versionOk: true });
+    const model = new DashboardReadModel(ro);
+    // Defaults before any operator action: not pinned, not archived, control 'active'.
+    let s = model.session(S)!;
+    expect(s.pinned).toBe(false);
+    expect(s.archived).toBe(false);
+    expect(s.archivedAt).toBeNull();
+    expect(s.receiveControl).toBe('active');
+    expect(s.claudeTitle).toBeNull();
+    expect(s.managed).toBe(false);
+    expect(s.managedPid).toBeNull();
+    // After operator mutations the projection reflects the broker's authoritative state.
+    store.operatorSetPinned(S, true);
+    store.operatorSetArchived(S, true);
+    store.operatorSetControl(S, 'do_not_disturb');
+    store.announceSession({ ...auth, role: 'hook' as never }, { source: 'startup', sessionTitle: 'Refactor auth' });
+    s = model.session(S)!;
+    expect(s.pinned).toBe(true);
+    expect(s.archived).toBe(true);
+    expect(s.archivedAt).not.toBeNull();
+    expect(s.receiveControl).toBe('do_not_disturb');
+    expect(s.claudeTitle).toBe('Refactor auth');
+  });
+
   // ── Beta.5 blocker #7: audit status (chain health + freshness) ──────────────────────────
   it('auditStatus reports ok on a good chain, and localizes a break without masking it', () => {
     const auth = store.register({ sessionId: 'dddd0005-0000-4000-8000-00000000000c', instanceId: 'i', connectionId: 'c', processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['pull'], role: 'hook' });
