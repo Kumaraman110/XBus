@@ -79,7 +79,7 @@ describe('dashboard HTTP server — security by construction', () => {
   });
 
   it('EVERY /api/* read requires a valid bearer token → 401 without one', async () => {
-    for (const p of ['/api/sessions', '/api/ledger', '/api/session/cccc0001-0000-4000-8000-000000000001', '/api/stream', '/api/unmanaged']) {
+    for (const p of ['/api/sessions', '/api/ledger', '/api/session/cccc0001-0000-4000-8000-000000000001', '/api/stream']) {
       const res = await fetch(`${base}${p}`);
       expect(res.status, p).toBe(401);
     }

@@ -275,11 +275,10 @@ function renderLedger(events) {
     body.appendChild(row);
   }
 }
-function renderBanner(banner) {
-  const elx = document.getElementById('banner');
-  if (banner && banner.possibleUnmanaged > 0) { elx.hidden = false; elx.textContent = banner.possibleUnmanaged + ' Claude session(s) may be running that started before XBus and aren’t managed yet — resume or restart them so XBus registers them at SessionStart.'; }
-  else { elx.hidden = true; }
-}
+/* NOTE: the unmanaged-sessions banner was REMOVED (product decision, beta.10 Train B). AgenTel
+ * makes no operational claim about sessions that started before it, so there is no banner, no
+ * request to that former endpoint, and no wording implying verified absence. A future
+ * unmanaged-runtime feature is a separate, out-of-scope design. */
 
 /* ── console state ── */
 const consoleState = { selectedThreadId: null, threads: [], routableSessions: [] };
@@ -491,10 +490,9 @@ function showError(msg) {
 }
 
 async function refresh() {
-  const [{ sessions }, ledger, banner, audit, threads] = await Promise.all([
+  const [{ sessions }, ledger, audit, threads] = await Promise.all([
     api('/api/sessions'),
     api('/api/ledger?limit=100'),
-    api('/api/unmanaged').catch(() => null),
     api('/api/audit').catch(() => null),
     api('/api/threads').catch(() => ({ threads: [] })),
   ]);
@@ -502,7 +500,6 @@ async function refresh() {
   renderSessions(sessions);
   renderHeroKpis(sessions, audit);
   renderLedger(ledger.events || []);
-  if (banner) renderBanner(banner);
   renderAudit(audit);
   renderThreadList(threads.threads || []);
   showError(null); // clear any prior error on a good refresh

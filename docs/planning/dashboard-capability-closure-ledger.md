@@ -16,6 +16,14 @@ one of **SHIPPED / HIDDEN / EXPERIMENTAL / BLOCKED** (never "PARTIAL").
 - **EXPERIMENTAL** — reachable/visible but explicitly not presented as supported.
 - **BLOCKED** — an implemented, wired code path that cannot produce a correct/useful result by
   construction (e.g. a value hardcoded to a no-op), so the visible surface is inert.
+- **DEFERRED_NOT_SHIPPED** — deliberately NOT part of the shipped product. Any code, route, or UI
+  for it has been removed (or is quarantined behind an explicit gate). AgenTel makes **no
+  operational claim** about the capability; a future version would need its own design + acceptance.
+
+> UPDATE (beta.10 Train B, product decision): the unmanaged-sessions feature — previously the sole
+> BLOCKED item — was **removed** from the shipped dashboard. A professional product shows *no data*
+> rather than fabricated certainty. It is now **DEFERRED_NOT_SHIPPED** (see §E1). There are now
+> **zero BLOCKED** capabilities.
 
 ---
 
@@ -28,14 +36,14 @@ one of **SHIPPED / HIDDEN / EXPERIMENTAL / BLOCKED** (never "PARTIAL").
   - **HIDDEN: 7** (operator controls: rename-alias, set-control/pause-DND, pin/unpin, archive/unarchive,
     remove-record, stop-managed; plus scheduling create/pause/resume/cancel). All have broker impl +
     API route + server-side authorization + audit event + unit/route tests — but **zero UI**.
-  - **BLOCKED: 1** (the unmanaged-sessions banner: `/api/unmanaged` is served and the UI renders it,
-    but the read-model hardcodes `possibleUnmanaged: 0` and `computeUnmanagedBanner()` is never wired
-    to the API, so the banner can never appear).
+  - **BLOCKED: 0** (was 1 — the unmanaged-sessions banner — now REMOVED and reclassified
+    DEFERRED_NOT_SHIPPED per the product decision; see §E1).
+  - **DEFERRED_NOT_SHIPPED: 1** (unmanaged-sessions detection — removed from the shipped slice).
   - **EXPERIMENTAL: 0.**
 
-- **Nonfunctional *visible* controls (the dead-button release-gate): NONE at Stage-0.** Every control
-  that is actually rendered in `index.html` works end to end (verified below). The gap is entirely
-  (a) capabilities with no UI surface (HIDDEN) and (b) one server value that is inert (BLOCKED).
+- **Nonfunctional *visible* controls (the dead-button release-gate): NONE.** Every control that is
+  actually rendered in `index.html` works end to end (verified below, incl. live-browser). The
+  remaining gap is capabilities with no UI surface (HIDDEN). There is now no inert server value.
   **This is the bar Train B must not regress:** adding controls must not introduce a single dead button.
 
 - **State-consistency latent defect (blocks the vertical slice, not Stage-0):** the read-model
@@ -351,26 +359,33 @@ the client). Route-level test exists: `tests/integration/dashboard-server.test.t
 
 ### E. Aggregate banner
 
-#### E1. Unmanaged-sessions banner — **BLOCKED**
-- Broker: `DashboardReadModel.unmanagedBanner()` returns `{ possibleUnmanaged: 0, managedOrDormant }`
-  — `possibleUnmanaged` is **hardcoded 0** because the read-only worker cannot spawn a process listing.
-  `read-model.ts:424-427`.
-- The real computation `computeUnmanagedBanner()` + `countLiveClaudeProcesses()` exists but is
-  **never wired to the API** (grep: the only references are the definition site).
-  `src/broker/unmanaged.ts:20-24,35-56`.
-- API: `GET /api/unmanaged` → `reader.run('unmanagedBanner')`, i.e. always `possibleUnmanaged: 0`.
-  `server.ts:347`.
-- Authorization: bearer token. `server.ts:201-202`.
-- Audit: none.
-- Dashboard exposure: `renderBanner()` shows the banner **only when `possibleUnmanaged > 0`**
-  (`app.js:252-256`) — so it is structurally unreachable.
-- Browser/e2e coverage: none.
-- Known defect: the banner can never appear; the honest live-process count is computed by a function
-  that nothing calls on the serving path. This is a code path that is wired end-to-end yet inert.
-- Disposition: **decision needed (see Blockers).** Either (a) wire the broker to post a live-process
-  count into the read path so the banner works, or (b) remove the dead endpoint+UI to satisfy the gate
-  ("an experimental feature presented as supported"). Do not silently leave it. Out of the
-  agent-management slice; flag for product.
+#### E1. Unmanaged-sessions detection — **DEFERRED_NOT_SHIPPED** (was BLOCKED; REMOVED beta.10 Train B)
+**Product decision (from the user): Option 2 — REMOVE the feature from the shipped slice.** Rationale:
+a professional product makes NO operational claim rather than a fabricated one; the shipped dashboard
+now says nothing at all about sessions that started before AgenTel — no data beats fabricated certainty.
+
+**AgenTel currently makes NO operational claim about unmanaged sessions.** Nothing in the shipped
+dashboard implies it has verified the presence or absence of pre-existing/unmanaged Claude sessions.
+
+What was removed (this branch):
+- `GET /api/unmanaged` route deleted from the dashboard API (`server.ts`); it now 404s like any
+  unknown `/api/*` path (guarded by the negative test `tests/integration/dashboard-no-unmanaged.test.ts`).
+- `DashboardReadModel.unmanagedBanner()` + the `UnmanagedBanner` interface removed (`read-model.ts`);
+  the `'unmanagedBanner'` read-worker method removed from the enum + dispatch (`read-worker.ts`).
+- The banner element (`#banner`), `renderBanner()`, the `/api/unmanaged` fetch in `refresh()`, and the
+  orphaned `.banner` CSS removed (`index.html`, `app.js`, `style.css`).
+- `src/broker/unmanaged.ts` (`computeUnmanagedBanner` + `countLiveClaudeProcesses`) DELETED — it had
+  **no production callers** (the read-model computed inline and never imported it); its only references
+  were its own tests. Those two test cases were removed; the SEPARATE, retained session-import
+  (dormant-metadata) tests in the same file are unaffected.
+- No test asserting the hardcoded `possibleUnmanaged:0` behavior remains.
+
+Why NOT wire live detection now (deferral rationale): a real unmanaged-runtime feature needs its own
+design + acceptance covering supported OSes, process-discovery permissions, false-positive/negative
+semantics, bounded execution time, privacy boundaries (never read another process's env/memory),
+correlation confidence, careful dashboard wording, and browser + restart behavior. That is out of
+scope for this slice. Not implemented here; no live-process detection is wired into the shipped build.
+- Disposition: **DEFERRED_NOT_SHIPPED.** Revisit as a first-class, separately-accepted feature.
 
 ### F. Cross-cutting infrastructure gaps (not user-facing capabilities, but they gate the slice)
 
@@ -408,10 +423,11 @@ tests/integration/dashboard-server.test.ts tests/integration/dashboard-ui.test.t
 → **4 files, 43 tests, all passing** (~16s). This is the green baseline the slice must preserve.
 
 ## Blockers / decisions needed from the human (product/scope)
-1. **Unmanaged banner (E1):** wire the live-process count into the read path (make it work) OR remove
-   the dead endpoint+UI (stop presenting an inert feature)? Product call.
-2. **Scheduling (D1/D2):** confirmed OUT of the agent-management slice. Needs its own read projection
-   + slice later. Confirm deferral.
-3. **Collections scope (Deliverable 2):** confirmed as LOCAL, non-routable roster-organization
-   metadata only (client-visible grouping + persistence). Not group messaging. Implementing on the
-   read-model/dashboard side, no broker routing concept. (No decision needed unless product disagrees.)
+1. **Unmanaged banner (E1): RESOLVED — Option 2 (REMOVE).** The feature is removed from the shipped
+   slice and reclassified DEFERRED_NOT_SHIPPED. No further action; a future unmanaged-runtime feature
+   is a separate design + acceptance.
+2. **Scheduling (D1/D2):** proposed OUT of the agent-management slice. Needs its own read projection
+   + slice later. Confirmation still PENDING with the user.
+3. **Collections persistence (Deliverable 2):** implemented as LOCAL, non-routable roster grouping
+   with client-side (localStorage) persistence — deliberately avoiding a schema/wire bump. Whether
+   shared/server-side persistence is required is still PENDING with the user.

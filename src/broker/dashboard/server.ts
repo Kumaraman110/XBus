@@ -344,7 +344,11 @@ export class DashboardServer {
   private async handleApi(p: string, u: URL, res: http.ServerResponse): Promise<void> {
     try {
       if (p === '/api/sessions') return this.json(res, 200, { sessions: await this.reader.run('sessions') });
-      if (p === '/api/unmanaged') return this.json(res, 200, await this.reader.run('unmanagedBanner'));
+      // NOTE: the former `/api/unmanaged` route was REMOVED (product decision, beta.10 Train B).
+      // AgenTel makes NO operational claim about sessions that started before it — a professional
+      // product shows no data rather than a fabricated/hardcoded certainty. An unmanaged-runtime
+      // feature needs its own design + acceptance; see the capability-closure ledger. A request to
+      // `/api/unmanaged` now falls through to the 404 below like any other unknown /api path.
       if (p === '/api/audit') return this.json(res, 200, await this.reader.run('auditStatus'));
       if (p === '/api/ledger') {
         const beforeSeq = u.searchParams.has('beforeSeq') ? Number(u.searchParams.get('beforeSeq')) : undefined;

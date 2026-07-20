@@ -121,12 +121,12 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 /* ── LIQUID GLASS material — applied to every panel via a shared .glass-ish set of
    selectors. 3 layers: ::before = isolated blur (crisp text), ::after = aberration
    edge, content on top. ── */
-.threads-pane, .thread-pane, .sessions-section, #ledger, .banner, .error-banner, .audit{
+.threads-pane, .thread-pane, .sessions-section, #ledger, .error-banner, .audit{
   position:relative; isolation:isolate; border-radius:var(--r); box-shadow:var(--shadow);
   border:none; background:transparent;
 }
 .threads-pane::before, .thread-pane::before, .sessions-section::before, #ledger::before,
-.banner::before, .error-banner::before, .audit::before{
+.error-banner::before, .audit::before{
   content:""; position:absolute; inset:0; z-index:-1; border-radius:inherit;
   background:var(--glass-fill);
   -webkit-backdrop-filter:var(--glass-filter); backdrop-filter:var(--glass-filter);
@@ -202,10 +202,9 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 
 /* ── main + banners ── */
 main{ margin:0; padding:0 0 var(--sp4); }
-.banner, .error-banner{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
-  font-size:13px; color:var(--text-2); border-left:3px solid var(--warn); }
-.error-banner{ border-left-color:var(--err); color:var(--text-1); }
-.banner[hidden], .error-banner[hidden]{ display:none; }
+.error-banner{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
+  font-size:13px; border-left:3px solid var(--err); color:var(--text-1); }
+.error-banner[hidden]{ display:none; }
 .audit{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
   font:400 12px/1.5 var(--font-mono); color:var(--text-3); border-left:3px solid var(--glass-border); }
 .audit:empty{ display:none; }

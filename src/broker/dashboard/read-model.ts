@@ -96,16 +96,6 @@ export interface DashboardSession {
   lastReceived: { from: string; at: string; state: string } | null;
 }
 
-export interface UnmanagedBanner {
-  /** Conservative aggregate count of possibly-unmanaged sessions (ADR 0013 D6). Computed
-   *  broker-side from a NON-INVASIVE live-`claude`-process count minus the managed+dormant
-   *  sessions the read model reports; the read-only worker never spawns processes, so it
-   *  reports `managedOrDormant` and 0 for `possibleUnmanaged` unless the broker posts a
-   *  live-process count. Never per-session, never invasive (ADR 0013 D6). */
-  possibleUnmanaged: number;
-  /** The count of managed+dormant sessions the read model knows (the subtrahend). */
-  managedOrDormant: number;
-}
 
 export interface LedgerPage {
   events: Array<{ seq: number; eventType: string; actor: string; subject: unknown; payload: unknown; createdAt: string; entryHash: string }>;
@@ -468,14 +458,6 @@ export class DashboardReadModel {
         WHERE m.thread_id=? ORDER BY m.thread_sequence DESC LIMIT 1`,
     ).get(threadId) as { state: string } | undefined;
     return mapDeliveryState(r?.state ?? 'queued');
-  }
-
-  /** Aggregate banner data (ADR 0013 D6). The read-only worker cannot spawn a process
-   *  listing, so it reports the managed+dormant count (the honest subtrahend); the broker
-   *  computes the final `possibleUnmanaged` from a non-invasive live-process count. */
-  unmanagedBanner(): UnmanagedBanner {
-    const managedOrDormant = (this.db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE management_state IN ('active','dormant') AND expired_at IS NULL`).get() as { n: number }).n;
-    return { possibleUnmanaged: 0, managedOrDormant };
   }
 
   /**
