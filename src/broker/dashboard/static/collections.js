@@ -6,15 +6,21 @@
  * capability and is deliberately out of scope here. Collections are never sent to the broker,
  * never influence delivery, and never appear on the wire.
  *
- * PERSISTENCE (deliberate): client-side localStorage, same store/pattern as the theme +
- * internal-sessions preferences. Rationale: the dashboard is a single-operator, loopback-only
- * tool, and a server-side Collections table would require a schema migration that bumps
- * SCHEMA_VERSION (derived from the max migration version) and therefore the fail-closed wire
- * compatibility tuple — coupling this change to a coordinated whole-install release. Keeping
- * Collections client-side keeps this purely a dashboard concern with no schema/broker/wire
- * impact. Membership is keyed by the durable canonical session_id, so it survives refresh as
- * long as the session record exists. (If shared-across-browsers persistence is later required,
- * that is an additive server-side change — see the capability-closure ledger.)
+ * PERSISTENCE — SWAPPABLE BACKEND (beta.10 loop; WS3 cutover seam). The dashboard consumes a
+ * CollectionsStore interface: `async load()` → state, `async save(state)` → bool. Two impls:
+ *   - makeLocalStorageStore(storage)  — the CURRENT default (browser localStorage), zero
+ *     schema/broker/wire impact; single-operator, loopback-only.
+ *   - makeServerStore(api)            — server-side persistence in the broker DB via the
+ *     authenticated dashboard API (GET/POST /api/collections). READY for WS3: the moment
+ *     WS1/WS3 lands the `collections` table + broker read/write endpoints, the dashboard flips
+ *     to this store at ONE call site (boot) with NO change to the pure state logic or any
+ *     mutation path. Until then localStorage remains active.
+ * The pure state functions (create/rename/delete/membership/filter) are backend-agnostic and
+ * unchanged, so switching persistence never risks the roster-grouping logic.
+ *
+ * A Collection remains NON-ROUTABLE organizational metadata regardless of backend — it never
+ * influences delivery and never appears on the wire; server persistence just means the grouping
+ * is shared across browsers/restarts instead of per-browser.
  *
  * This module is CSP-safe (script-src 'self', no inline). It is written as an ES module so the
  * pure logic is unit-testable under vitest; it also publishes the same API on
@@ -30,8 +36,9 @@ export function emptyState() {
   return { version: SCHEMA, collections: [], members: {} };
 }
 
-/** Coerce any parsed value into a well-formed state (defensive against a corrupt/legacy blob). */
-function normalize(raw) {
+/** Coerce any parsed value into a well-formed state (defensive against a corrupt/legacy blob).
+ *  Exported so the server backend can normalize an untrusted server payload identically. */
+export function normalize(raw) {
   if (!raw || typeof raw !== 'object') return emptyState();
   const collections = Array.isArray(raw.collections)
     ? raw.collections.filter((c) => c && typeof c.id === 'string' && typeof c.name === 'string').map((c) => ({ id: c.id, name: c.name }))
@@ -151,12 +158,55 @@ export function filterSessionsByCollection(sessions, state, selector) {
   return list.filter((s) => st.members[s.sessionId] && st.members[s.sessionId].includes(selector));
 }
 
+/* ─────────────────────────── swappable persistence backends ───────────────────────────
+ * A CollectionsStore is `{ load(): Promise<state>, save(state): Promise<boolean>, kind }`.
+ * The dashboard picks one at boot; every mutation path calls store.load()/store.save() and is
+ * unaware of the backend. This is the seam WS3 flips to move Collections off localStorage. */
+
+/** localStorage-backed store (current default). Wraps the existing sync helpers in the async
+ *  CollectionsStore contract so the call sites are already async-ready for the server cutover. */
+export function makeLocalStorageStore(storage) {
+  return {
+    kind: 'local',
+    load() { return Promise.resolve(loadCollections(storage)); },
+    save(state) { return Promise.resolve(saveCollections(storage, state)); },
+  };
+}
+
+/**
+ * Server-backed store (WS3): persists Collections in the broker DB via the authenticated
+ * dashboard API. `api` is the app.js seam (window.XBusApi): `get(path)` resolves the parsed
+ * JSON body, `post(path, obj)` resolves `{ ok, status, body }`. Contract with WS1/WS3:
+ *   - GET  /api/collections        → the full {version, collections, members} projection
+ *   - POST /api/collections        → replace/persist the full state (authorized + audited
+ *                                     broker-side); resolves ok:true on success.
+ * Both directions NORMALIZE (drop dangling membership, coerce shape) so an unexpected server
+ * payload can never corrupt the roster grouping. Never throws: a read failure → empty state;
+ * a write failure → false (the caller surfaces it, exactly like the localStorage path).
+ * NOTE: the endpoint shapes above are the dashboard's REQUEST to WS3; adjust here (one place)
+ * when WS3 publishes the final schema — no call site changes.
+ */
+export function makeServerStore(api) {
+  return {
+    kind: 'server',
+    async load() {
+      try { return normalize(await api.get('/api/collections')); }
+      catch { return emptyState(); }
+    },
+    async save(state) {
+      try { const r = await api.post('/api/collections', normalize(state)); return !!(r && r.ok); }
+      catch { return false; }
+    },
+  };
+}
+
 // Publish on window for the classic (non-module) app.js in the browser. Guarded so importing
 // this module under vitest (no window) is a harmless no-op.
 if (typeof window !== 'undefined') {
   window.XBusCollections = {
-    COLLECTIONS_KEY, emptyState, loadCollections, saveCollections, normalizeName,
+    COLLECTIONS_KEY, emptyState, normalize, loadCollections, saveCollections, normalizeName,
     createCollection, renameCollection, deleteCollection, addMember, removeMember,
     collectionsForSession, filterSessionsByCollection,
+    makeLocalStorageStore, makeServerStore,
   };
 }

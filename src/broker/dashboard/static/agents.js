@@ -79,12 +79,18 @@ export function applyRosterFilter(sessions, deps) {
 /* ─────────────────────────────── browser wiring ─────────────────────────────── */
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-  const C = window.XBusCollections; // Collections module (LOCAL grouping)
+  const C = window.XBusCollections; // Collections module (roster grouping)
   const filterState = { search: '', status: 'all', control: 'all', collectionSelector: 'all' };
-  let collectionsState = C ? C.loadCollections(window.localStorage) : null;
+  // Persistence backend (WS3 cutover seam): default to localStorage. To move Collections onto
+  // the broker DB once WS3 lands, change ONLY this one line to `C.makeServerStore(window.XBusApi)`
+  // — every mutation path already goes through the async store, so nothing else changes.
+  const collectionsStore = C ? C.makeLocalStorageStore(window.localStorage) : null;
+  let collectionsState = C ? C.emptyState() : null; // hydrated async at init() via the store
   let inspectorSessionId = null; // the session currently open in the inspector (persist across refresh)
 
-  function persistCollections() { if (C) C.saveCollections(window.localStorage, collectionsState); }
+  // Persist through the swappable store (async). Best-effort: a failure never throws here; the
+  // in-memory state stays authoritative for this tab until the next successful save/reload.
+  function persistCollections() { if (collectionsStore) return collectionsStore.save(collectionsState); return Promise.resolve(false); }
   function sessions() { return window.__sessions || []; }
   function findSession(id) { return sessions().find((s) => s.sessionId === id) || null; }
 
@@ -391,14 +397,19 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     document.body.appendChild(overlay);
   }
 
-  /* ---- lifecycle: build the toolbar once, re-render inspector after every roster render ---- */
+  /* ---- lifecycle: hydrate collections from the store, build the toolbar, keep inspector fresh ---- */
   function init() {
-    buildToolbar();
-    // app.js re-renders sessions on every stream frame / poll; keep the inspector in sync so the
-    // displayed state always matches the latest authenticated payload (survives live updates).
-    const origRerender = window.XBusApi.rerender;
-    // Nothing to wrap; app.js calls renderSessions directly. Instead, re-render the inspector
-    // on a light interval tied to the same cache — cheap + keeps state authoritative.
+    buildToolbar(); // immediate (empty collections) so the roster filters render without waiting
+    // Hydrate Collections from the swappable persistence backend (localStorage now; broker DB
+    // after the WS3 cutover). Async so the server store works unchanged; on resolve, rebuild the
+    // toolbar (collection selector) + re-render the roster so grouping applies.
+    if (collectionsStore) {
+      void collectionsStore.load().then((st) => {
+        if (st) { collectionsState = st; buildToolbar(); if (window.XBusApi) window.XBusApi.rerender(); }
+      }).catch(() => { /* store.load never throws, but be defensive */ });
+    }
+    // app.js re-renders sessions on every stream frame / poll; the interval below keeps the open
+    // inspector in sync with the latest authenticated payload (survives live updates + restart).
   }
 
   window.XBusAgents = {

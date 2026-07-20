@@ -13,6 +13,7 @@ import {
   createCollection, renameCollection, deleteCollection,
   addMember, removeMember, collectionsForSession, filterSessionsByCollection,
   COLLECTIONS_KEY,
+  makeLocalStorageStore, makeServerStore,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS asset, no type declarations (intentional: it is a static UI file)
 } from '../../src/broker/dashboard/static/collections.js';
@@ -134,5 +135,75 @@ describe('Collections — persistence + corruption tolerance', () => {
     const broken = { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } } as unknown as Storage;
     expect(loadCollections(broken)).toEqual(emptyState());
     expect(saveCollections(broken, emptyState())).toBe(false);
+  });
+});
+
+describe('Collections — swappable persistence backend (WS3 cutover seam)', () => {
+  // The dashboard consumes a CollectionsStore interface: async load() + save(state). Two impls:
+  //  - localStorage (current default), and
+  //  - server (broker DB via authenticated fetch) — ready for WS3 without touching call sites.
+  it('localStorage store round-trips via load()/save() (async contract)', async () => {
+    const mem = memStorage();
+    const store = makeLocalStorageStore(mem);
+    let { state, collection } = createCollection(await store.load(), 'Local');
+    state = addMember(state, collection.id, 'sA');
+    await store.save(state);
+    const reloaded = await store.load();
+    expect(reloaded.collections.map((c: { name: string }) => c.name)).toEqual(['Local']);
+    expect(collectionsForSession(reloaded, 'sA')).toEqual([collection.id]);
+  });
+
+  it('localStorage store.load() never throws on unavailable storage (returns empty)', async () => {
+    const broken = { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } } as unknown as Storage;
+    const store = makeLocalStorageStore(broken);
+    await expect(store.load()).resolves.toEqual(emptyState());
+    await expect(store.save(emptyState())).resolves.toBe(false);
+  });
+
+  it('server store GETs the projection on load() and normalizes it', async () => {
+    // A fake authenticated API client (the same shape app.js exposes as window.XBusApi).
+    const calls: Array<{ path: string; body?: unknown }> = [];
+    const api = {
+      get: async (path: string) => { calls.push({ path }); return { version: 1, collections: [{ id: 'c1', name: 'Server A' }], members: { s1: ['c1', 'ghost'] } }; },
+      post: async (path: string, body: unknown) => { calls.push({ path, body }); return { ok: true, status: 200, body: {} }; },
+    };
+    const store = makeServerStore(api);
+    const state = await store.load();
+    expect(calls[0]!.path).toBe('/api/collections');
+    // Normalized: dangling 'ghost' membership dropped even from the server payload.
+    expect(collectionsForSession(state, 's1')).toEqual(['c1']);
+  });
+
+  it('server store PUTs the full state on save() to the authenticated write route', async () => {
+    const calls: Array<{ path: string; body?: unknown }> = [];
+    const api = {
+      get: async (path: string) => { calls.push({ path }); return emptyState(); },
+      post: async (path: string, body: unknown) => { calls.push({ path, body }); return { ok: true, status: 200, body: {} }; },
+    };
+    const store = makeServerStore(api);
+    const { state } = createCollection(emptyState(), 'To persist');
+    const ok = await store.save(state);
+    expect(ok).toBe(true);
+    const save = calls.find((c) => c.path === '/api/collections');
+    expect(save, 'a write to /api/collections').toBeTruthy();
+    expect((save!.body as { collections: unknown[] }).collections).toHaveLength(1);
+  });
+
+  it('server store.save() returns false (never throws) on a write failure', async () => {
+    const api = {
+      get: async () => emptyState(),
+      post: async () => ({ ok: false, status: 503, body: { error: 'write_unavailable' } }),
+    };
+    const store = makeServerStore(api);
+    await expect(store.save(emptyState())).resolves.toBe(false);
+  });
+
+  it('server store.load() falls back to empty (never throws) on a read failure', async () => {
+    const api = {
+      get: async () => { throw new Error('network'); },
+      post: async () => ({ ok: true, status: 200, body: {} }),
+    };
+    const store = makeServerStore(api);
+    await expect(store.load()).resolves.toEqual(emptyState());
   });
 });
