@@ -17,35 +17,53 @@ import {
 describe('parseHealthCapabilities — derive feature flags from a /api/health body', () => {
   it('honors an explicit capabilities array exactly', () => {
     const c = parseHealthCapabilities({ build: {}, capabilities: ['redeliver'] });
-    expect(c).toEqual({ health: true, redeliver: true, instances: false });
+    expect(c).toEqual({ health: true, redeliver: true, instances: false, removeSafe: false });
   });
   it('with both advertised, enables both', () => {
     const c = parseHealthCapabilities({ capabilities: ['redeliver', 'instances'] });
     expect(c.redeliver).toBe(true);
     expect(c.instances).toBe(true);
   });
-  it('health present but NO explicit list → infer the WS1 batch ships together (both on)', () => {
+  it('health present but NO explicit list → infer read-only features, NOT removeSafe (destructive)', () => {
     const c = parseHealthCapabilities({ build: { version: '0.1.0' }, runtime: {}, ledger: {} });
-    expect(c).toEqual({ health: true, redeliver: true, instances: true });
+    expect(c).toEqual({ health: true, redeliver: true, instances: true, removeSafe: false });
+  });
+  it('remove_safe advertised explicitly → removeSafe true (never inferred)', () => {
+    const c = parseHealthCapabilities({ capabilities: ['redeliver', 'instances', 'remove_safe'] });
+    expect(c).toEqual({ health: true, redeliver: true, instances: true, removeSafe: true });
   });
   it('a null/garbage body → nothing enabled (health absent)', () => {
-    expect(parseHealthCapabilities(null)).toEqual({ health: false, redeliver: false, instances: false });
-    expect(parseHealthCapabilities('nope')).toEqual({ health: false, redeliver: false, instances: false });
+    expect(parseHealthCapabilities(null)).toEqual({ health: false, redeliver: false, instances: false, removeSafe: false });
+    expect(parseHealthCapabilities('nope')).toEqual({ health: false, redeliver: false, instances: false, removeSafe: false });
   });
 });
 
 describe('probeCapabilities — cheap GET probes, never throws, absent endpoints stay off', () => {
-  it('health 200 + collections 200 → all flags set from the responses', async () => {
+  it('health 200 (all caps incl remove_safe) + collections s11 → all flags set from the responses', async () => {
     const api = {
       get: async (path: string) => {
-        if (path === '/api/health') return { capabilities: ['redeliver', 'instances'] };
+        if (path === '/api/health') return { capabilities: ['redeliver', 'instances', 'remove_safe'] };
         if (path === '/api/collections') return { version: 1, collections: [], members: {} };
         throw new Error('request failed: 404');
       },
       post: async () => ({ ok: true, status: 200, body: {} }),
     };
     const caps = await probeCapabilities(api);
-    expect(caps).toEqual({ health: true, redeliver: true, instances: true, collectionsServer: true });
+    expect(caps).toEqual({ health: true, redeliver: true, instances: true, removeSafe: true, collectionsServer: true });
+  });
+
+  it('collections endpoint present but s10 (version:0 fail-closed) → collectionsServer stays OFF (keep localStorage)', async () => {
+    const api = {
+      get: async (path: string) => {
+        if (path === '/api/health') return { capabilities: ['redeliver', 'instances'] };
+        if (path === '/api/collections') return { version: 0, collections: [], members: {} }; // s10 fail-closed
+        throw new Error('request failed: 404');
+      },
+      post: async () => ({ ok: true, status: 200, body: {} }),
+    };
+    const caps = await probeCapabilities(api);
+    expect(caps.collectionsServer).toBe(false); // s10 → localStorage stays
+    expect(caps.removeSafe).toBe(false);         // not advertised
   });
 
   it('endpoints absent (both 404) → empty caps, never throws (zero dead controls)', async () => {

@@ -544,7 +544,12 @@ export class DashboardReadModel {
       // call); report a stable not-overloaded baseline. A future worker-instrumented value can
       // replace this without a shape change.
       readWorker: { inFlight: 0, overloaded: false },
-      capabilities: ['redeliver', 'instances'],
+      // Integration (Package D): 'remove_safe' advertises that this broker build has the KNOWN-3
+      // fix — operatorRemoveRecord atomically GCs physical_session_map + deletes name_ownership +
+      // terminalizes deliveries to recipient_removed + cleans collection_members (WS1 R1 162d44a).
+      // The dashboard gates its remove_record control on this capability, so remove only lights on
+      // a broker that supports the safe teardown (never the pre-KNOWN-3 corrupting primitive).
+      capabilities: ['redeliver', 'instances', 'remove_safe'],
     };
   }
 

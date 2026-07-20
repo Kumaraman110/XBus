@@ -6,7 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
-  applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, receiveControlLabel, describeControlResult,
+  applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, removeRecordEnabled, receiveControlLabel, describeControlResult,
   postMutationStatus, sortRoster, hasActiveFilters, ROSTER_SORTS,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS static asset, intentionally untyped
@@ -62,11 +62,15 @@ describe('control-action surface + KNOWN-3 gate', () => {
       expect(CONTROL_ACTIONS[a], `missing action ${a}`).toBeTruthy();
     }
   });
-  it('remove_record is GATED (disabled) pending the Train-A broker fix', () => {
-    expect(AGENTS_REMOVE_RECORD_ENABLED).toBe(false);
-    expect(CONTROL_ACTIONS.remove_record.gated).toBe(true);
+  it('remove_record is CAPABILITY-GATED (build allow true post-KNOWN-3; requires broker remove_safe)', () => {
+    expect(AGENTS_REMOVE_RECORD_ENABLED).toBe(true); // KNOWN-3 fixed → build-level allow
+    expect(CONTROL_ACTIONS.remove_record.requiresCapability).toBe('remove_safe');
     expect(CONTROL_ACTIONS.remove_record.destructive).toBe(true);
     expect(CONTROL_ACTIONS.remove_record.confirm).toBe(true);
+    // The EFFECTIVE gate: enabled only when the connected broker advertises remove_safe.
+    expect(removeRecordEnabled({ removeSafe: true })).toBe(true);
+    expect(removeRecordEnabled({ removeSafe: false })).toBe(false);
+    expect(removeRecordEnabled(null)).toBe(false);
   });
   it('destructive non-gated actions require confirmation', () => {
     expect(CONTROL_ACTIONS.stop_managed.confirm).toBe(true);

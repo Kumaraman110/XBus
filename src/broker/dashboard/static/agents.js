@@ -10,10 +10,12 @@
  *  - Every action shows pending → success/failure. A failure surfaces the broker's actionable
  *    message (status + error/message), never a generic "something went wrong".
  *  - Destructive ops (remove record) require an explicit typed confirmation.
- *  - remove_record is GATED DISABLED pending the Train-A KNOWN-3 broker fix (a remove over the
- *    current primitive orphans name_ownership + physical_session_map → state would contradict the
- *    broker after restart). The control is VISIBLE but disabled with an explicit reason — never
- *    fires the corrupting action. Flip AGENTS_REMOVE_RECORD_ENABLED to true once KNOWN-3 lands.
+ *  - remove_record is DOUBLE-GATED: the build-level allow (AGENTS_REMOVE_RECORD_ENABLED, now true
+ *    since KNOWN-3 is fixed) AND a RUNTIME capability probe (caps.removeSafe) — the control lights
+ *    ONLY when the connected broker EXPLICITLY advertises the KNOWN-3-safe teardown (health
+ *    capabilities include 'remove_safe'). Against a pre-KNOWN-3 broker the probe finds no
+ *    'remove_safe' → the control stays disabled-with-reason, never firing the corrupting action.
+ *    removeRecordEnabled() is the effective gate used everywhere.
  *  - Collections are LOCAL, non-routable roster grouping (window.XBusCollections). No routing.
  *
  * CSP-safe (script-src 'self', no inline). ES module; pure helpers are exported for unit tests,
@@ -23,8 +25,15 @@
 
 /* eslint-disable no-undef */
 
-/** KNOWN-3 gate: remove_record stays disabled until Train A ships the map-invalidation helper. */
-export const AGENTS_REMOVE_RECORD_ENABLED = false;
+/** Build-level allow: true now that KNOWN-3 (safe teardown) is fixed broker-side. The EFFECTIVE
+ *  gate is removeRecordEnabled() = this AND the runtime capability probe seeing a remove-safe broker. */
+export const AGENTS_REMOVE_RECORD_ENABLED = true;
+
+/** Effective remove_record gate: build allow AND the connected broker advertising the KNOWN-3-safe
+ *  teardown. `caps` is the capability-probe result ({removeSafe}). Pure + exported for testing. */
+export function removeRecordEnabled(caps) {
+  return AGENTS_REMOVE_RECORD_ENABLED === true && !!(caps && caps.removeSafe);
+}
 
 /** The operator control actions, with UI labels + the confirm/authorization policy. Pure data so
  *  a test can assert the surface without a DOM. `state`-shaped actions are toggles (pin/archive). */
@@ -36,7 +45,7 @@ export const CONTROL_ACTIONS = Object.freeze({
   archive: { label: 'Archive', destructive: false },
   unarchive: { label: 'Unarchive', destructive: false },
   stop_managed: { label: 'Stop session', destructive: true, confirm: true },
-  remove_record: { label: 'Remove record', destructive: true, confirm: true, gated: !AGENTS_REMOVE_RECORD_ENABLED },
+  remove_record: { label: 'Remove record', destructive: true, confirm: true, requiresCapability: 'remove_safe' },
 });
 
 /** Human sentence for a receive-control mode (used in the inspector). */
@@ -528,18 +537,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       }));
     }
 
-    // Remove record — GATED disabled pending KNOWN-3.
+    // Remove record — DOUBLE-GATED (build allow AND the broker advertising remove_safe). Refuses a
+    // CONNECTED session broker-side (disconnect/archive first). Destructive → typed confirmation.
+    const removeOk = removeRecordEnabled(caps);
     const removeBtn = actionButton('Remove record', true, async () => {
-      if (!AGENTS_REMOVE_RECORD_ENABLED) return; // belt-and-suspenders: never fire while gated
-      const typed = window.prompt('Type REMOVE to permanently remove this session RECORD (the Claude transcript is preserved).');
+      if (!removeRecordEnabled(caps)) return; // belt-and-suspenders: never fire while gated
+      const typed = window.prompt('Type REMOVE to permanently remove this session RECORD.\n\nThe broker atomically cleans routing/name-ownership/deliveries; the Claude transcript is preserved. A CONNECTED session is refused — disconnect or archive it first.');
       if (typed !== 'REMOVE') { setInspStatus('Removal cancelled (confirmation not matched).', 'muted'); return; }
       await runControl(s.sessionId, { action: 'remove_record' }, 'Removing record…');
     });
-    if (!AGENTS_REMOVE_RECORD_ENABLED) {
+    if (!removeOk) {
       removeBtn.disabled = true;
-      removeBtn.title = 'Temporarily unavailable — pending a broker fix (KNOWN-3) so removal also invalidates name_ownership + physical_session_map. Enabling it now would corrupt broker state after restart.';
+      removeBtn.title = 'Unavailable — this broker build does not advertise the KNOWN-3-safe record teardown (remove_safe). Enabling it against an unfixed broker would corrupt routing/name-ownership state after restart.';
       removeBtn.setAttribute('aria-disabled', 'true');
-      const note = el('span', 'gated-note', 'pending broker fix');
+      const note = el('span', 'gated-note', 'unsupported by broker');
       removeBtn.appendChild(note);
     }
     wrap.appendChild(removeBtn);
@@ -629,8 +640,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     const panel = document.getElementById('inspector');
     if (!panel) return;
     for (const b of panel.querySelectorAll('.insp-action, .insp-control-select')) {
-      // Never RE-ENABLE the gated remove button.
-      if (b.classList && b.classList.contains('danger') && b.textContent && b.textContent.indexOf('Remove record') === 0 && !AGENTS_REMOVE_RECORD_ENABLED) { b.disabled = true; continue; }
+      // Never RE-ENABLE the remove button while it is gated (broker lacks remove_safe).
+      if (b.classList && b.classList.contains('danger') && b.textContent && b.textContent.indexOf('Remove record') === 0 && !removeRecordEnabled(caps)) { b.disabled = true; continue; }
       b.disabled = disabled;
     }
   }

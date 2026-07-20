@@ -618,22 +618,48 @@ async function retryTurn(thread, turn, btn) {
   refreshThreads();
 }
 
-/* #1 (pre-staged, WS1): explicit operator REDELIVERY — POST /api/message/:id/redeliver {reason?}.
- * Re-presents the SAME message body to the recipient (distinct from Retry's fresh send). Only
- * wired when caps.redeliver (endpoint exists). Shows pending/success/failure inline; re-reads the
- * thread so the timeline reflects the authoritative delivery state. Never claims success on a
- * non-ok response. The endpoint stamps local-operator + audits OPERATOR_REDELIVERY broker-side. */
+/* #1 explicit operator REDELIVERY — POST /api/message/:id/redeliver {reason?, confirmReplayAccepted?}.
+ * Re-presents the SAME message body to the recipient (distinct from Retry's fresh send). Only wired
+ * when caps.redeliver. TWO-PHASE for the accepted-replay flow (WS3 contract):
+ *   1. First attempt WITHOUT confirmReplayAccepted. Ordinary (not-yet-accepted) work → outcome
+ *      'redelivered', done.
+ *   2. If the broker REFUSES (400 CONFIRMATION/ILLEGAL_STATE/DUPLICATE — replaying ALREADY-ACCEPTED
+ *      work), present an explicit DESTRUCTIVE/duplicate-work confirmation. Only on operator confirm
+ *      do we resend with confirmReplayAccepted:true → outcome 'replayed' (+ a new attemptId).
+ * NEVER silently replays accepted work. Honest pending/success/failure; re-reads the thread so the
+ * timeline reflects authoritative state. The endpoint stamps local-operator + audits broker-side. */
 async function redeliverTurn(thread, turn, btn) {
   btn.disabled = true;
   const prior = btn.textContent; btn.textContent = 'Redelivering…';
-  const r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console' });
+  composerError('');
+  // Phase 1: ordinary redelivery (no confirmation).
+  let r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console' });
+  // Phase 2: the broker refused because this is ALREADY-ACCEPTED work → require explicit confirm.
+  if (!r.ok && redeliverNeedsReplayConfirm(r)) {
+    btn.textContent = prior;
+    const ok = window.confirm(
+      'This message was already ACCEPTED by the recipient. Redelivering will make the recipient '
+      + 'process it AGAIN (duplicate work), recorded as a new replay attempt.\n\nReplay anyway?');
+    if (!ok) { btn.disabled = false; composerError('Replay cancelled — the accepted message was not re-sent.'); return; }
+    btn.disabled = true; btn.textContent = 'Replaying…';
+    r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console', confirmReplayAccepted: true });
+  }
   if (!r.ok) {
     btn.disabled = false; btn.textContent = prior;
     composerError('Redelivery failed (' + r.status + '): ' + (r.body.message || r.body.error || 'error'));
     return;
   }
+  // Authoritative re-read; the derived timeline state will reflect the new attempt.
   await loadThread(thread.threadId);
   refreshThreads();
+}
+
+/** Did the broker refuse an ordinary redelivery because the work was already ACCEPTED (so a replay
+ *  needs explicit confirmation)? Matches the WS3 contract's confirmation-required error codes. Pure. */
+function redeliverNeedsReplayConfirm(res) {
+  if (!res || res.ok) return false;
+  const code = (res.body && (res.body.error || res.body.code)) || '';
+  return res.status === 400 && /CONFIRMATION|ILLEGAL_STATE|DUPLICATE/i.test(String(code));
 }
 
 async function startNewThread() {

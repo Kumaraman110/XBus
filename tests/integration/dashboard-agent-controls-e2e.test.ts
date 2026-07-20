@@ -187,4 +187,75 @@ describe('agent controls E2E — authorize + audit + authoritative state over re
       expect(r.status).toBe(400);
     } finally { svc.close(); }
   }, 30_000);
+
+  // ── Package D integration: remove_record over the real dashboard HTTP route (KNOWN-3 safe) ──
+  it('remove_record REFUSES a connected session (400), then succeeds once disconnected + is gone on re-read', async () => {
+    const tk = await token();
+    const svc = await session(SID, 'seatmap-api');
+    // Connected → the broker refuses (safe-remove contract): clean 400, record intact.
+    const refused = await control(tk, SID, { action: 'remove_record' });
+    expect(refused.status).toBe(400);
+    expect((await getSession(tk, SID)).sessionId).toBe(SID); // still present
+    // Disconnect (close the IPC clients), give the broker a moment to mark it disconnected.
+    svc.close();
+    await new Promise((r) => setTimeout(r, 500));
+    const removed = await control(tk, SID, { action: 'remove_record' });
+    expect(removed.status).toBe(200);
+    expect((await removed.json() as { removed: boolean }).removed).toBe(true);
+    // Authoritative re-read: the session is GONE (404), and the removal is audited + chain valid.
+    const after = await A(tk, `/api/session/${encodeURIComponent(SID)}`);
+    expect(after.status).toBe(404);
+    expect(ledgerHas('OPERATOR_SESSION_RECORD_REMOVED') || ledgerHas('SESSION_RECORD_REMOVED') || ledgerHas('IDENTITY_REMOVED')).toBe(true);
+    expect(chainOk()).toBe(true);
+  }, 30_000);
+
+  // ── Package D integration: the WS3 endpoints my probe consumes respond through the HTTP surface ──
+  it('GET /api/health advertises the capabilities my probe lights (redeliver + instances + remove_safe)', async () => {
+    const tk = await token();
+    const svc = await session(SID, 'seatmap-api');
+    try {
+      const h = await (await A(tk, '/api/health')).json() as { build: { schemaVersion: number }; capabilities: string[]; ledger: { ok: boolean } };
+      expect(Array.isArray(h.capabilities)).toBe(true);
+      expect(h.capabilities).toEqual(expect.arrayContaining(['redeliver', 'instances', 'remove_safe']));
+      expect(typeof h.build.schemaVersion).toBe('number');
+      expect(h.ledger.ok).toBe(true);
+    } finally { svc.close(); }
+  }, 30_000);
+
+  it('GET /api/session/:id carries instances[] (current flagged) for the inspector history', async () => {
+    const tk = await token();
+    const svc = await session(SID, 'seatmap-api');
+    try {
+      const s = await getSession(tk, SID) as { instances?: Array<{ current: boolean; role: string; state: string }> };
+      expect(Array.isArray(s.instances)).toBe(true);
+      expect(s.instances!.length).toBeGreaterThan(0);
+      expect(s.instances!.some((i) => i.current)).toBe(true); // a current instance is flagged
+    } finally { svc.close(); }
+  }, 30_000);
+
+  it('redelivery: ordinary redeliver succeeds; replaying ACCEPTED work is refused (400) without confirmReplayAccepted', async () => {
+    const tk = await token();
+    const svc = await session(SID, 'seatmap-api');
+    try {
+      // Operator opens a thread to the session (a real queued delivery to redeliver).
+      const open = await (await A(tk, '/api/thread', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: 'seatmap-api', text: 'please review', requiresAck: true, requiresReply: true, idempotencyKey: 'rd1' }) })).json() as { messageId: string };
+      // Ordinary redelivery of not-yet-accepted work → 200 outcome 'redelivered'.
+      const ordinary = await A(tk, `/api/message/${encodeURIComponent(open.messageId)}/redeliver`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'nudge' }) });
+      expect(ordinary.status).toBe(200);
+      expect((await ordinary.json() as { outcome: string }).outcome).toBe('redelivered');
+      // Session pulls + ACCEPTS the message → now it is accepted work.
+      const pulled = await svc.hook.request('checkpoint_pull_hook', { checkpointId: `cp-${Math.random().toString(36).slice(2)}`, limit: 20 });
+      const msgs = (pulled.payload as { messages: Array<{ messageId: string; metadata: Record<string, string> }> }).messages;
+      const inj = msgs.find((m) => m.messageId === open.messageId)!.metadata['xbus_injection_id'];
+      await svc.mcp.request('ack_message', { messageId: open.messageId, status: 'accepted', injectionId: inj });
+      // Replaying ACCEPTED work WITHOUT confirmReplayAccepted → refused 400 (never silent replay).
+      const refused = await A(tk, `/api/message/${encodeURIComponent(open.messageId)}/redeliver`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'again' }) });
+      expect(refused.status).toBe(400);
+      // WITH the explicit acknowledgement → 200 outcome 'replayed'.
+      const replayed = await A(tk, `/api/message/${encodeURIComponent(open.messageId)}/redeliver`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: 'again', confirmReplayAccepted: true }) });
+      expect(replayed.status).toBe(200);
+      expect((await replayed.json() as { outcome: string }).outcome).toBe('replayed');
+      expect(chainOk()).toBe(true);
+    } finally { svc.close(); }
+  }, 30_000);
 });
