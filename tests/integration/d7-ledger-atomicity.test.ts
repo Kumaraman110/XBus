@@ -134,7 +134,11 @@ describe('D7 abort-atomicity — a ledger-write failure aborts the identity tran
     const ok = store.renameSession(a1, 'healthy-name');           // no break
     expect(ok.state).toBe('active');
     expect(nameOf(a1.sessionId).name).toBe('healthy-name');
-    expect(ledgerCount()).toBe(chainBefore + 1);                  // chained
+    // A healthy FIRST-name rename GROWS the chain. Since R3 (name.awarded on fresh award) a
+    // first award chains two events (name.awarded + session.rename); this self-check only needs
+    // "chain grew" for non-vacuity, so we assert growth rather than an exact count — the exact
+    // per-award event count is pinned by ownership-primitive.test.ts, not here.
+    expect(ledgerCount()).toBeGreaterThan(chainBefore);           // chained
 
     const a2 = reg();
     const chainMid = ledgerCount();

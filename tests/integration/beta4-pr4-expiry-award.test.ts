@@ -6,8 +6,10 @@
  * The composed guarantee this file proves — with a deterministic FakeClock, at the store
  * + reaper layer (where expiry is authoritative) — is:
  *
- *   • expiry clears the active NAME (retired, name released) AND drops the session from
- *     discovery, so no routing survives on the expired identity;
+ *   • expiry TOMBSTONES the session as dormant (beta.10 ADR 0033 split teardown: expiry =
+ *     dormancy, NOT destruction — the name_ownership handle + owner secret are preserved for
+ *     secret-bearing reactivation) AND drops the session from discovery, so no routing survives
+ *     on the expired identity even though the handle is retained;
  *   • an expired recipient rejects new sends FINAL (RECIPIENT_SESSION_EXPIRED) — a stale
  *     award cannot make an expired adapter routable;
  *   • re-registration after expiry starts a FRESH epoch (the daemon re-runs award
@@ -60,17 +62,24 @@ function nameState(sessionId: string): { state: string; norm: string | null; exp
   return db.prepare('SELECT session_name_state AS state, normalized_session_name AS norm, expired_at AS expired FROM sessions WHERE session_id=?').get(sessionId) as never;
 }
 
-describe('Group 3 — expiry clears name + de-routes the identity', () => {
-  it('expiry retires the name, releases it, and drops the session from discovery', () => {
+describe('Group 3 — expiry tombstones (dormancy) + de-routes the identity', () => {
+  it('expiry tombstones the session as dormant, PRESERVES the handle, and drops it from discovery', () => {
+    // beta.10 split identity teardown (ADR 0033, commit 162d44a): EXPIRY = DORMANCY, not
+    // destruction. The reaper sets expired_at (the tombstone) and purges transient routing, but
+    // deliberately does NOT release the name_ownership handle or its owner_secret_hash — the
+    // logical identity, its handle, and its secret survive so the owner can REACTIVATE later with
+    // the secret. (Releasing the handle on idle-expiry was the beta.9 handle-takeover bug this
+    // change fixes.) De-routing is guaranteed by the tombstone, not by name release: the expired
+    // session is gone from active discovery and rejects new sends (below), while the handle stays.
     const a = ready('award-victim');
     expect(nameState(a.sessionId).state).toBe('active');
     clock.advance(15 * DAY + 1000);
     expect(reaper.sweep().sessionsExpired).toBe(1);
     const row = nameState(a.sessionId);
-    expect(row.expired).not.toBeNull();
-    expect(row.state).toBe('retired');
-    expect(row.norm).toBeNull();                                   // name released
-    expect(store.listActiveNamedSessions().map((s) => s.sessionId)).not.toContain(a.sessionId); // gone from discovery
+    expect(row.expired).not.toBeNull();                            // tombstoned (dormant)
+    expect(row.state).toBe('active');                              // handle PRESERVED (dormancy, not retirement)
+    expect(row.norm).toBe('award-victim');                         // name NOT released — reactivatable with the secret
+    expect(store.listActiveNamedSessions().map((s) => s.sessionId)).not.toContain(a.sessionId); // gone from discovery (via the tombstone)
   });
 
   it('a send to an expired (formerly named+awarded) recipient is rejected FINAL — no stale routing', () => {
