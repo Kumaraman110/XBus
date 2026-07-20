@@ -75,6 +75,20 @@ function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.appendChild(text(txt)); return e; }
 function cell(row, value) { const td = document.createElement('td'); td.appendChild(text(value)); row.appendChild(td); return td; }
 function hhmmss(iso) { return iso ? String(iso).slice(11, 19) : ''; }
+/** Compact relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), or "—" when absent.
+ *  Client-side from an ISO instant (no new broker data). Never throws on a bad value. */
+function relativeTime(iso) {
+  if (!iso) return '—';
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '—';
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 45) return 'just now';
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + 'm ago';
+  const hr = Math.round(min / 60);
+  if (hr < 24) return hr + 'h ago';
+  return Math.round(hr / 24) + 'd ago';
+}
 /** A 2-char monogram for the session avatar: initials of a hyphenated name, else first 2 chars. */
 function monogram(name) {
   const parts = String(name || '').split(/[-_ ]+/).filter(Boolean);
@@ -158,7 +172,7 @@ function renderSessions(sessions) {
   const hiddenCount = (sessions || []).length - shown.length;
   if (!shown.length) {
     const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
-    c.colSpan = 8; c.className = 'state-cell';
+    c.colSpan = 9; c.className = 'state-cell';
   } else for (const s of shown) {
     const r = document.createElement('tr');
     if (isInternal(s)) r.className = 'row-internal';
@@ -173,6 +187,12 @@ function renderSessions(sessions) {
     if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
     svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
     const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
+    // Beta.10 (Train B): last-activity column from lastSeenSourceAt (already projected). Shows a
+    // compact relative time with the exact ISO in a title for precision.
+    const la = document.createElement('td'); la.className = 'last-activity';
+    const laSpan = el('span', 'muted', relativeTime(s.lastSeenSourceAt));
+    if (s.lastSeenSourceAt) laSpan.title = s.lastSeenSourceAt;
+    la.appendChild(laSpan); r.appendChild(la);
     const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
     deliveryCell(r, d.queued, 'queued');
     deliveryCell(r, d.delivered, 'delivered');
@@ -318,6 +338,17 @@ function renderThreadList(threads) {
     main.appendChild(el('span', 'thread-item-peer', t.peerName || (t.peerSessionId ? t.peerSessionId.slice(0, 8) : 'unknown')));
     main.appendChild(el('span', 'thread-item-sub', t.subject || ('turn ' + t.lastThreadSequence + ' · ' + t.lastTurnState)));
     li.appendChild(main);
+    // Beta.10 (Train B): a "needs attention" flag for stalled/failed/expired threads, derived
+    // from the summary alone (no per-thread turn fetch — no N+1). Text + title carry meaning
+    // (never color alone), so it is accessible.
+    const T = window.XBusTimeline;
+    const attn = T ? T.threadListAttention(t, Date.now()) : { needsAttention: false };
+    if (attn.needsAttention) {
+      const flag = el('span', 'attn attn-' + attn.reason, attn.reason === 'failed' ? '!failed' : attn.reason === 'expired' ? '!expired' : '!stalled');
+      flag.title = attn.reason === 'stalled' ? 'No reply yet — this conversation has been idle past the stall threshold.'
+        : attn.reason === 'expired' ? 'A turn expired before it completed.' : 'A turn failed.';
+      li.appendChild(flag);
+    }
     if (t.unreadCount > 0) li.appendChild(el('span', 'unread', String(t.unreadCount)));
     // Keyboard-operable: a thread row behaves as a button (Enter/Space select it) + is
     // focusable + announces selection state for assistive tech.
@@ -363,7 +394,20 @@ function renderTimeline(thread) {
   header.hidden = false;
   peerEl.textContent = thread.peerName || 'unknown';
   subjEl.textContent = thread.subject ? '· ' + thread.subject : '';
-  stateEl.textContent = thread.state === 'closed' ? 'closed' : (thread.turns.length + ' turn(s)');
+  // Beta.10 (Train B): summarize stalled/unanswered work for the OPEN thread (full per-turn
+  // rollup — turns are already loaded here, so no extra fetch). Surfaces what needs attention.
+  const T = window.XBusTimeline;
+  const work = T ? T.summarizeThreadWork(thread.turns, Date.now()) : { needsAttention: false };
+  stateEl.className = 'muted' + (work.needsAttention ? ' attn-text' : '');
+  if (thread.state === 'closed') stateEl.textContent = 'closed';
+  else if (work.needsAttention) {
+    const bits = [];
+    if (work.failed) bits.push(work.failed + ' failed');
+    if (work.expired) bits.push(work.expired + ' expired');
+    const stalledOnly = work.stalled - work.failed - work.expired;
+    if (stalledOnly > 0) bits.push(stalledOnly + ' awaiting reply');
+    stateEl.textContent = thread.turns.length + ' turn(s) · needs attention: ' + bits.join(', ');
+  } else stateEl.textContent = thread.turns.length + ' turn(s)';
 
   tl.replaceChildren();
   if (!thread.turns.length) { tl.appendChild(el('p', 'empty', 'No turns yet.')); }
@@ -375,14 +419,18 @@ function renderTimeline(thread) {
     meta.appendChild(el('span', null, hhmmss(turn.createdAt)));
     div.appendChild(meta);
     div.appendChild(el('div', 'turn-body', turn.text));
-    const st = el('div', 'turn-state state-' + turn.deliveryState);
-    let label = turn.deliveryState;
-    if (turn.ackStatus === 'rejected') label = 'rejected by recipient';
-    else if (turn.deliveryState === 'queued' && turn.authorType === 'operator') label = 'queued — waiting for recipient checkpoint';
-    else if (turn.deliveryState === 'failed') label = 'failed' + (turn.failureCategory ? ' (' + turn.failureCategory + ')' : '');
+    // Beta.10 (Train B): derive the distinct timeline state (queued/injected/acknowledged/
+    // reply-pending/replied/failed/expired) client-side from the projection fields. Fall back to
+    // the raw deliveryState if the timeline module isn't present.
+    const T = window.XBusTimeline;
+    const tstate = T ? T.deriveTurnState(turn, Date.now()) : turn.deliveryState;
+    const st = el('div', 'turn-state state-' + tstate);
+    let label = T ? T.turnStateLabel(tstate) : turn.deliveryState;
+    if (tstate === 'failed' && turn.ackStatus === 'rejected') label = 'Rejected by recipient';
+    else if (tstate === 'failed' && turn.failureCategory) label = 'Failed (' + turn.failureCategory + ')';
     st.appendChild(text(label));
-    // Safe retry for a FAILED operator turn: re-send with a fresh idempotency key in the thread.
-    if (turn.deliveryState === 'failed' && turn.authorType === 'operator') {
+    // Safe retry for a FAILED or EXPIRED operator turn: re-send with a fresh idempotency key.
+    if ((tstate === 'failed' || tstate === 'expired') && turn.authorType === 'operator') {
       const btn = el('button', 'secondary retry-btn', 'Retry'); btn.type = 'button';
       btn.addEventListener('click', () => retryTurn(thread, turn, btn));
       st.appendChild(btn);

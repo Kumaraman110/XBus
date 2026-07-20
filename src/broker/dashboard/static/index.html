@@ -105,6 +105,7 @@
             <tr>
               <th scope="col">Session</th>
               <th scope="col">Status</th>
+              <th scope="col">Last activity</th>
               <th scope="col">Queued</th>
               <th scope="col">Delivered</th>
               <th scope="col">ACK</th>
@@ -113,7 +114,7 @@
               <th scope="col"><span class="sr-only">Details</span></th>
             </tr>
           </thead>
-          <tbody id="sessions-body"><tr><td colspan="8" class="state-cell">Loading…</td></tr></tbody>
+          <tbody id="sessions-body"><tr><td colspan="9" class="state-cell">Loading…</td></tr></tbody>
         </table>
       </div>
       <div class="tbl-foot">
@@ -149,6 +150,7 @@
        external files (strict CSP: script-src 'self'; no inline JS). collections.js + agents.js
        are ES modules; app.js is a classic script. -->
   <script type="module" src="/collections.js"></script>
+  <script type="module" src="/timeline.js"></script>
   <script src="/app.js"></script>
   <script type="module" src="/agents.js"></script>
 </body>
