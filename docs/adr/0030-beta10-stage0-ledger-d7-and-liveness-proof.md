@@ -1,10 +1,11 @@
 # ADR 0030 — recycled-PID liveness proof (beta.9.1 / beta.10 Stage 0 Part B)
 
-**Status:** Accepted (beta.9.1). Originally authored as beta.10 Stage 0 (commit `c6c761c`), which
-bundled this recycled-PID fix (Part B) with the ADR-0027 D7 ledger debt (Part A). For the beta.9.1
-point-release the two are decomposed into independently-revertible commits: this ADR covers the
-recycled-PID liveness proof; the D7 ledger atomicity is documented in ADR 0032. The primitive is
-byte-identical to the code reviewed at `c6c761c`.
+**Status:** Accepted (beta.9.1). Originally authored as part of the reviewed beta.10 Stage-0 work,
+which bundled this recycled-PID fix (Part B) with the ADR-0027 D7 ledger debt (Part A). For the
+beta.9.1 point-release the two are decomposed into independently-revertible commits: this ADR covers
+the recycled-PID liveness proof; the D7 ledger atomicity is documented in ADR 0032. The primitive is
+byte-identical to the reviewed Stage-0 baseline (the exact Stage-0 source is recorded in git history
+and the beta.9.1 decomposition equivalence proof).
 
 **Context:** A prerequisite for the durable-role work (Stage 1) and adoption/transfer (Stage 3),
 independently valuable and shippable with no schema/protocol change.

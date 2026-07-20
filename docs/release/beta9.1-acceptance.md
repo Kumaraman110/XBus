@@ -6,13 +6,15 @@ acceptance item to the coverage that verifies it; the aggregate release gate run
 APPROVED Node runtime in `[22.13, 25)` (the machine PATH node v25 is out-of-floor; use the pinned
 runtime / an isolated Node-22 harness).
 
-Reviewed runtime head: `9f00a95` (4 runtime commits; all three reviewer gates green). This manifest
-and the version-identity edits are commit 5 (the release candidate); the candidate's provenance is
+Reviewed runtime baseline: the four runtime commits (CSPRNG, recycled-PID, reply-pending-orphan,
+D7), all three reviewer gates green (exact SHAs recorded in git history + the beta.9.1 decomposition
+equivalence proof). This manifest and the version-identity edits are commit 5 (the release
+candidate); the candidate's provenance is
 generated AFTER commit 5 and reports the commit-5 SHA.
 
 | # | Acceptance item | Verified by |
 |---|---|---|
-| 1 | beta.9 → beta.9.1 upgrade (schema/compat unchanged, s10) | `tests/unit/version-consistency.test.ts` (s10 pinned) + `tests/unit/migration-v10.test.ts` (head schema 10) + no `migrations.ts` diff over `0ed86fb..9f00a95` |
+| 1 | beta.9 → beta.9.1 upgrade (schema/compat unchanged, s10) | `tests/unit/version-consistency.test.ts` (s10 pinned) + `tests/unit/migration-v10.test.ts` (head schema 10) + no `migrations.ts` diff between the beta.9 tag and the reviewed runtime baseline |
 | 2 | Existing beta.9 owner-secret validity (no invalidation) | `tests/unit/credential-csprng.test.ts` [3b] legacy issued-secret still verifies+reclaims; `hashSecret` unchanged |
 | 3 | New CSPRNG secret minting | `tests/unit/credential-csprng.test.ts` [1][2][5][6][7] (length/encoding, no-collision, cryptographic source, reconstruction-insufficient, seam cannot alter production default) |
 | 4 | Recycled PID rejection | `tests/unit/liveness-proof.test.ts` (three-verdict truth table) + `tests/integration/broker-shutdown.test.ts` (KILL fail-closed) |

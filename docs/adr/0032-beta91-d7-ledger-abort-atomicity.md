@@ -1,11 +1,12 @@
 # ADR 0032 — durable-identity ledger transitions are abort-atomic (ADR-0027 D7)
 
 **Status:** Accepted (beta.9.1).
-**Relationship:** Implements the ADR-0027 D7 requirement. Originally authored as beta.10 Stage 0
-Part A (commit `c6c761c`), decomposed for beta.9.1 into its own independently-revertible commit,
-separate from the recycled-PID liveness proof (ADR 0030). The `audit()→ledger()` production change
-is byte-identical to the code reviewed at `c6c761c`; this ADR adds the explicit failure-path proof
-that beta.9 lacked.
+**Relationship:** Implements the ADR-0027 D7 requirement. Originally authored as part of the
+reviewed beta.10 Stage-0 work (Part A), decomposed for beta.9.1 into its own independently-revertible
+commit, separate from the recycled-PID liveness proof (ADR 0030). The `audit()→ledger()` production
+change is byte-identical to the reviewed Stage-0 baseline (the exact Stage-0 source is recorded in
+git history and the beta.9.1 decomposition equivalence proof); this ADR adds the explicit
+failure-path proof that beta.9 lacked.
 
 **Context.** The intended atomicity — an identity-authority transition and its hash-chained audit
 record commit or roll back together — was the DESIGN in the reviewed Stage-0 work: the events
