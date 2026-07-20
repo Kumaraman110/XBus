@@ -16,6 +16,19 @@ change to "released" semantics cannot silently skip a caller.
 (expiry = dormancy now keeps the handle), leaving 2 in store.ts — consolidated here into 1.
 **Proof.** ownership-primitive.test.ts (no half-released row from any path). Adversarial+Reliability
 review of R2/R3/R4 = Package B (pending at time of writing).
+**Authority-primitive roster (R2 invariant "one path mutates ownership").** The sanctioned writers
+of the dedicated authority tables (`name_ownership`, `physical_session_map`, `session_epochs`,
+`fencing_counter`) are, in full: `setNameOwnershipActive` (award), `releaseNameOwnership` (release),
+`register()` (reclaim redirect / stale-edge self-heal / epoch lifecycle via `nextEpochToken`),
+`reapExpiredSessions` (expiry-GC = dormancy), and the two operator-console primitives
+`operatorRenameAlias` (award mirror; operator holds no SessionAuthority so cannot call
+`renameSession`) + `operatorRemoveRecord` (destruction GC). Migrations are DDL/backfill only. This
+roster is now STATICALLY ENFORCED by ownership-authority-guard.test.ts (table-scoped): a raw-SQL
+write to any of the four tables from a non-allow-listed file fails CI, so the invariant cannot
+silently erode. A 5-agent bypass audit (wf_50494ea9, 70 sites) found ZERO production bypasses.
+**Hygiene.** The audit flagged private `nextFencingToken()` as zero-caller dead code (a latent
+footgun that could bump the shared fence outside a lifecycle transition); it was removed. Only
+`nextEpochToken` bumps `fencing_counter`, guarded by the same static test.
 
 ## WS1 R3 — hash-chained ledger completeness for credential birth
 **Decision.** A FIRST protected name award (a fresh owner secret minted in `setNameOwnershipActive`)

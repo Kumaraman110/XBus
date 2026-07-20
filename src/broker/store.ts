@@ -482,11 +482,6 @@ export class BrokerStore {
     }
   }
 
-  private nextFencingToken(): number {
-    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
-    return (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
-  }
-
   private nextEpochToken(): string {
     this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
     const v = (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
