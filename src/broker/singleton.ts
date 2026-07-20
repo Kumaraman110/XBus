@@ -14,7 +14,7 @@
  *     surfaced in diagnostics.
  */
 import net from 'node:net';
-import { readStateFile, pidIsAlive } from './state-file.js';
+import { readStateFile } from './state-file.js';
 import { classifyLiveness, type LivenessDeps } from './liveness-proof.js';
 
 export type SingletonOutcome = 'acquired' | 'already_running' | 'contended' | 'stale_cleared';
