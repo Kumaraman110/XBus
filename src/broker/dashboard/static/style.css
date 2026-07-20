@@ -550,3 +550,7 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
 .inst-badge{ font:600 9.5px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--ok); background:var(--accent-soft); padding:3px 7px; border-radius:var(--r-pill); }
 .redeliver-btn{ margin-left:8px; font:500 10.5px/1 var(--font-ui); color:var(--st-delivered); background:var(--st-delivered-bg); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:5px 10px; cursor:pointer; }
 .redeliver-btn:hover{ border-color:var(--accent-line); }
+
+/* Beta.10 (Train B): clear-all-filters affordance in the roster toolbar. */
+.roster-clear{ margin-left:auto; } /* push to the right end of the flex toolbar */
+.state-cell .link-btn{ margin-left:4px; }

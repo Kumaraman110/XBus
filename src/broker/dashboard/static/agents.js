@@ -76,6 +76,58 @@ export function applyRosterFilter(sessions, deps) {
   return out.slice();
 }
 
+/** The selectable roster sort modes (value + label). 'default' = the read-model order (newest-first). */
+export const ROSTER_SORTS = [
+  { value: 'default', label: 'Default order' },
+  { value: 'attention', label: 'Needs attention first' },
+  { value: 'pinned', label: 'Pinned first' },
+  { value: 'activity', label: 'Recent activity' },
+];
+
+/** Per-session attention signal for sorting: a session with failed deliveries needs attention. */
+function sessionNeedsAttention(s) { return ((s.delivery && s.delivery.failed) || 0) > 0; }
+
+/**
+ * PURE, STABLE roster sort. Never mutates the input. 'default'/unknown → the incoming order
+ * (read-model newest-first). 'pinned' → pinned agents first. 'attention' → agents with failed
+ * deliveries first. 'activity' → most-recent lastSeenSourceAt desc (nulls last). Stability is
+ * preserved by sorting on a decorated index so equal keys keep their original relative order.
+ */
+export function sortRoster(sessions, mode) {
+  const list = Array.isArray(sessions) ? sessions.slice() : [];
+  if (mode === 'pinned') {
+    return stableSort(list, (s) => (s.pinned ? 0 : 1));
+  }
+  if (mode === 'attention') {
+    return stableSort(list, (s) => (sessionNeedsAttention(s) ? 0 : 1));
+  }
+  if (mode === 'activity') {
+    return stableSort(list, (s) => {
+      const t = s.lastSeenSourceAt ? Date.parse(s.lastSeenSourceAt) : NaN;
+      return Number.isFinite(t) ? -t : Infinity; // most-recent first; nulls/invalid last
+    });
+  }
+  return list; // 'default' / unknown → read-model order
+}
+
+/** Stable sort by a numeric key (ascending), preserving original order for equal keys. */
+function stableSort(list, keyOf) {
+  return list
+    .map((item, i) => ({ item, i, k: keyOf(item) }))
+    .sort((a, b) => (a.k - b.k) || (a.i - b.i))
+    .map((d) => d.item);
+}
+
+/** Are any roster filters narrowing the view right now? Drives the clear-all affordance + the
+ *  empty-state wording (distinguishes "no agents" from "no agents match your filters"). Pure. */
+export function hasActiveFilters(fs) {
+  const f = fs || {};
+  return (String(f.search || '').trim() !== '')
+    || (f.status && f.status !== 'all')
+    || (f.control && f.control !== 'all')
+    || (f.collectionSelector && f.collectionSelector !== 'all');
+}
+
 /**
  * Human, HONEST success message for a control action's authoritative broker result. Pure +
  * exported so the stop_managed honesty is unit-testable: a stop that signalled a live process
@@ -129,7 +181,7 @@ export function postMutationStatus(action, resultBody, refreshResult) {
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   const C = window.XBusCollections; // Collections module (roster grouping)
-  const filterState = { search: '', status: 'all', control: 'all', collectionSelector: 'all' };
+  const filterState = { search: '', status: 'all', control: 'all', collectionSelector: 'all', sort: 'default' };
   // Persistence backend (WS3 cutover seam): default to localStorage; AUTOMATICALLY switches to the
   // broker DB (makeServerStore) at init() the instant the capability probe finds GET/POST
   // /api/collections. No manual flip needed — the probe drives it; localStorage stays until then.
@@ -144,13 +196,16 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   function sessions() { return window.__sessions || []; }
   function findSession(id) { return sessions().find((s) => s.sessionId === id) || null; }
 
-  /* ---- roster filter (consumed by app.js renderSessions) ---- */
+  /* ---- roster filter + sort (consumed by app.js renderSessions) ---- */
   function rosterFilter(list) {
-    return applyRosterFilter(list, {
+    const filtered = applyRosterFilter(list, {
       ...filterState,
       collectionsApi: C, collectionsState,
     });
+    return sortRoster(filtered, filterState.sort);
   }
+  // Expose the active filter state so app.js can tailor the empty-state wording.
+  function activeFilters() { return hasActiveFilters(filterState); }
 
   /* ---- toolbar (search + status + control + collection selector + manage collections) ---- */
   function buildToolbar() {
@@ -158,28 +213,37 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     if (!host) return;
     host.replaceChildren();
 
+    // A filter change re-renders the roster AND syncs the clear-button visibility (without a full
+    // toolbar rebuild, so the active select keeps focus). A sort change is an ordering, not a filter.
+    const onFilterChange = () => { window.XBusApi.rerender(); syncClearButton(); };
+
     const search = document.createElement('input');
     search.type = 'search'; search.id = 'roster-search'; search.className = 'roster-search';
     search.placeholder = 'Search agents…'; search.setAttribute('aria-label', 'Search agents');
     search.value = filterState.search;
-    search.addEventListener('input', () => { filterState.search = search.value; window.XBusApi.rerender(); });
+    search.addEventListener('input', () => { filterState.search = search.value; onFilterChange(); });
     host.appendChild(search);
 
     const statusSel = mkSelect('roster-status', 'Filter by status', [
       ['all', 'All statuses'], ['active-ready', 'Ready'], ['active-starting', 'Starting'],
       ['active-disconnected', 'Disconnected'], ['dormant', 'Dormant'], ['unmanaged', 'Unmanaged'], ['expired', 'Expired'],
-    ], filterState.status, (v) => { filterState.status = v; window.XBusApi.rerender(); });
+    ], filterState.status, (v) => { filterState.status = v; onFilterChange(); });
     host.appendChild(statusSel);
 
     const ctrlSel = mkSelect('roster-control', 'Filter by receive control', [
       ['all', 'All controls'], ['active', 'Active'], ['paused', 'Paused'], ['do_not_disturb', 'Do not disturb'], ['manual_checkpoint', 'Manual'],
-    ], filterState.control, (v) => { filterState.control = v; window.XBusApi.rerender(); });
+    ], filterState.control, (v) => { filterState.control = v; onFilterChange(); });
     host.appendChild(ctrlSel);
+
+    // Sort selector (pinned / attention / activity / default). Client-side ordering over the
+    // already-filtered rows — pure sortRoster. Not a filter, so it does not affect clear-all.
+    const sortSel = mkSelect('roster-sort', 'Sort agents', ROSTER_SORTS.map((m) => [m.value, m.label]), filterState.sort, (v) => { filterState.sort = v; window.XBusApi.rerender(); });
+    host.appendChild(sortSel);
 
     if (C) {
       const opts = [['all', 'All collections'], ['ungrouped', 'Ungrouped']]
         .concat(collectionsState.collections.map((c) => [c.id, c.name]));
-      const colSel = mkSelect('roster-collection', 'Filter by collection', opts, filterState.collectionSelector, (v) => { filterState.collectionSelector = v; window.XBusApi.rerender(); });
+      const colSel = mkSelect('roster-collection', 'Filter by collection', opts, filterState.collectionSelector, (v) => { filterState.collectionSelector = v; onFilterChange(); });
       host.appendChild(colSel);
 
       const manageBtn = el('button', 'secondary', 'Collections…');
@@ -187,6 +251,30 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       manageBtn.addEventListener('click', openCollectionsManager);
       host.appendChild(manageBtn);
     }
+
+    syncClearButton(); // add the clear button now if filters are already active (e.g. after rebuild)
+  }
+
+  /**
+   * Add/remove the toolbar "Clear filters" button to match hasActiveFilters WITHOUT rebuilding the
+   * whole toolbar (so an in-progress select/search keeps focus). Idempotent.
+   */
+  function syncClearButton() {
+    const host = document.getElementById('roster-toolbar');
+    if (!host) return;
+    const existing = document.getElementById('roster-clear-btn');
+    if (hasActiveFilters(filterState)) {
+      if (!existing) {
+        const clear = el('button', 'link-btn roster-clear', 'Clear filters');
+        clear.type = 'button'; clear.id = 'roster-clear-btn';
+        clear.addEventListener('click', () => {
+          filterState.search = ''; filterState.status = 'all'; filterState.control = 'all'; filterState.collectionSelector = 'all';
+          buildToolbar(); // full rebuild resets every select to 'all' + drops this button
+          window.XBusApi.rerender();
+        });
+        host.appendChild(clear);
+      }
+    } else if (existing) { existing.remove(); }
   }
 
   function mkSelect(id, aria, opts, value, onChange) {
@@ -622,6 +710,8 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 
   window.XBusAgents = {
     rosterFilter,
+    activeFilters,   // app.js uses this to tailor the empty-state wording
+    clearFilters: () => { filterState.search = ''; filterState.status = 'all'; filterState.control = 'all'; filterState.collectionSelector = 'all'; buildToolbar(); window.XBusApi.rerender(); },
     openInspector,
     describeControlResult,
     postMutationStatus,

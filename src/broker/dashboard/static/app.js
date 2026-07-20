@@ -236,8 +236,24 @@ function renderSessions(sessions) {
   if (!shown.length) {
     rosterRowCache.clear();
     body.replaceChildren();
-    const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
-    c.colSpan = 9; c.className = 'state-cell';
+    const r = body.insertRow();
+    const c = document.createElement('td'); c.colSpan = 9; c.className = 'state-cell';
+    // Distinguish the three empty cases so the operator knows WHY it's empty + how to recover:
+    //  (a) filters hid everything → say so + offer a one-click Clear;
+    //  (b) only internal sessions exist → point at the Internal toggle;
+    //  (c) genuinely no sessions yet.
+    const filtersActive = window.XBusAgents && window.XBusAgents.activeFilters && window.XBusAgents.activeFilters();
+    if ((sessions || []).length && filtersActive) {
+      c.appendChild(text('No agents match your filters. '));
+      const clr = el('button', 'link-btn', 'Clear filters'); clr.type = 'button';
+      clr.addEventListener('click', () => { if (window.XBusAgents && window.XBusAgents.clearFilters) window.XBusAgents.clearFilters(); });
+      c.appendChild(clr);
+    } else if ((sessions || []).length) {
+      c.appendChild(text('No user sessions — toggle “Internal sessions” to see XBus internals.'));
+    } else {
+      c.appendChild(text('No sessions yet.'));
+    }
+    r.appendChild(c);
   } else {
     // Incremental/keyed re-render (G7): reuse rows whose signature is unchanged; rebuild only the
     // changed ones; reconcile order with minimal DOM ops. No whole-table rebuild per frame.

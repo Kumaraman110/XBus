@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, receiveControlLabel, describeControlResult,
-  postMutationStatus,
+  postMutationStatus, sortRoster, hasActiveFilters, ROSTER_SORTS,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS static asset, intentionally untyped
 } from '../../src/broker/dashboard/static/agents.js';
@@ -129,5 +129,55 @@ describe('postMutationStatus — DASH-1: never show unqualified success over sta
     expect(st.cls).not.toBe('ok');
     expect(st.retry).toBe(true);
     expect(st.message).not.toMatch(/^Archived\.$/); // not the bare success string
+  });
+});
+
+describe('sortRoster — stable, pure roster ordering (pinned / attention / activity)', () => {
+  // delivery.failed drives per-session attention; pinned drives pin-first; lastSeenSourceAt drives activity.
+  const rows = [
+    { sessionId: 'a', pinned: false, delivery: { failed: 0 }, lastSeenSourceAt: '2026-07-20T10:00:00Z' },
+    { sessionId: 'b', pinned: true,  delivery: { failed: 0 }, lastSeenSourceAt: '2026-07-20T09:00:00Z' },
+    { sessionId: 'c', pinned: false, delivery: { failed: 3 }, lastSeenSourceAt: '2026-07-20T11:00:00Z' },
+    { sessionId: 'd', pinned: true,  delivery: { failed: 2 }, lastSeenSourceAt: '2026-07-20T08:00:00Z' },
+  ];
+  it('default preserves the incoming order (read-model order), never mutates input', () => {
+    const copy = rows.slice();
+    expect(sortRoster(rows, 'default').map((r: { sessionId: string }) => r.sessionId)).toEqual(['a', 'b', 'c', 'd']);
+    expect(rows).toEqual(copy); // input untouched
+  });
+  it("'pinned' puts pinned agents first, preserving relative order within each group (stable)", () => {
+    expect(sortRoster(rows, 'pinned').map((r: { sessionId: string }) => r.sessionId)).toEqual(['b', 'd', 'a', 'c']);
+  });
+  it("'attention' puts agents with failed deliveries first (stable within group)", () => {
+    // c (3 failed) and d (2 failed) are the attention set, in original relative order → c, d, then a, b.
+    expect(sortRoster(rows, 'attention').map((r: { sessionId: string }) => r.sessionId)).toEqual(['c', 'd', 'a', 'b']);
+  });
+  it("'activity' sorts by most-recent lastSeenSourceAt desc (nulls last)", () => {
+    const withNull = rows.concat([{ sessionId: 'e', pinned: false, delivery: { failed: 0 }, lastSeenSourceAt: null }]);
+    expect(sortRoster(withNull, 'activity').map((r: { sessionId: string }) => r.sessionId)).toEqual(['c', 'a', 'b', 'd', 'e']);
+  });
+  it('an unknown/absent mode falls back to default order', () => {
+    expect(sortRoster(rows, 'bogus').map((r: { sessionId: string }) => r.sessionId)).toEqual(['a', 'b', 'c', 'd']);
+    expect(sortRoster(rows).map((r: { sessionId: string }) => r.sessionId)).toEqual(['a', 'b', 'c', 'd']);
+  });
+  it('ROSTER_SORTS advertises the selectable modes', () => {
+    expect(ROSTER_SORTS.map((m: { value: string }) => m.value)).toEqual(
+      expect.arrayContaining(['default', 'pinned', 'attention', 'activity']),
+    );
+  });
+});
+
+describe('hasActiveFilters — drives the clear-all affordance + empty-state wording', () => {
+  it('false for the all-default filter state', () => {
+    expect(hasActiveFilters({ search: '', status: 'all', control: 'all', collectionSelector: 'all' })).toBe(false);
+  });
+  it('true when any dimension is narrowed', () => {
+    expect(hasActiveFilters({ search: 'x', status: 'all', control: 'all', collectionSelector: 'all' })).toBe(true);
+    expect(hasActiveFilters({ search: '', status: 'dormant', control: 'all', collectionSelector: 'all' })).toBe(true);
+    expect(hasActiveFilters({ search: '', status: 'all', control: 'paused', collectionSelector: 'all' })).toBe(true);
+    expect(hasActiveFilters({ search: '', status: 'all', control: 'all', collectionSelector: 'ungrouped' })).toBe(true);
+  });
+  it('treats whitespace-only search as inactive', () => {
+    expect(hasActiveFilters({ search: '   ', status: 'all', control: 'all', collectionSelector: 'all' })).toBe(false);
   });
 });
