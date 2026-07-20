@@ -479,7 +479,24 @@ export class BrokerStore {
       // which presents no secret and drives checkpoint delivery) must resolve to the SAME
       // canonical session — otherwise the hook would pull an empty inbox against the phantom
       // physical id. The map is authoritative and read on every register.
-      const mapped = this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(physicalSessionId) as { c: string } | undefined;
+      // BETA.10 WS1 (ADR 0033) — DEFENSE-IN-DEPTH map resolution. Follow a physical_session_map edge
+      // ONLY when its canonical target still EXISTS and is REDIRECT-ELIGIBLE (a live/connected
+      // lifecycle, NOT dormant/expired and NOT removed/missing). A secret-less register must never be
+      // redirected onto a dormant or torn-down identity (that was the resurrection/inbox-adoption
+      // hole). If the edge is dangling (target row gone) or ineligible (target expired/dormant), it is
+      // a stale cache entry: transactionally PURGE it and fall through to normal registration. A
+      // secret-BEARING reclaim does not depend on this edge — it goes through resolveReclaim below.
+      const mappedRaw = this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(physicalSessionId) as { c: string } | undefined;
+      let mapped: { c: string } | undefined = mappedRaw;
+      if (mappedRaw) {
+        const tgt = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(mappedRaw.c) as { expired_at: string | null } | undefined;
+        const eligible = !!tgt && tgt.expired_at === null; // exists AND not dormant/expired
+        if (!eligible) {
+          // Self-heal: purge the stale/ineligible edge so it can never be followed secret-lessly.
+          this.db.prepare('DELETE FROM physical_session_map WHERE physical_session_id=?').run(physicalSessionId);
+          mapped = undefined;
+        }
+      }
       // A fresh secret-bearing reclaim (mcp only): decide the canonical target + liveness gate.
       const reclaim = role === ComponentRole.MCP
         ? this.resolveReclaim(inputRaw.requestedSessionName, inputRaw.ownerSecret, physicalSessionId)
@@ -1484,12 +1501,29 @@ export class BrokerStore {
       // the id by value, not FK) and NEVER touch the transcript file on disk (transcript_path is
       // read-only here). component_instances/session_epochs carry no FK, but prune them too so a
       // removed session leaves no dangling per-session rows.
+      // BETA.10 WS1 (ADR 0033) — REMOVE = EXPLICIT DESTRUCTION. Before deleting the sessions row,
+      // terminalize every UNFINISHED delivery to this recipient with an explicit reason so no
+      // adoptable/silent orphan survives (queued/retry_wait/transport_written/accepted → dead_letter,
+      // failure_category='recipient_removed'). Messages/deliveries rows themselves are preserved as
+      // history (referenced by value, not FK); only their live state is closed out.
+      this.db.prepare(
+        `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_removed', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}','${DeliveryState.ACCEPTED}')`,
+      ).run(this.clock.nowIso(), sessionId);
       this.db.prepare('DELETE FROM aliases WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM session_instances WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM recipient_sequences WHERE recipient_session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM component_instances WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM session_epochs WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM thread_participants WHERE session_id=?').run(sessionId);
+      // BETA.10 WS1 (ADR 0033): release + DELETE the durable name_ownership row (the freed handle
+      // returns to the pool, normally claimable by a new owner), and GC EVERY physical_session_map
+      // edge referencing this identity as physical source, canonical target, or logical identity.
+      // Together with the sessions DELETE this makes the identity UNRECLAIMABLE through any stale
+      // mapping and INVALIDATES the old ownership secret (no active/pending name_ownership row for
+      // resolveReclaim to match). This is the KNOWN-3 fix: remove no longer orphans the durable-
+      // identity tables (which previously enabled secret-less resurrection + inbox adoption).
+      this.db.prepare('DELETE FROM physical_session_map WHERE canonical_session_id=? OR physical_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId, sessionId);
+      this.db.prepare('DELETE FROM name_ownership WHERE current_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId);
       this.db.prepare('DELETE FROM sessions WHERE session_id=?').run(sessionId);
       this.ledger('OPERATOR_SESSION_RECORD_REMOVED', OPERATOR_LEDGER_ACTOR, { sessionId }, { transcriptPreserved: true });
       return { sessionId, removed: true };

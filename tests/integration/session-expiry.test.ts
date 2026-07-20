@@ -66,9 +66,13 @@ describe('15-day expiry sweep', () => {
     const row = sessRow(a.sessionId);
     expect(row.expired_at).toBe(clock.nowIso());
     expect(row.reason).toBe('recipient_inactive_15_days');
-    expect(row.state).toBe('retired'); // name released
     expect(row.readiness).toBe('disconnected');
-    expect(row.norm).toBeNull(); // name no longer held
+    // BETA.10 WS1 (ADR 0033) — EXPIRY = DORMANCY, NOT DELETION. Expiry no longer RETIRES the name
+    // or releases the durable handle (beta.9 did — the handle-takeover / continuity-loss bug). The
+    // dormancy flag is `expired_at`; the protected USER handle stays HELD so only the secret-bearing
+    // owner can reactivate it. So session_name_state stays 'active' and the name remains held.
+    expect(row.state).toBe('active'); // handle stays HELD (dormant), not retired/released
+    expect(row.norm).toBe('exp-a');   // durable name still held for secret-gated reclaim
   });
 
   it('exactly 15 days is the boundary (expires_at == now is due)', () => {
@@ -79,15 +83,24 @@ describe('15-day expiry sweep', () => {
     expect(sessRow(a.sessionId).expired_at).not.toBeNull();
   });
 
-  it('drops the session from discovery and frees its name for reuse', () => {
+  it('drops the session from discovery but KEEPS its name HELD (dormant, not freed for secret-less takeover)', () => {
+    // BETA.10 WS1 (ADR 0033) — EXPIRY = DORMANCY. beta.9 freed the name for reuse by any brand-new
+    // session; that is exactly the handle-takeover the split-teardown decision forbids. Now the
+    // dormant identity KEEPS its protected handle: it drops out of the ACTIVE discovery view, but a
+    // brand-new SECRET-LESS session claiming the same name gets PENDING (not active), and only the
+    // valid owner secret reactivates the identity. (Explicit destruction via operatorRemoveRecord is
+    // the path that frees the handle — covered by identity-map-lifecycle CASE 3.)
     const a = ready('exp-name');
     clock.advance(15 * DAY + 1000);
     reaper.sweep();
     expect(store.listActiveNamedSessions().map((s) => s.sessionId)).not.toContain(a.sessionId);
-    // The freed name can be claimed by a brand-new session.
+    // A brand-new SECRET-LESS session cannot take the held handle — it is parked pending.
     const b = ready('exp-name');
-    expect(sessRow(b.sessionId).state).toBe('active');
-    expect(sessRow(b.sessionId).norm).toBe('exp-name');
+    expect(sessRow(b.sessionId).state, 'a dormant handle is not takeable without the secret').not.toBe('active');
+    // The valid owner secret reactivates the ORIGINAL identity + its handle.
+    const back = store.register({ sessionId: sid(), instanceId: 'i', connectionId: `c-back`, processId: 1, projectId: 'p', cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'exp-name', ownerSecret: a.ownerSecret! });
+    expect(back.sessionId, 'valid secret reactivates the dormant identity').toBe(a.sessionId);
+    expect(back.awardedSessionName).toBe('exp-name');
   });
 
   it('rejects new sends to an expired recipient with RECIPIENT_SESSION_EXPIRED (final)', () => {
@@ -196,7 +209,10 @@ describe('15-day expiry sweep', () => {
     clock.advance(15 * DAY + 1000);
     reaper.sweep();
     expect(sessRow(victim.sessionId).expired_at).not.toBeNull();
-    expect(sessRow(victim.sessionId).state).toBe('retired');
+    // BETA.10 WS1 (ADR 0033): expiry = dormancy, so the handle stays HELD ('active'), not 'retired'.
+    // The dormancy flag is expired_at (asserted above). The rename-resurrection behavior this test
+    // covers (clear the tombstone, become routable) is unchanged — asserted below.
+    expect(sessRow(victim.sessionId).state).toBe('active');
     // The live connection's epoch is unchanged (expiry doesn't bump it), so rename's
     // epoch check passes — exactly the bite case.
     const autoAlias = (db.prepare('SELECT automatic_alias AS a FROM sessions WHERE session_id=?').get(victim.sessionId) as { a: string }).a;
