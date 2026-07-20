@@ -169,6 +169,7 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
         onMarkThreadRead: (payload) => daemon.operatorMarkThreadRead(payload),
         onOperatorControl: (payload) => daemon.operatorControl(payload),
         onOperatorRedeliver: (payload) => daemon.operatorRedeliver(payload),
+        onOperatorCollections: (payload) => daemon.operatorReplaceCollections(payload),
         onOperatorSchedule: (payload) => daemon.operatorSchedule(payload),
       });
       await dashboard.start();

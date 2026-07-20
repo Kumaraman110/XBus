@@ -513,6 +513,26 @@ export class DashboardReadModel {
       capabilities: ['redeliver', 'instances'],
     };
   }
+
+  /**
+   * BETA.10 WS3 — the workspace Collections read (dashboard contract), off-loop read-only. Mirrors
+   * BrokerStore.readCollections but on the read-worker's read-only handle. Ordered by sort_order.
+   */
+  collections(): { version: number; collections: Array<{ id: string; name: string; sortOrder: number; state: string }>; members: Record<string, string[]> } {
+    let cols: Array<{ id: string; name: string; sortOrder: number; state: string }> = [];
+    let memberRows: Array<{ cid: string; agent: string }> = [];
+    try {
+      cols = this.db.prepare(`SELECT collection_id AS id, name, sort_order AS sortOrder, state FROM collections WHERE workspace_id='local' ORDER BY sort_order ASC, normalized_name ASC`).all() as typeof cols;
+      memberRows = this.db.prepare(`SELECT collection_id AS cid, logical_agent_id AS agent FROM collection_members ORDER BY sort_order ASC`).all() as typeof memberRows;
+    } catch {
+      // s10 DB (collections tables absent) → fail-closed empty, never a partial/crash. The dashboard's
+      // capability probe treats this as "collections unavailable" and keeps localStorage.
+      return { version: 0, collections: [], members: {} };
+    }
+    const members: Record<string, string[]> = {};
+    for (const r of memberRows) { (members[r.agent] ??= []).push(r.cid); }
+    return { version: cols.length + memberRows.length + 1, collections: cols, members };
+  }
 }
 
 function safeParse(s: string): unknown {

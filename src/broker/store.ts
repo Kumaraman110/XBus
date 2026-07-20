@@ -1505,6 +1505,84 @@ export class BrokerStore {
     });
   }
 
+  /**
+   * BETA.10 WS3 — read the workspace Collections state (dashboard contract). Ordered by sort_order.
+   * { version, collections:[{id,name,sortOrder,state}], members:{logicalAgentId:[collectionId]} }.
+   * `version` = a monotonic stamp (max updated_at count proxy) so the client can detect staleness;
+   * here we use the row count + latest updated_at hashed to a simple increasing integer is overkill,
+   * so we return the number of collections mutations via a COUNT of rows as a coarse version — the
+   * dashboard only needs SOME changing value; a full vector isn't required for local single-writer.
+   */
+  readCollections(): { version: number; collections: Array<{ id: string; name: string; sortOrder: number; state: string }>; members: Record<string, string[]> } {
+    const cols = this.db.prepare(
+      `SELECT collection_id AS id, name, sort_order AS sortOrder, state FROM collections WHERE workspace_id='local' ORDER BY sort_order ASC, normalized_name ASC`,
+    ).all() as Array<{ id: string; name: string; sortOrder: number; state: string }>;
+    const memberRows = this.db.prepare(
+      `SELECT collection_id AS cid, logical_agent_id AS agent FROM collection_members ORDER BY sort_order ASC`,
+    ).all() as Array<{ cid: string; agent: string }>;
+    const members: Record<string, string[]> = {};
+    for (const r of memberRows) { (members[r.agent] ??= []).push(r.cid); }
+    // version = a coarse monotonic-ish stamp: total collections + total memberships (changes on any
+    // structural mutation). Single local writer, so exact vector clocks are unnecessary.
+    const version = cols.length + memberRows.length + 1;
+    return { version, collections: cols, members };
+  }
+
+  /**
+   * BETA.10 WS3 — REPLACE the full workspace Collections state (the dashboard POSTs the whole
+   * {collections, members}). Atomic full-state swap in ONE transaction: delete-then-reinsert so a
+   * collection dropped from the payload is DELETED (its membership cascades) but NO agent is ever
+   * touched. Enforces: unique ACTIVE normalized name per workspace (ux_collection_active_name), no
+   * duplicate member (PK + de-dup here), ordering (sort_order). A duplicate active name or a
+   * malformed row aborts the whole swap (no partial state). Operator-authority (audited).
+   */
+  replaceCollections(state: { collections: Array<{ id: string; name: string; sortOrder?: number; state?: string }>; members: Record<string, string[]> }): { version: number } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      // Guard duplicate ACTIVE normalized names up front (clearer error than the UNIQUE index abort).
+      const activeNorm = new Set<string>();
+      for (const c of state.collections) {
+        const st = c.state ?? 'active';
+        if (st === 'active') {
+          const norm = c.name.trim().toLowerCase();
+          if (activeNorm.has(norm)) throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `duplicate active collection name: ${c.name}`);
+          activeNorm.add(norm);
+        }
+      }
+      // Full swap: membership first (FK), then collections. Only these two tables — never sessions/
+      // name_ownership/agents. ON DELETE CASCADE would also clear membership, but we clear explicitly.
+      this.db.prepare('DELETE FROM collection_members').run();
+      this.db.prepare(`DELETE FROM collections WHERE workspace_id='local'`).run();
+      const validIds = new Set<string>();
+      for (const c of state.collections) {
+        const st = c.state ?? 'active';
+        this.db.prepare(
+          `INSERT INTO collections (collection_id, workspace_id, name, normalized_name, sort_order, state, created_at, updated_at) VALUES (?, 'local', ?, ?, ?, ?, ?, ?)`,
+        ).run(c.id, c.name, c.name.trim().toLowerCase(), c.sortOrder ?? 0, st, now, now);
+        validIds.add(c.id);
+      }
+      // Memberships: de-dup (collection,agent), skip refs to collections not in the new set.
+      for (const [agent, cids] of Object.entries(state.members)) {
+        const seen = new Set<string>();
+        let order = 0;
+        for (const cid of cids) {
+          if (!validIds.has(cid) || seen.has(cid)) continue; // drop dangling/duplicate refs
+          seen.add(cid);
+          this.db.prepare('INSERT INTO collection_members (collection_id, logical_agent_id, sort_order, created_at) VALUES (?,?,?,?)').run(cid, agent, order++, now);
+        }
+      }
+      this.ledger('OPERATOR_COLLECTIONS_REPLACED', OPERATOR_LEDGER_ACTOR, {}, { collections: state.collections.length });
+      return { version: this.readCollectionsVersion() };
+    });
+  }
+
+  /** Coarse monotonic-ish version stamp for the collections state (single local writer). */
+  private readCollectionsVersion(): number {
+    const c = (this.db.prepare(`SELECT COUNT(*) AS n FROM collections WHERE workspace_id='local'`).get() as { n: number }).n;
+    const m = (this.db.prepare('SELECT COUNT(*) AS n FROM collection_members').get() as { n: number }).n;
+    return c + m + 1;
+  }
+
   /** Pin / unpin a session (keep it surfaced in the console). Orthogonal to state/lifecycle. */
   operatorSetPinned(sessionId: string, pinned: boolean): { sessionId: string; pinned: boolean } {
     return this.db.transaction(() => {
@@ -1569,6 +1647,11 @@ export class BrokerStore {
       // identity tables (which previously enabled secret-less resurrection + inbox adoption).
       this.db.prepare('DELETE FROM physical_session_map WHERE canonical_session_id=? OR physical_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId, sessionId);
       this.db.prepare('DELETE FROM name_ownership WHERE current_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId);
+      // BETA.10 WS3: clean the removed identity's Collections membership transactionally (in this
+      // same remove txn). Deleting an AGENT cleans its collection_members rows; the collections
+      // themselves are untouched (removing a member never deletes a collection). Keyed on the
+      // durable logical id (membership follows the identity, not a physical session id).
+      this.db.prepare('DELETE FROM collection_members WHERE logical_agent_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId);
       this.db.prepare('DELETE FROM sessions WHERE session_id=?').run(sessionId);
       this.ledger('OPERATOR_SESSION_RECORD_REMOVED', OPERATOR_LEDGER_ACTOR, { sessionId }, { transcriptPreserved: true });
       return { sessionId, removed: true };
