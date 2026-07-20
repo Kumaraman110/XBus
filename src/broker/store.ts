@@ -11,7 +11,7 @@
  * Sender identity is ALWAYS derived from the authenticated session passed by the
  * broker connection layer — never from caller-supplied fields.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { SqliteDriver } from '../database/connection.js';
 import type { Clock, IdGen } from '../shared/clock.js';
 import { XBusError, XBusErrorCode } from '../protocol/errors.js';
@@ -35,6 +35,23 @@ export type OperatorSendInput = SendInput & { threadId?: string; parentMessageId
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
+
+/** beta.9.1 credential hardening: bytes of CSPRNG entropy behind an identity-reclaim
+ *  credential (the owner secret). 32 bytes = 256 bits, hex-encoded to a 64-char opaque
+ *  string — the same string shape the prior sha256-hex derivation produced, so the client
+ *  representation and the persisted `hashSecret(secret)` verification contract are unchanged. */
+export const CREDENTIAL_SECRET_BYTES = 32;
+
+/** beta.9.1: the SINGLE production source of credential-grade entropy. A reclaim credential
+ *  MUST be unpredictable — the prior derivation (sha256 over the public brokerInstanceId + a
+ *  monotonic fencing counter + wall-clock ms) was reconstructable by anyone who observed the
+ *  public brokerInstanceId and bounded the counter + mint window, so it was NOT unguessable.
+ *  This draws from Node's cryptographic RNG (`crypto.randomBytes`), the same primitive the
+ *  receipt-capability path already uses. It is the DEFAULT for the store's `randomFn` seam;
+ *  tests may inject a deterministic seam but can NEVER change this production default. */
+export function cryptoCredentialSecret(): string {
+  return randomBytes(CREDENTIAL_SECRET_BYTES).toString('hex');
+}
 
 /**
  * Beta.5 Phase 1 (ADR 0013 D2): SessionStart `source` → the ledger event type recorded
@@ -154,7 +171,15 @@ export class BrokerStore {
     private readonly db: SqliteDriver,
     private readonly clock: Clock,
     private readonly ids: IdGen,
+    // beta.9.1: retained for positional call-site compatibility only. It USED to seed the
+    // owner-secret derivation; that derivation is gone (secrets now come from a CSPRNG), so this
+    // is no longer read. Kept as a positional param to avoid churning 30+ construction sites.
     private readonly brokerInstanceId: string,
+    // beta.9.1: injectable credential-entropy seam (mirrors ReceiptsStore's randomFn). The
+    // DEFAULT is the production CSPRNG; a test may pass a deterministic function to make a
+    // minted secret predictable, but omitting it ALWAYS yields cryptographic entropy — there is
+    // no production code path that reaches a non-CSPRNG default.
+    private readonly randomFn: () => string = cryptoCredentialSecret,
   ) {
     this.controls = new ControlsStore(db, clock);
   }
@@ -187,6 +212,53 @@ export class BrokerStore {
    */
   private ledger(eventType: string, actor: string, subject: LedgerSubject, payload: Record<string, unknown>): void {
     ledgerAppend(this.db, this.ids, this.clock, eventType, actor, subject, payload);
+  }
+
+  /**
+   * BLOCKER #3 (beta.9.1): on a fresh-lifecycle takeover (supersede), carry the REPLY AUTHORITY
+   * of every ACCEPTED (acked, reply-still-owed) delivery to the NEW epoch so the successor can
+   * complete the outstanding reply — WITHOUT re-queuing/re-injecting the body (at-most-once
+   * effective injection is preserved; the body was already presented + acked to the prior owner).
+   *
+   * receipts.authorize('reply') requires a context_injections row keyed (message_id,
+   * recipient_session_id, recipient_epoch). After the epoch bump the only injection is the
+   * prior epoch's, so the successor is fenced out (EPOCH_MISMATCH). We mint an AUTHORITY-ONLY
+   * injection row for the new epoch: a NEW (message_id, recipient_epoch, logical_injection_number=1)
+   * tuple (never reusing/mutating the epoch-N row → ux_injection_logical respected), with a fresh
+   * capability hash (ux_injection_cap). The delivery row is left 'accepted' (NOT re-queued), so no
+   * checkpoint pull ever re-presents the body, and exactly ONE reply() still completes it.
+   *
+   * TTL: aligned to the 15-day meaningful-activity retention (not the default 30-min injection TTL)
+   * so the re-homed authority does not expire before the reaper's explicit-terminal expiry sweep —
+   * otherwise the successor's reply would fail RECEIPT_EXPIRED while the obligation is still live.
+   * Only reply-pending ('requires_reply=1') accepted rows are carried (a no-reply accepted row owes
+   * nothing). Runs inside the register transaction. No-op when there are no such rows (e.g. an
+   * expired-resume, whose accepted rows were already given an explicit terminal by the sweep).
+   */
+  private rehomeAcceptedReplyAuthority(canonicalSessionId: string, newEpoch: number, componentInstanceId: string, now: string): void {
+    const pending = this.db
+      .prepare(
+        `SELECT d.message_id AS mid FROM deliveries d JOIN messages m ON m.message_id=d.message_id
+         WHERE d.recipient_session_id=? AND d.state='${DeliveryState.ACCEPTED}' AND m.requires_reply=1`,
+      )
+      .all(canonicalSessionId) as Array<{ mid: string }>;
+    if (pending.length === 0) return;
+    const expiresAt = new Date(this.clock.nowMs() + MEANINGFUL_ACTIVITY_RETENTION_MS).toISOString();
+    for (const { mid } of pending) {
+      // Idempotent: if an authority row already exists for this (message, new epoch) — e.g. a
+      // repeated register on the same fresh epoch — do not mint a duplicate.
+      const already = this.db
+        .prepare('SELECT 1 AS x FROM context_injections WHERE message_id=? AND recipient_epoch=? AND logical_injection_number=1')
+        .get(mid, newEpoch) as { x: number } | undefined;
+      if (already) continue;
+      const capHash = createHash('sha256').update(randomBytes(24).toString('base64url'), 'utf8').digest('hex');
+      this.db
+        .prepare(
+          'INSERT INTO context_injections (injection_id, message_id, recipient_session_id, recipient_epoch, checkpoint_id, injected_by_component_id, receipt_capability_hash, injected_at, expires_at, logical_injection_number) VALUES (?,?,?,?,?,?,?,?,?,1)',
+        )
+        .run(this.ids.next(), mid, canonicalSessionId, newEpoch, `reply-authority-rehome-${this.ids.next()}`, componentInstanceId, capHash, now, expiresAt);
+      this.audit('REPLY_AUTHORITY_REHOMED', { sessionId: canonicalSessionId, messageId: mid, epoch: newEpoch });
+    }
   }
 
   /**
@@ -278,13 +350,16 @@ export class BrokerStore {
     return createHash('sha256').update(`owner:${secret}`, 'utf8').digest('hex');
   }
 
-  /** Mint a fresh opaque ownership secret (returned to the client verbatim, once). */
+  /** Mint a fresh opaque ownership secret (returned to the client verbatim, once).
+   *  beta.9.1: drawn from a CSPRNG (`randomFn`, default `cryptoCredentialSecret`). The prior
+   *  derivation — sha256 over the PUBLIC brokerInstanceId + monotonic fencing counter +
+   *  wall-clock ms — was reconstructable and therefore guessable; it is replaced here. The
+   *  returned string is still a 64-char hex value, so the client representation and the
+   *  persisted `hashSecret(secret)` verification are unchanged (already-issued secrets keep
+   *  verifying). No fencing-counter bump: uniqueness now comes from 256 bits of entropy, not
+   *  the counter, so this mint no longer perturbs the shared fence used by epoch tokens. */
   private mintOwnerSecret(): string {
-    // Derive from the monotonic fencing counter so it is unguessable + unique without a RNG
-    // dependency in the store (tests use a deterministic clock; the value must still be opaque).
-    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
-    const v = (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
-    return createHash('sha256').update(`owner-secret:${this.brokerInstanceId}:${v}:${this.clock.nowMs()}`, 'utf8').digest('hex');
+    return this.randomFn();
   }
 
   /** The durable logical identity of a canonical session row (defaults to the id itself for a
@@ -420,7 +495,11 @@ export class BrokerStore {
       if (reclaim && physicalSessionId !== reclaim.canonicalSessionId) {
         this.db.prepare('INSERT OR REPLACE INTO physical_session_map (physical_session_id, canonical_session_id, logical_identity_id, created_at) VALUES (?,?,?,?)')
           .run(physicalSessionId, reclaim.canonicalSessionId, reclaim.logicalIdentityId, now);
-        this.audit('IDENTITY_RECLAIMED', { sessionId: reclaim.canonicalSessionId, physicalSessionId });
+        // Beta.10 Stage 0 (ADR-0027 D7): a cross-id reclaim is an identity-AUTHORITY transition and
+        // MUST be hash-chained (was best-effort audit() — the least tamper-evident path for the most
+        // security-sensitive event). actor = the canonical (durable) identity reclaimed onto; subject
+        // ids-only; payload no secret/body. In the register() txn → shares the mutation's fate.
+        this.ledger('identity.reclaimed', reclaim.canonicalSessionId, { sessionId: reclaim.canonicalSessionId }, { physicalSessionId });
       }
 
       const existing = this.db
@@ -479,6 +558,20 @@ export class BrokerStore {
         // For an expired resume there are none (the sweep dead-lettered the queue),
         // so this is a no-op there — old dead_letter rows are NOT touched.
         this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, target_instance_id=NULL, updated_at=? WHERE recipient_session_id=? AND state='${DeliveryState.TRANSPORT_WRITTEN}'`).run(now, input.sessionId);
+        // BLOCKER #3 (beta.9.1): re-home the REPLY AUTHORITY of any ACCEPTED (acked, reply-still-
+        // owed) delivery to the NEW epoch — WITHOUT re-queuing/re-injecting the body. An 'accepted'
+        // request's body was already presented AND acknowledged by the prior owner; re-showing it
+        // would duplicate model-visible work and break at-most-once effective injection. But the
+        // reply is still owed, and receipts.authorize() gates reply on a context_injections row for
+        // the CURRENT (message, session, epoch) — which the successor's new epoch lacks, stranding
+        // the obligation forever (invisible, unrepliable, never reaped). So we mint a fresh
+        // authority-only injection row for epoch N+1 (a NEW (message_id, recipient_epoch, logical#1)
+        // tuple — never reusing/mutating the epoch-N row, so ux_injection_logical is respected). The
+        // delivery stays 'accepted' (NOT re-queued), so the body is never re-presented and exactly
+        // ONE reply still completes it. inboxView surfaces it (bodyIncluded:false) so the successor
+        // can DISCOVER + complete it. For an expired resume there are no 'accepted' rows (the sweep
+        // gave them an explicit terminal), so this is a no-op there too.
+        this.rehomeAcceptedReplyAuthority(input.sessionId, epoch, componentInstanceId, now);
         if (isExpiredResume) {
           // The expiry sweep retired ALL of this session's alias rows (active=0),
           // including the broker-minted automatic_alias (session-<8hex>) — the
@@ -487,7 +580,9 @@ export class BrokerStore {
           // automatic_alias'); reactivate it (re-upsert if the row was pruned). The
           // session's prior USER name stays released (re-claimed below if requested).
           this.upsertAutomaticAliasSafe(automaticAlias(input.sessionId), input.sessionId, now);
-          this.audit('EXPIRED_SESSION_RESUMED', { sessionId: input.sessionId, epoch });
+          // Beta.10 Stage 0 (ADR-0027 D7): expired-resume is a committed identity-lifecycle transition
+          // → hash-chained (was audit()). actor = the resumed session's own id; in the register() txn.
+          this.ledger('session.expired_resumed', input.sessionId, { sessionId: input.sessionId }, { epoch });
         }
       } else {
         // Split-brain guard (ADR 0008): at most ONE live writable (mcp) component
@@ -888,7 +983,10 @@ export class BrokerStore {
       // authority — in the same transaction; mint a stable owner secret on first protected award
       // (reused, not rotated, on subsequent renames so the client cannot be self-locked-out).
       const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
-      this.audit(wasExpired ? 'EXPIRED_SESSION_RESUMED_VIA_RENAME' : 'SESSION_RENAMED', { sessionId: auth.sessionId, name: norm.display });
+      // Beta.10 Stage 0 (ADR-0027 D7): a rename is a committed name-authority transition → hash-chained
+      // (was audit()). actor = the renaming session; payload carries the display name only (NEVER the
+      // ownerSecret — D7 invariant: the plaintext secret must not appear in ledger_events/audit_events).
+      this.ledger(wasExpired ? 'session.expired_resumed_via_rename' : 'session.rename', auth.sessionId, { sessionId: auth.sessionId }, { name: norm.display });
       return { state: 'active', name: norm.display, ownerSecret };
     });
   }

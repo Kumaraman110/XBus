@@ -549,15 +549,18 @@ async function cmdStop(): Promise<CliResult> {
     }
     return { human: `Broker refused shutdown: ${JSON.stringify(ack.payload)}`, json: { ok: false, payload: ack.payload }, exitCode: 1 };
   } catch (e) {
-    // IPC failed (broker hung/unreachable). Forced kill is eligible ONLY because
-    // classifyShutdown already verified owner + alive + (no) instance mismatch.
+    // IPC failed (broker hung/unreachable). Forced kill is eligible ONLY because we reached
+    // this branch via decision.action==='ipc', which (beta.10 Stage 0) now requires a POSITIVE
+    // liveness PROOF that this pid is our broker — not merely pidIsAlive (which a recycled PID
+    // would also pass). An inconclusive/recycled pid classifies 'refuse'/'none' and never reaches
+    // here, so SIGTERM cannot hit an unrelated recycled process (ADR-0007).
     const pid = decision.pid;
     if (pid && pidIsAlive(pid)) {
       try {
         process.kill(pid, 'SIGTERM');
-        return { human: `Broker IPC unreachable (${(e as Error).message}); sent SIGTERM to verified broker pid ${pid}.`, json: { ok: true, stopped: true, method: 'forced', pid }, exitCode: 0 };
+        return { human: `Broker IPC unreachable (${(e as Error).message}); sent SIGTERM to liveness-proven broker pid ${pid}.`, json: { ok: true, stopped: true, method: 'forced', pid }, exitCode: 0 };
       } catch (ke) {
-        return { human: `Could not signal verified broker pid ${pid}: ${(ke as Error).message}`, json: { ok: false, pid }, exitCode: 1 };
+        return { human: `Could not signal broker pid ${pid}: ${(ke as Error).message}`, json: { ok: false, pid }, exitCode: 1 };
       }
     }
     return { human: `Broker not reachable and pid not alive; run: ${invocationHint('doctor')}`, json: { ok: false }, exitCode: 1 };

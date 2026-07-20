@@ -6,6 +6,33 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.9.1] — durable-identity correctness hotfix
+
+A prerelease patch over beta.9 fixing four durable-identity correctness/robustness defects. **No
+schema migration, no wire or protocol change, no existing-secret invalidation, and no beta.10 role,
+dashboard, or conversation capability.** Compatibility is unchanged (schema 10 /
+`xbus-p1-stp1-s10` / protocol 1 / XBUS-STP 1); **beta.9 remains the upgrade source**.
+
+- **Owner-reclaim credentials use 256-bit CSPRNG entropy.** The owner secret (the durable-identity
+  reclaim credential) is now minted from `crypto.randomBytes`, replacing a deterministic derivation
+  over a public broker id + counter + wall-clock that was reconstructable. Already-issued beta.9
+  secrets remain valid — the stored `sha256('owner:'+secret)` verification is unchanged.
+- **Broker ownership/liveness no longer accepts a recycled PID without matching ownership proof.** A
+  three-verdict liveness proof (OS process-creation-time / STP handshake) refuses to signal a
+  process it cannot prove is our broker (never SIGTERM an innocent recycled-PID process) and never
+  spawns a duplicate over an unprovable one.
+- **Accepted reply-pending work survives logical-identity reclaim without re-injecting the original
+  body.** A successor inherits reply-only authority for an already-accepted request (the body is
+  never re-presented; at-most-once effective injection is preserved), the superseded epoch stays
+  fenced, exactly one correlated reply completes, and unanswered accepted work that expires reaches
+  an explicit terminal category (`reply_pending_unanswered_15_days`) rather than being silently
+  dropped or left immortal.
+- **Identity-authority transitions use the hash-chained ledger inside the enclosing transaction.**
+  Cross-id reclaim, expired-resume, and rename now write the hash-chained ledger in the same
+  transaction as the state mutation, so a ledger failure aborts the mutation with no partial
+  ownership state (was best-effort audit — the most security-sensitive events were the least
+  tamper-evident).
+
 ## [0.1.0-beta.9] — frictionless operations (carries the beta.8 durable-identity foundation)
 
 Make install, verification, release, and governance usable without manual environment repair

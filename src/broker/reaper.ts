@@ -165,6 +165,18 @@ export class Reaper {
       this.db.prepare(
         `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_inactive_15_days', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}')`,
       ).run(now, s.session_id);
+      // BLOCKER #3 (beta.9.1): an ACCEPTED (acked, reply-still-owed) delivery is EXCLUDED from the
+      // dead-letter above by design — dead-lettering it into the generic 'recipient_inactive_15_days'
+      // bucket would DISGUISE an unanswered reply obligation as a never-acked delivery, and leaving
+      // it 'accepted' leaves it immortal (no other pass terminates it). Instead give it an EXPLICIT,
+      // observable terminal that PRESERVES the "reply was owed and not delivered" signal: accepted ->
+      // expired (a legal edge) with a DISTINCT failure_category, keeping application_accepted_at so an
+      // observer can see the request WAS accepted but its reply never arrived. This lets the sender/
+      // operator distinguish never-delivered / delivered-but-unacked / acked-reply-outstanding /
+      // acked-but-abandoned-on-expiry — rather than silently reaping the defect away.
+      this.db.prepare(
+        `UPDATE deliveries SET state='${DeliveryState.EXPIRED}', failure_category='reply_pending_unanswered_15_days', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state='${DeliveryState.ACCEPTED}' AND (SELECT m.requires_reply FROM messages m WHERE m.message_id=deliveries.message_id)=1`,
+      ).run(now, s.session_id);
       // Release any held leases for this recipient's now-dead-lettered deliveries.
       this.db.prepare(`UPDATE delivery_leases SET state='expired', released_at=? WHERE state='held' AND message_id IN (SELECT message_id FROM deliveries WHERE recipient_session_id=? AND state='${DeliveryState.DEAD_LETTER}' AND failure_category='recipient_inactive_15_days')`).run(now, s.session_id);
       this.audit('SESSION_EXPIRED', null, { sessionId: s.session_id, reason: 'recipient_inactive_15_days' });

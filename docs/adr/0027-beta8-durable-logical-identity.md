@@ -69,26 +69,35 @@ is a single pointer update, liveness-gated so a **live incumbent is never evicte
 | connection instance | `component_instances` | unchanged |
 | routable name + aliases | columns on `sessions(session_id)` | owned by `logical_identity_id` via `name_ownership` |
 
-### D1 — `logical_identity_id` everywhere the inbox is keyed (v10)
+### D1 — `logical_identity_id` (v10) — as-shipped scope
 
-`ALTER TABLE sessions ADD COLUMN logical_identity_id TEXT;` plus the SAME column added to the
-inbox-bearing tables so routing resolves on the durable identity:
+> **Correction (beta.9.1 honesty pass).** The bullet list below was a DRAFT proposal for
+> native-keying the inbox tables with a `recipient_logical_id`/`receiver_logical_id` column on
+> five tables. **Only `sessions.logical_identity_id` shipped** (plus the `name_ownership` /
+> `physical_session_map` tables — see the implementation box above and migration v10 in
+> `src/database/migrations.ts`). The per-table `recipient_logical_id` / `receiver_logical_id`
+> columns, the `recipient_sequences` re-key, and the `ux_recipseq` re-key **were NOT implemented**
+> (`git grep recipient_logical_id -- src` = 0 hits; `ux_recipseq` remains keyed on
+> `recipient_session_id`). Continuity is achieved by CANONICAL-SESSION REDIRECTION
+> (`physical_session_map`), not native keying — see D4. The draft text is retained struck-through
+> for provenance:
 
-- `deliveries.recipient_logical_id`
-- `messages.recipient_logical_id` (and the per-recipient sequence space keys on it)
-- `recipient_sequences` re-keyed to `recipient_logical_id` (PK)
-- `receipts.receiver_logical_id`
-- `context_injections.recipient_logical_id`
+`ALTER TABLE sessions ADD COLUMN logical_identity_id TEXT;` shipped. The following per-table
+columns were proposed but **NOT implemented** (superseded by canonical-session redirection):
 
-**Backfill (same migration transaction, additive, lossless):** set every existing row's
-`logical_identity_id` / `recipient_logical_id` / `receiver_logical_id` = the row's current
-`session_id` (each existing physical session becomes its own logical identity — no historical
-grouping exists). The unique index `ux_recipseq` becomes `(recipient_logical_id,
-recipient_sequence)`; because the backfill maps 1:1 session→identity, no existing row collides.
+- ~~`deliveries.recipient_logical_id`~~ (not shipped)
+- ~~`messages.recipient_logical_id`~~ (not shipped)
+- ~~`recipient_sequences` re-keyed to `recipient_logical_id`~~ (not shipped; still keyed on `recipient_session_id`)
+- ~~`receipts.receiver_logical_id`~~ (not shipped)
+- ~~`context_injections.recipient_logical_id`~~ (not shipped; dedup keys on `recipient_epoch`)
 
-New registrations mint a fresh `logical_identity_id` (UUIDv7) unless a reclaim proof matches an
-existing identity. `ack()`/`reply()`/`checkpointPull`/injection-dedup/idempotency all authorize
-and de-dupe on `recipient_logical_id` (the durable identity), never `session_id`.
+**Backfill (as-shipped):** the v10 migration sets every existing session's
+`sessions.logical_identity_id = session_id` (each existing physical session becomes its own
+logical identity — no historical grouping exists) and backfills `name_ownership`. New
+registrations mint a fresh `logical_identity_id` (UUIDv7) unless a reclaim proof matches an
+existing identity. `ack()`/`reply()`/`checkpointPull`/injection-dedup/idempotency authorize and
+de-dupe on `recipient_session_id` + `recipient_epoch` (the successor resolves to the canonical
+`session_id` via `physical_session_map`), NOT on a per-table `recipient_logical_id`.
 
 ### D2 — `name_ownership` table (v10), the SINGLE name authority
 
@@ -158,18 +167,55 @@ The owner secret is **stable across reclaims** (Major — no per-reclaim rotatio
 rotated only on explicit operator/rename request, so a crash between broker-commit and the
 client's file-write can never self-lock the identity out.
 
-### D4 — inbox continuity & exactly-once (native keying)
+### D4 — inbox continuity & exactly-once (as-shipped: canonical-session redirection)
 
-Because the inbox is keyed on `logical_identity_id`, a successor under a new `session_id`:
-- pulls the identity's queued deliveries directly (no re-point);
-- acks/replies via `recipient_logical_id` authorization (delivery.ts paths switch from
-  `messages.recipient_session_id` to `recipient_logical_id`);
-- injection dedup keys `(message_id, recipient_logical_id, logical#)` so the body is presented
-  exactly once regardless of the epoch-0 collision that broke the re-point;
-- `accepted` (reply-pending) deliveries need no move — they're already the identity's.
+**Correction (beta.9.1 honesty pass).** An earlier draft of this section described a
+`recipient_logical_id` NATIVE-KEYING design — the inbox keyed on `logical_identity_id`, and
+delivery.ts ack/reply authorization switching from `messages.recipient_session_id` to
+`recipient_logical_id`, with injection dedup keyed `(message_id, recipient_logical_id, logical#)`.
+**That design was never implemented.** `git grep recipient_logical_id -- src` returns zero hits;
+the shipped ack/reply path authorizes on `recipient_session_id` (delivery.ts), and injection dedup
+is keyed `(message_id, recipient_epoch, logical_injection_number)` (`ux_injection_logical`). The
+earlier text also claimed a "reclaim-after-partial-ack completes the reply" test existed; **it did
+not** — the reclaim tests exercised only reclaim→ack→reply (queued-inbox inheritance), never
+ack→reclaim→reply. This section is corrected to describe what actually shipped.
 
-Tests assert: reclaim-after-partial-ack completes the reply; redelivery after reclaim de-dupes;
-predecessor+successor both at epoch 0 present the moved body exactly once.
+**As-shipped design — canonical-session redirection (see the implementation box above).** The
+inbox is keyed on the CANONICAL `session_id`. A successor under a new physical `session_id` is
+REDIRECTED onto the canonical id via `physical_session_map`, so it:
+- pulls the identity's queued deliveries directly (they already sit on the canonical id — no row
+  movement, no re-point);
+- acks/replies under the canonical `session_id` its connection resolves to;
+- injection dedup keys `(message_id, recipient_epoch, logical#)` — at-most-once per epoch.
+
+**Reply-pending continuity across an epoch bump (BLOCKER #3, beta.9.1).** A reclaim/supersede
+advances the epoch (N→N+1). A delivery in `queued`/`transport_written` is re-homed to the new
+epoch normally. An `accepted` (acked, reply-still-owed) delivery is the subtle case: its body was
+already presented AND acknowledged, so it MUST NOT be re-injected (that would duplicate
+model-visible work and break at-most-once). But its reply is still owed, and `receipts.authorize`
+gates reply on a `context_injections` row for the CURRENT (message, session, epoch) — which the
+successor's new epoch lacks. Left unhandled the obligation was a permanent orphan (invisible,
+unrepliable, never reaped). The fix (`store.rehomeAcceptedReplyAuthority`) re-homes only the REPLY
+AUTHORITY: it mints a fresh authority-only `context_injections` row for epoch N+1 (a NEW
+(message, epoch, logical#1) tuple — never reusing the epoch-N row, so `ux_injection_logical` holds),
+WITHOUT re-queuing the delivery. The delivery stays `accepted`; `inboxView` surfaces the
+cross-epoch accepted-reply-pending row (`bodyIncluded:false`, action `reply`) so the successor can
+DISCOVER and complete it; exactly one reply completes the original; the superseded epoch stays
+fenced (`assertCurrentEpoch` + epoch-scoped injection).
+
+**Expiry (BLOCKER #3, beta.9.1).** An `accepted` reply-pending delivery on a session that simply
+idles past the 15-day horizon (no reclaim) was also orphaned — the expiry sweep dead-lettered
+`queued`/`retry_wait`/`transport_written` but EXCLUDED `accepted`, leaving it immortal. The reaper
+now transitions such rows to `expired` with a DISTINCT `failure_category='reply_pending_unanswered_15_days'`
+(preserving `application_accepted_at`), NOT the generic `recipient_inactive_15_days` bucket — so an
+observer can distinguish never-delivered / delivered-but-unacked / acked-but-reply-outstanding /
+acked-but-abandoned-on-expiry, rather than the defect being silently reaped away.
+
+Tests (`tests/integration/reply-pending-orphan.test.ts`, RED-first at the beta.9 tag): a successor
+completes the outstanding reply WITHOUT body re-injection; the old epoch is fenced; exactly one
+reply completes; the obligation survives a broker restart; on pure expiry the accepted row reaches
+the explicit observable terminal above. Redelivery-after-reclaim de-dup and queued-inbox
+inheritance remain covered by the existing reclaim tests.
 
 ### D5 — event-driven reclaim window; stable secret
 
@@ -294,8 +340,12 @@ work:
   from accidentally reclaiming and gives the legit successor continuity; it is NOT a defense
   against a hostile same-user peer (that peer reads the file) — cross-user is the ACL's job.
   Test: wrong/absent secret ⇒ no reclaim, predecessor keeps the name.
-- **R2 exactly-once across identity change:** native `logical_identity_id` keying (D1/D4).
-  Test: reclaim after partial ack; redelivery de-dupes; epoch-0 body presented once.
+- **R2 exactly-once across identity change:** canonical-session redirection + epoch fencing (D4,
+  as-shipped — NOT the never-implemented native `recipient_logical_id` keying). Tests: reclaim
+  inherits the queued inbox (`session-identity-reclaim-fix`); redelivery-after-reclaim de-dupes
+  (`inbox-dedup`); a reply-pending `accepted` delivery survives an epoch bump AND pure expiry with
+  no body re-injection, old epoch fenced, exactly one reply, explicit observable expiry terminal
+  (`reply-pending-orphan`, beta.9.1 BLOCKER #3, RED-first at the beta.9 tag).
 - **R3 dual-live-owner:** reclaim force-closes residual predecessor components — but only once
   the incumbent is confirmed gone (D3 liveness gate); a live incumbent is refused, not evicted.
   Test: reclaim of a disconnected predecessor succeeds; reclaim against a live incumbent is
