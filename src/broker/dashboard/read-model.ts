@@ -79,6 +79,12 @@ export interface DashboardSession {
   claudeTitle: string | null; // Claude-native display title (ADR 0024) — NEVER a routable alias
   managed: boolean;
   managedPid: number | null;
+  /** Beta.10 (Train B) inspector: the DURABLE logical identity this physical session belongs to
+   *  (ADR 0027). For a session that has never been reclaimed this equals its own session_id. */
+  logicalIdentityId: string | null;
+  /** Count of physical Claude-session ids that have been REDIRECTED onto this canonical session
+   *  (superseded twins in physical_session_map), PLUS the canonical itself. 1 = never reclaimed. */
+  physicalInstances: number;
   /** Delivery-state breakdown for messages addressed TO this session (blocker #6). */
   delivery: { queued: number; delivered: number; acknowledged: number; replied: number; failed: number };
   /** legacy fields kept for existing consumers/tests. */
@@ -210,7 +216,7 @@ export class DashboardReadModel {
               -- Beta.10 (Train B): operator-lifecycle + control projection (ADDITIVE; columns exist).
               s.pinned AS pinned, s.archived AS archived, s.archived_at AS archivedAt,
               s.claude_title AS claudeTitle, s.managed_by_xbus AS managed, s.managed_pid AS managedPid,
-              c.receiving AS receiving
+              s.logical_identity_id AS logicalIdentityId, c.receiving AS receiving
          FROM sessions s
          -- LEFT JOIN so a session with no explicit control row reads as 'active' (the ControlsStore default).
          LEFT JOIN session_controls c ON c.session_id = s.session_id
@@ -230,6 +236,12 @@ export class DashboardReadModel {
     const deliveryByState = new Map<string, Record<string, number>>();
     for (const d of this.db.prepare(`SELECT recipient_session_id AS sid, state, COUNT(*) AS n FROM deliveries GROUP BY recipient_session_id, state`).all() as Array<{ sid: string; state: string; n: number }>) {
       const m = deliveryByState.get(d.sid) ?? {}; m[d.state] = d.n; deliveryByState.set(d.sid, m);
+    }
+    // Physical-instance count per canonical session (redirected twins), ONE GROUP BY (no N+1).
+    // A canonical with no reclaims has no row here → its count is just itself (1, added below).
+    const redirectCount = new Map<string, number>();
+    for (const p of this.db.prepare(`SELECT canonical_session_id AS sid, COUNT(*) AS n FROM physical_session_map GROUP BY canonical_session_id`).all() as Array<{ sid: string; n: number }>) {
+      redirectCount.set(p.sid, p.n);
     }
     // Last SENT per sender: the newest message row per sender_session_id, joined to its delivery
     // state. `NOT EXISTS a newer row for the same sender` picks exactly the latest (index-assisted).
@@ -290,6 +302,8 @@ export class DashboardReadModel {
         claudeTitle: (r.claudeTitle as string | null) ?? null,
         managed: (r.managed as number) === 1,
         managedPid: (r.managedPid as number | null) ?? null,
+        logicalIdentityId: (r.logicalIdentityId as string | null) ?? null,
+        physicalInstances: 1 + (redirectCount.get(sid) ?? 0),
         delivery,
         queued: delivery.queued,
         unacknowledged: delivery.delivered,
