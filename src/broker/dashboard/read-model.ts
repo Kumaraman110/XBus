@@ -13,6 +13,8 @@
 import type { SqliteDriver } from '../../database/connection.js';
 import { verifyLedger } from '../ledger.js';
 import { OPERATOR_SESSION_ID } from '../operator.js';
+import { BUILD_ID, SCHEMA_VERSION } from '../../protocol/handshake.js';
+import { XBUS_VERSION } from '../../protocol/version.js';
 
 /** The dashboard-visible label for a session, derived top-down, first-match-wins from the
  *  FOUR real fields (ADR 0020 Q2 decision table). */
@@ -445,6 +447,33 @@ export class DashboardReadModel {
       lastVerifiedAt = row?.at ?? null;
     } catch { lastVerifiedAt = null; } // table absent (older DB / pre-first-verify) → null
     return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null, lastVerifiedAt };
+  }
+
+  /**
+   * BETA.10 WS3 (#5) — broker/build/runtime/ledger health projection for the dashboard health panel.
+   * Shape matches the dashboard's locked consumption contract: { build, runtime, ledger, readWorker,
+   * capabilities }. The `ledger` block REUSES auditStatus() (no duplicate verifyLedger pass). `build`
+   * comes from the version constants; `runtime` from process (uptime/pid/node). `capabilities` is an
+   * explicit allowlist so the dashboard's probe lights the s10-neutral features (#1 redeliver, #2
+   * instances) deterministically rather than inferring. Read-only, off the broker loop.
+   */
+  health(): {
+    build: { version: string; buildId: string; schemaVersion: number };
+    runtime: { uptimeMs: number; pid: number; nodeVersion: string };
+    ledger: { ok: boolean; checked: number; firstBreakSeq: number | null; lastVerifiedAt: string | null };
+    readWorker: { inFlight: number; overloaded: boolean };
+    capabilities: string[];
+  } {
+    return {
+      build: { version: XBUS_VERSION, buildId: BUILD_ID, schemaVersion: SCHEMA_VERSION },
+      runtime: { uptimeMs: Math.round(process.uptime() * 1000), pid: process.pid, nodeVersion: process.version },
+      ledger: this.auditStatus(),
+      // The read worker's own depth isn't tracked in this projection layer (the worker wraps this
+      // call); report a stable not-overloaded baseline. A future worker-instrumented value can
+      // replace this without a shape change.
+      readWorker: { inFlight: 0, overloaded: false },
+      capabilities: ['redeliver', 'instances'],
+    };
   }
 }
 

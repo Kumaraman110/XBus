@@ -346,6 +346,8 @@ export class DashboardServer {
       if (p === '/api/sessions') return this.json(res, 200, { sessions: await this.reader.run('sessions') });
       if (p === '/api/unmanaged') return this.json(res, 200, await this.reader.run('unmanagedBanner'));
       if (p === '/api/audit') return this.json(res, 200, await this.reader.run('auditStatus'));
+      // BETA.10 WS3 (#5): broker/build/runtime/ledger health projection (read-only, off-loop).
+      if (p === '/api/health') return this.json(res, 200, await this.reader.run('health'));
       if (p === '/api/ledger') {
         const beforeSeq = u.searchParams.has('beforeSeq') ? Number(u.searchParams.get('beforeSeq')) : undefined;
         const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : undefined;

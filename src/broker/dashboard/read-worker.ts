@@ -31,7 +31,7 @@ export function workerEntryPath(): string {
 }
 
 /** A read request the server sends to the worker. `method` names a DashboardReadModel op. */
-export interface ReadRequest { id: number; method: 'sessions' | 'session' | 'ledger' | 'unmanagedBanner' | 'auditStatus' | 'threads' | 'thread'; args?: unknown; }
+export interface ReadRequest { id: number; method: 'sessions' | 'session' | 'ledger' | 'unmanagedBanner' | 'auditStatus' | 'threads' | 'thread' | 'health'; args?: unknown; }
 export interface ReadResponse { id: number; ok: boolean; result?: unknown; error?: string; }
 
 /** The seam the HTTP server depends on — a bounded, cancelable read call. */
@@ -50,6 +50,7 @@ export function dispatchRead(model: DashboardReadModel, method: ReadRequest['met
     case 'auditStatus': return model.auditStatus();
     case 'threads': return model.threads((args as { limit?: number }) ?? {});
     case 'thread': return model.thread(String((args as { threadId?: string })?.threadId ?? ''), (args as { limit?: number }) ?? {});
+    case 'health': return model.health();
     default: throw new Error(`unknown read method ${String(method)}`);
   }
 }
