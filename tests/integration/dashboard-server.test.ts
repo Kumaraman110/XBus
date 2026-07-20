@@ -17,6 +17,10 @@ import { FakeClock, SeqIdGen } from '../../src/shared/clock.js';
 import { DashboardServer } from '../../src/broker/dashboard/server.js';
 import { DashboardAuth } from '../../src/broker/dashboard/auth.js';
 import { InProcessReadExecutor, WorkerReadExecutor, type ReadExecutor } from '../../src/broker/dashboard/read-worker.js';
+// DASH-1 client contract (agents.js): the post-mutation status decision the browser applies.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — plain JS static asset, intentionally untyped
+import { postMutationStatus } from '../../src/broker/dashboard/static/agents.js';
 
 let dir: string; let dbPath: string; let writer: SqliteDriver; let clock: FakeClock;
 let auth: DashboardAuth; let reader: ReadExecutor; let server: DashboardServer; let base: string;
@@ -152,6 +156,38 @@ describe('dashboard read isolation — off-loop failure does not surface as a cr
       expect(res.status).toBe(503);
       const body = await res.json() as { error: string };
       expect(body.error).toBe('read_unavailable'); // no raw stack / 500 leak
+    } finally { await s.stop(); }
+  });
+
+  it('DASH-1: a control COMMITS but the post-mutation /api/sessions read 503s → UI must NOT show unqualified success over stale state', async () => {
+    // The reader always rejects (post-mutation refresh will 503), but the control WRITE path
+    // succeeds via onOperatorControl (the mutation truly commits on the broker).
+    const badReader: ReadExecutor = { run: () => Promise.reject(new Error('worker crashed')), close: () => Promise.resolve() };
+    let committed = false;
+    const onOperatorControl = (payload: unknown): unknown => { committed = true; return { sessionId: (payload as { sessionId: string }).sessionId, pinned: true }; };
+    const s = new DashboardServer({ auth, reader: badReader, onOperatorControl });
+    await s.start();
+    try {
+      const token = await getTokenFor(s, auth);
+      // 1) The control POST commits and returns the authoritative result (200).
+      const ctl = await fetch(`${s.url}/api/session/cccc0001-0000-4000-8000-000000000001/control`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'pin' }),
+      });
+      expect(ctl.status).toBe(200);
+      expect(committed).toBe(true);
+      const ctlBody = await ctl.json() as { pinned: boolean };
+      expect(ctlBody.pinned).toBe(true);
+      // 2) The post-mutation authoritative-state read genuinely 503s (the DASH-1 trigger).
+      const read = await fetch(`${s.url}/api/sessions`, { headers: { Authorization: `Bearer ${token}` } });
+      expect(read.status).toBe(503);
+      // 3) CLIENT CONTRACT: given (commit ok) + (refresh 503), the inspector status must DOWNGRADE
+      //    — never an unqualified green "Pinned." over stale pre-mutation state.
+      const st = postMutationStatus('pin', ctlBody, { ok: false, status: read.status });
+      expect(st.cls).not.toBe('ok');                    // not a green success
+      expect(st.message).toMatch(/committed on the broker/i);
+      expect(st.message).toContain('503');
+      expect(st.retry).toBe(true);
     } finally { await s.stop(); }
   });
 

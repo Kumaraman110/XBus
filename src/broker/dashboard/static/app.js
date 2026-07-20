@@ -159,48 +159,103 @@ function isInternal(s) {
   return s.sessionId.startsWith('cli-') || s.sessionId === 'local-operator' || String(s.project).startsWith('proj-cli');
 }
 
+/**
+ * G7 (Reliability scale finding): a per-row content SIGNATURE covering every field the row
+ * renders. Two payloads with the same sig produce an identical row, so we can SKIP rebuilding
+ * that row's DOM on a live-stream frame. Keeps the roster cheap toward ~120 sessions (the old
+ * code rebuilt the entire table every stream frame). Pure + exported for unit testing.
+ */
+function sessionRowSig(s) {
+  const d = s.delivery || {};
+  return [
+    s.sessionId, s.name, s.label, s.project, s.lastSeenSourceAt,
+    d.queued || 0, d.delivered || 0, d.acknowledged || 0, d.replied || 0, d.failed || 0,
+    isInternal(s) ? 1 : 0,
+  ].join(''); // unit-separator: cannot appear in these values
+}
+
+/** Build ONE roster row (<tr>) for a session. Extracted so the incremental renderer can rebuild
+ *  only the rows whose signature changed. */
+function buildSessionRow(s) {
+  const r = document.createElement('tr');
+  if (isInternal(s)) r.className = 'row-internal';
+  const nameStr = s.name || s.sessionId.slice(0, 8);
+  const label = document.createElement('td');
+  const svc = el('div', 'svc');
+  const ico = el('span', 'svc-ico badge-' + s.label, monogram(nameStr)); // state class tints the avatar edge
+  const main = el('div', 'svc-main');
+  main.appendChild(el('span', 'svc-name', nameStr));
+  if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
+  svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
+  const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
+  // Last-activity column from lastSeenSourceAt (compact relative time; exact ISO in title).
+  const la = document.createElement('td'); la.className = 'last-activity';
+  const laSpan = el('span', 'muted', relativeTime(s.lastSeenSourceAt));
+  if (s.lastSeenSourceAt) laSpan.title = s.lastSeenSourceAt;
+  la.appendChild(laSpan); r.appendChild(la);
+  const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
+  deliveryCell(r, d.queued, 'queued');
+  deliveryCell(r, d.delivered, 'delivered');
+  deliveryCell(r, d.acknowledged, 'ack');
+  deliveryCell(r, d.replied, 'replied');
+  deliveryCell(r, d.failed, 'failed');
+  detailsCell(r, s);
+  return r;
+}
+
+/** Keyed reconcile: make `body`'s children exactly `desired` (an ordered array of <tr>) with
+ *  MINIMAL DOM ops — remove absent rows, then insert/move only where the order actually differs.
+ *  Reused (unchanged-sig) rows are the SAME node, so they are neither rebuilt nor moved when in
+ *  place. This is the G7 win: a stream frame with unchanged data touches (near) zero DOM. */
+function reconcileRows(body, desired) {
+  const want = new Set(desired);
+  for (const child of Array.from(body.children)) if (!want.has(child)) body.removeChild(child);
+  for (let i = 0; i < desired.length; i++) {
+    const node = desired[i];
+    const current = body.children[i];
+    if (current !== node) body.insertBefore(node, current || null);
+  }
+}
+
+// Row cache: sessionId → { tr, sig }. Survives across renders so unchanged rows are reused.
+const rosterRowCache = new Map();
+// Diagnostics so the browser/Reliability can VERIFY the G7 improvement: a frame with unchanged
+// data must do 0 row rebuilds. window.__rosterStats.rebuilds increments per row DOM (re)build.
+window.__rosterStats = { rebuilds: 0, renders: 0 };
+
 function renderSessions(sessions) {
   window.__sessions = sessions; // cache for re-render on filter toggle + the console selector
+  window.__rosterStats.renders += 1;
   const body = document.getElementById('sessions-body');
-  body.replaceChildren();
   const showInternal = document.getElementById('show-internal') && document.getElementById('show-internal').checked;
   // Beta.10 (Train B): the agent-management module supplies the roster search/status/Collection
   // filters (all client-side over already-authorized data). Absent (module not loaded) → identity.
   const rosterFilter = (window.XBusAgents && window.XBusAgents.rosterFilter) || ((list) => list);
-  const afterFilters = rosterFilter((sessions || []).filter((s) => showInternal || !isInternal(s)));
-  const shown = afterFilters;
+  const shown = rosterFilter((sessions || []).filter((s) => showInternal || !isInternal(s)));
   const hiddenCount = (sessions || []).length - shown.length;
   if (!shown.length) {
+    rosterRowCache.clear();
+    body.replaceChildren();
     const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
     c.colSpan = 9; c.className = 'state-cell';
-  } else for (const s of shown) {
-    const r = document.createElement('tr');
-    if (isInternal(s)) r.className = 'row-internal';
-    // Session cell: a monogram avatar + the name + a muted project/description subtitle
-    // (matches the locked mock — a plain two-line identity cell, not a bordered badge).
-    const nameStr = s.name || s.sessionId.slice(0, 8);
-    const label = document.createElement('td');
-    const svc = el('div', 'svc');
-    const ico = el('span', 'svc-ico badge-' + s.label, monogram(nameStr)); // state class tints the avatar edge
-    const main = el('div', 'svc-main');
-    main.appendChild(el('span', 'svc-name', nameStr));
-    if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
-    svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
-    const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
-    // Beta.10 (Train B): last-activity column from lastSeenSourceAt (already projected). Shows a
-    // compact relative time with the exact ISO in a title for precision.
-    const la = document.createElement('td'); la.className = 'last-activity';
-    const laSpan = el('span', 'muted', relativeTime(s.lastSeenSourceAt));
-    if (s.lastSeenSourceAt) laSpan.title = s.lastSeenSourceAt;
-    la.appendChild(laSpan); r.appendChild(la);
-    const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
-    deliveryCell(r, d.queued, 'queued');
-    deliveryCell(r, d.delivered, 'delivered');
-    deliveryCell(r, d.acknowledged, 'ack');
-    deliveryCell(r, d.replied, 'replied');
-    deliveryCell(r, d.failed, 'failed');
-    detailsCell(r, s);
-    body.appendChild(r);
+  } else {
+    // Incremental/keyed re-render (G7): reuse rows whose signature is unchanged; rebuild only the
+    // changed ones; reconcile order with minimal DOM ops. No whole-table rebuild per frame.
+    const desired = [];
+    const seen = new Set();
+    for (const s of shown) {
+      seen.add(s.sessionId);
+      const sig = sessionRowSig(s);
+      let entry = rosterRowCache.get(s.sessionId);
+      if (!entry || entry.sig !== sig) {
+        entry = { tr: buildSessionRow(s), sig };
+        rosterRowCache.set(s.sessionId, entry);
+        window.__rosterStats.rebuilds += 1;
+      }
+      desired.push(entry.tr);
+    }
+    for (const key of Array.from(rosterRowCache.keys())) if (!seen.has(key)) rosterRowCache.delete(key);
+    reconcileRows(body, desired);
   }
   // A muted footer note when internal sessions are hidden, so the filter is discoverable.
   const note = document.getElementById('sessions-hidden-note');

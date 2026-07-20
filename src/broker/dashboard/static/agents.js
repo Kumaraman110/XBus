@@ -103,6 +103,28 @@ export function describeControlResult(action, body) {
   }
 }
 
+/**
+ * DASH-1 (Adversarial MINOR, G3): compute the inspector status AFTER a mutation, given the
+ * authoritative broker result AND whether the subsequent authoritative-state refresh succeeded.
+ * The action already committed on the broker (the POST returned ok); the ONLY question is whether
+ * the view could re-read fresh state. If the refresh succeeded → GREEN success. If it FAILED (e.g.
+ * /api/sessions 503 read_unavailable off-loop, or max-streams) → DOWNGRADE: never show an
+ * unqualified "Pinned."/"Archived." over stale pre-mutation state — say it committed on the broker
+ * but the view could not refresh, surface the HTTP status, and signal a retry. Pure + exported.
+ * `refreshResult` = { ok:boolean, status?:number }.
+ */
+export function postMutationStatus(action, resultBody, refreshResult) {
+  const rr = refreshResult || { ok: false };
+  if (rr.ok) return { message: describeControlResult(action, resultBody), cls: 'ok', retry: false };
+  const httpX = rr.status ? ('HTTP ' + rr.status) : 'connection lost';
+  return {
+    message: describeControlResult(action, resultBody).replace(/\.$/, '')
+      + ' — committed on the broker, but the view could not refresh (' + httpX + '); retrying…',
+    cls: 'pending',
+    retry: true,
+  };
+}
+
 /* ─────────────────────────────── browser wiring ─────────────────────────────── */
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
@@ -429,13 +451,53 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       setInspStatus('Action failed (' + r.status + '): ' + reason, 'err');
       return false;
     }
-    // Authoritative state re-fetch so the UI cannot drift from the broker.
-    setInspStatus(describeControlResult(payload.action, r.body), 'ok');
-    await window.XBusApi.refresh();
-    // If the record was removed, the session disappears → close the inspector.
-    if (payload.action === 'remove_record' && !findSession(sessionId)) { inspectorSessionId = null; }
+    // The mutation committed on the broker (POST ok). Now re-read authoritative state so the UI
+    // cannot drift. DASH-1: guard the refresh — a post-mutation read failure (503 read_unavailable
+    // off-loop / max-streams) must NOT leave an unqualified green "Pinned." over STALE pre-mutation
+    // state. On refresh failure we DOWNGRADE the status (committed-on-broker + could-not-refresh)
+    // and schedule a retry; the 1s inspector-sync interval + 5s app poll are the self-heal backstop.
+    const refreshOutcome = await guardedRefresh();
+    const st = postMutationStatus(payload.action, r.body, refreshOutcome);
+    setInspStatus(st.message, st.cls);
+    if (st.retry) scheduleRefreshRetry(payload.action, r.body, sessionId);
+    // If the record was removed AND the refresh saw it gone, close the inspector.
+    if (payload.action === 'remove_record' && refreshOutcome.ok && !findSession(sessionId)) { inspectorSessionId = null; }
     renderInspector();
-    return true;
+    return refreshOutcome.ok;
+  }
+
+  /** Run the authoritative-state refresh, translating a throw/HTTP-failure into {ok,status} so
+   *  runControl can decide the honest status (never let a refresh error escape as an uncaught
+   *  rejection that would leave a green success over stale state — the DASH-1 window). */
+  async function guardedRefresh() {
+    try { await window.XBusApi.refresh(); return { ok: true }; }
+    catch (e) {
+      // api() throws Error('request failed: <status>') on a non-ok read; extract the code if present.
+      const m = /(\d{3})/.exec(String((e && e.message) || ''));
+      return { ok: false, status: m ? Number(m[1]) : undefined };
+    }
+  }
+
+  /** After a downgraded post-mutation refresh, retry the re-read a few times with backoff so the
+   *  view converges to the broker WITHOUT waiting on the 5s poll. Idempotent per action; the last
+   *  successful refresh flips the status back to a clean success. */
+  let refreshRetryTimer = null;
+  function scheduleRefreshRetry(action, body, sessionId, attempt = 1) {
+    if (refreshRetryTimer) clearTimeout(refreshRetryTimer);
+    if (attempt > 5) return; // give up after ~ (1+2+3+4+5)s; the 5s poll remains the backstop
+    refreshRetryTimer = setTimeout(async () => {
+      const outcome = await guardedRefresh();
+      const st = postMutationStatus(action, body, outcome);
+      // Only overwrite the status if the inspector is still showing THIS retry context (best-effort).
+      setInspStatus(st.message, st.cls);
+      if (outcome.ok) {
+        if (action === 'remove_record' && !findSession(sessionId)) inspectorSessionId = null;
+        renderInspector();
+      } else {
+        scheduleRefreshRetry(action, body, sessionId, attempt + 1);
+      }
+    }, attempt * 1000);
+    if (refreshRetryTimer && typeof refreshRetryTimer.unref === 'function') refreshRetryTimer.unref();
   }
 
   function setActionsDisabled(disabled) {
@@ -482,6 +544,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     rosterFilter,
     openInspector,
     describeControlResult,
+    postMutationStatus,
     // exposed for tests / debugging
     _state: () => ({ filterState, collectionsState }),
   };

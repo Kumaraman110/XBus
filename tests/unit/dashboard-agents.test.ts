@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   applyRosterFilter, CONTROL_ACTIONS, AGENTS_REMOVE_RECORD_ENABLED, receiveControlLabel, describeControlResult,
+  postMutationStatus,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS static asset, intentionally untyped
 } from '../../src/broker/dashboard/static/agents.js';
@@ -102,5 +103,31 @@ describe('describeControlResult — honest, authoritative-result wording (esp. s
     expect(describeControlResult('pin', {})).toMatch(/pinned/i);
     expect(describeControlResult('archive', {})).toMatch(/archived/i);
     expect(describeControlResult('remove_record', {})).toMatch(/transcript preserved/i);
+  });
+});
+
+describe('postMutationStatus — DASH-1: never show unqualified success over stale state', () => {
+  it('refresh succeeded → GREEN success with the authoritative-result wording, no retry', () => {
+    const st = postMutationStatus('pin', { pinned: true }, { ok: true });
+    expect(st.cls).toBe('ok');
+    expect(st.message).toMatch(/pinned/i);
+    expect(st.retry).toBe(false);
+  });
+
+  it('refresh FAILED → DOWNGRADE: committed-on-broker + could-not-refresh + retry (NOT unqualified success)', () => {
+    const st = postMutationStatus('pin', { pinned: true }, { ok: false, status: 503 });
+    expect(st.cls).not.toBe('ok');                 // must NOT be a green success
+    expect(st.message).toMatch(/committed on the broker/i);
+    expect(st.message).toMatch(/could not refresh/i);
+    expect(st.message).toContain('503');           // surfaces the actual HTTP status
+    expect(st.message).toMatch(/retry/i);
+    expect(st.retry).toBe(true);                   // caller schedules a re-fetch
+  });
+
+  it('refresh failure with no status still downgrades honestly (never claims success)', () => {
+    const st = postMutationStatus('archive', { archived: true }, { ok: false });
+    expect(st.cls).not.toBe('ok');
+    expect(st.retry).toBe(true);
+    expect(st.message).not.toMatch(/^Archived\.$/); // not the bare success string
   });
 });
