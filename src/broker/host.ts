@@ -11,6 +11,7 @@ import { defaultEndpoint, ensureDataDir } from '../ipc/transport.js';
 import { systemClock, uuidIdGen, type Clock, type IdGen } from '../shared/clock.js';
 import { existsSync as fsExists } from 'node:fs';
 import { writeStateFile, removeStateFileIfOwned, ownerIdentityHash } from './state-file.js';
+import { osProcessCreationTimeMs } from './liveness-proof.js';
 import { hardenFile } from '../ipc/acl.js';
 import { BUILD_ID, SCHEMA_VERSION } from '../protocol/handshake.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist } from '../shared/build-identity.js';
@@ -207,9 +208,15 @@ export async function startBrokerHost(opts: BrokerHostOptions): Promise<RunningB
       try { return resolveIdentity(SCHEMA_VERSION, readProvenance(provenancePathFromDist(import.meta.url))); }
       catch { return resolveIdentity(SCHEMA_VERSION, null); }
     })();
+    // Beta.10 Stage 0 (recycled-PID fix): record THIS broker's OS process-creation time via the
+    // SAME reader the liveness proof uses on the way back in, so a real broker round-trips to an
+    // EQUAL value (guards the inverse-failure where a real broker is mislabeled 'recycled'). Best
+    // effort: null on an unreadable host → the liveness proof falls back to the handshake arm.
+    const processCreatedAt = osProcessCreationTimeMs(process.pid);
     writeStateFile(opts.dataDir, {
       pid: process.pid,
       processStartedAt: clock.nowIso(),
+      ...(processCreatedAt != null ? { processCreatedAt } : {}),
       brokerInstanceId,
       buildId: BUILD_ID,
       exactBuildId: stateIdentity.buildId,
