@@ -339,15 +339,41 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   function rebuildToolbarPreserving() { buildToolbar(); }
 
   /* ---- inspector ---- */
+  // Per-session detail cache (instances[] from GET /api/session/:id — NOT on the roster payload).
+  // Fetched on open + refreshed on demand; keyed by sessionId so a stale open session's instances
+  // don't bleed into another. Cleared when the inspector closes.
+  let inspectorInstances = { sessionId: null, instances: null };
+
   function openInspector(sessionId) {
     inspectorSessionId = sessionId;
+    inspectorInstances = { sessionId: null, instances: null }; // drop any prior session's detail
     renderInspector();
+    void fetchInspectorDetail(sessionId); // async: instances[] render when it arrives
+  }
+
+  /** Fetch the per-session detail for instances[] (#2), gated on caps.instances (endpoint exists).
+   *  Defensive: a failure leaves instances unrendered (never a dead/empty section). Re-renders on
+   *  success only if this is still the open session (no race across opens). */
+  async function fetchInspectorDetail(sessionId) {
+    if (!caps.instances || !window.XBusApi) return;
+    try {
+      const detail = await window.XBusApi.get('/api/session/' + encodeURIComponent(sessionId));
+      if (inspectorSessionId === sessionId && detail && Array.isArray(detail.instances)) {
+        inspectorInstances = { sessionId, instances: detail.instances };
+        renderInspector();
+      }
+    } catch { /* endpoint/read failed → instances section simply stays absent */ }
   }
 
   function renderInspector() {
     const panel = document.getElementById('inspector');
     if (!panel) return;
-    const s = findSession(inspectorSessionId);
+    const base = findSession(inspectorSessionId);
+    // Merge the fetched instances[] (if for THIS session) onto the roster projection so the
+    // instance-history section renders. The roster payload has no instances[]; the detail does.
+    const s = base && inspectorInstances.sessionId === inspectorSessionId
+      ? { ...base, instances: inspectorInstances.instances }
+      : base;
     if (!inspectorSessionId || !s) { panel.hidden = true; panel.replaceChildren(); return; }
     panel.hidden = false;
     panel.replaceChildren();
@@ -676,8 +702,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
    * Everything is DEFENSIVE — pre-WS1 the probe finds nothing and no optional control renders.
    */
   async function bootProbeAndHydrate() {
+    // Wait for app.js to have a tab token BEFORE probing — the probe's authenticated GETs would
+    // otherwise race the async nonce→token exchange, 401, and leave every capability dark. If no
+    // token materializes (bad/absent nonce), skip the probe (nothing to authenticate with anyway).
     try {
-      if (window.XBusCaps && window.XBusApi) caps = await window.XBusCaps.probeCapabilities(window.XBusApi);
+      const tokenOk = window.XBusTokenReady ? await window.XBusTokenReady : true;
+      if (tokenOk && window.XBusCaps && window.XBusApi) caps = await window.XBusCaps.probeCapabilities(window.XBusApi);
     } catch { /* probe never throws, but be defensive */ }
     window.__caps = caps; // expose for diagnostics / other modules
     // Collections cutover: the instant the server endpoint exists, use it (shared across browsers);

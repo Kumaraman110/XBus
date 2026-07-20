@@ -70,6 +70,12 @@ window.XBusApi = {
   refresh: () => refresh(),
 };
 
+/* Token-ready signal (integration fix): agents.js must not run its authenticated capability probe
+ * until app.js has a tab token in sessionStorage — otherwise the probe GETs race the async
+ * nonce→token exchange and 401, leaving every optional capability dark. boot() resolves this once a
+ * token is present (true) or unavailable (false). Consumers: `await window.XBusTokenReady`. */
+window.XBusTokenReady = new Promise((resolve) => { window.__resolveTokenReady = resolve; });
+
 /* ── small DOM helpers ── */
 function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.appendChild(text(txt)); return e; }
@@ -764,6 +770,9 @@ async function boot() {
   let token = sessionStorage.getItem(TOKEN_KEY);
   const nonce = takeNonceFromFragment();
   if (!token && nonce) { token = await exchangeNonce(nonce); if (token) sessionStorage.setItem(TOKEN_KEY, token); }
+  // Signal token readiness so agents.js runs its capability probe only AFTER a token exists
+  // (avoids the probe-vs-exchange race that leaves optional capabilities dark).
+  if (window.__resolveTokenReady) { window.__resolveTokenReady(!!token); window.__resolveTokenReady = null; }
   if (!token) { setStatus('No session token — open the dashboard via `xbus dashboard`.', 'err'); return; }
   try {
     await refresh();
