@@ -1460,6 +1460,51 @@ export class BrokerStore {
     });
   }
 
+  /**
+   * BETA.10 WS3 (#1) — operator-initiated redelivery, PRESERVING the accepted-vs-transport
+   * distinction (the user-mandated safety rule). The operator (local-operator, no live component)
+   * re-drives a message to its recipient. Two paths, kept DISTINGUISHABLE:
+   *  - ORDINARY REDELIVERY: the delivery is NOT yet accepted (queued / retry_wait / transport_written)
+   *    — the recipient has not acted on it. Re-arm it to 'queued' for a fresh injection. Audited
+   *    OPERATOR_REDELIVERY.
+   *  - EXPLICIT REPLAY of ALREADY-ACCEPTED work (state='accepted'): the recipient already accepted
+   *    the body — replaying it is DESTRUCTIVE / duplicate model-visible work. It is REFUSED unless
+   *    the caller passes confirmReplayAccepted=true (explicit destructive acknowledgement). On
+   *    confirm it mints a NEW attempt identity, audits DISTINCTLY as OPERATOR_ACCEPTED_REPLAY (never
+   *    as an ordinary redelivery), re-arms to 'queued' for re-injection, and preserves the prior
+   *    accepted history in the audit trail. NEVER a silent re-inject of an accepted body.
+   */
+  operatorRedeliver(messageId: string, opts: { reason?: string; confirmReplayAccepted?: boolean } = {}):
+    { messageId: string; outcome: 'redelivered' | 'replayed' | 'not_found'; replay: boolean; attemptId?: string; state?: string } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const d = this.db.prepare('SELECT state, recipient_session_id AS rsid FROM deliveries WHERE message_id=?').get(messageId) as { state: string; rsid: string } | undefined;
+      if (!d) return { messageId, outcome: 'not_found' as const, replay: false };
+      const reason = (opts.reason ?? '').slice(0, 120);
+      if (d.state === DeliveryState.ACCEPTED) {
+        // Destructive/duplicate replay of accepted work — require explicit acknowledgement.
+        if (opts.confirmReplayAccepted !== true) {
+          this.audit('OPERATOR_ACCEPTED_REPLAY_REFUSED_UNCONFIRMED', { sessionId: d.rsid, messageId });
+          throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, 'replaying already-accepted work is destructive/duplicate; pass confirmReplayAccepted to proceed');
+        }
+        const attemptId = this.ids.next(); // NEW auditable attempt identity
+        // Re-arm for re-injection. The prior accepted state is recorded in the audit metadata so the
+        // replay is fully traceable (a new attempt, not an overwrite of history).
+        this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, application_accepted_at=NULL, target_instance_id=NULL, next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.ACCEPTED}'`).run(now, messageId);
+        this.audit('OPERATOR_ACCEPTED_REPLAY', { sessionId: d.rsid, messageId, attemptId, reason, priorState: 'accepted' });
+        return { messageId, outcome: 'replayed' as const, replay: true, attemptId, state: DeliveryState.QUEUED };
+      }
+      // Ordinary redelivery: not-yet-accepted work. Re-arm to queued for re-injection.
+      if (d.state === DeliveryState.QUEUED || d.state === DeliveryState.RETRY_WAIT || d.state === DeliveryState.TRANSPORT_WRITTEN) {
+        this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, target_instance_id=NULL, next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}')`).run(now, messageId);
+        this.audit('OPERATOR_REDELIVERY', { sessionId: d.rsid, messageId, reason });
+        return { messageId, outcome: 'redelivered' as const, replay: false, state: DeliveryState.QUEUED };
+      }
+      // Terminal state (completed/rejected/expired/dead_letter/cancelled) — nothing to redeliver.
+      throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `cannot redeliver a delivery in terminal state ${d.state}`);
+    });
+  }
+
   /** Pin / unpin a session (keep it surfaced in the console). Orthogonal to state/lifecycle. */
   operatorSetPinned(sessionId: string, pinned: boolean): { sessionId: string; pinned: boolean } {
     return this.db.transaction(() => {
