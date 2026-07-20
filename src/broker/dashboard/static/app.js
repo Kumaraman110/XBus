@@ -378,8 +378,45 @@ function renderSessionSelect(sessions) {
   document.getElementById('new-thread-btn').disabled = false;
 }
 
+/* Beta.10 (Train B): top-level "N conversations need attention" banner. Aggregates the per-thread
+ * attention signals (summary-only via timeline.js — no per-thread fetch, no N+1) across the whole
+ * threads list into one actionable rollup. Each chip focuses that thread when clicked. Hidden when
+ * nothing needs attention. Text carries meaning (never color alone) for accessibility. */
+function renderAttentionBanner(threads) {
+  const banner = document.getElementById('attention-banner');
+  if (!banner) return;
+  const T = window.XBusTimeline;
+  if (!T) { banner.hidden = true; return; }
+  const roll = T.summarizeRosterAttention(threads || [], Date.now());
+  if (!roll.needsAttention) { banner.hidden = true; banner.replaceChildren(); return; }
+  banner.hidden = false;
+  banner.replaceChildren();
+  const n = roll.total;
+  const head = el('span', 'attn-banner-head', n + (n === 1 ? ' conversation needs attention' : ' conversations need attention'));
+  banner.appendChild(head);
+  const bits = [];
+  if (roll.failed) bits.push(roll.failed + ' failed');
+  if (roll.expired) bits.push(roll.expired + ' expired');
+  if (roll.stalled) bits.push(roll.stalled + ' awaiting reply');
+  banner.appendChild(el('span', 'attn-banner-sub', bits.join(' · ')));
+  // Focus chips: click to select the affected thread (limited to a sane number so the banner
+  // stays compact at scale; the count above is the full total).
+  const chips = el('span', 'attn-banner-chips');
+  for (const tid of roll.threadIds.slice(0, 8)) {
+    const t = (threads || []).find((x) => x.threadId === tid);
+    const label = t ? (t.peerName || (t.peerSessionId ? t.peerSessionId.slice(0, 8) : tid.slice(0, 6))) : tid.slice(0, 6);
+    const chip = el('button', 'attn-chip', label);
+    chip.type = 'button';
+    chip.addEventListener('click', () => { void selectThread(tid); });
+    chips.appendChild(chip);
+  }
+  if (roll.threadIds.length > 8) chips.appendChild(el('span', 'muted', '+' + (roll.threadIds.length - 8) + ' more'));
+  banner.appendChild(chips);
+}
+
 function renderThreadList(threads) {
   consoleState.threads = threads || [];
+  renderAttentionBanner(consoleState.threads); // Beta.10 (Train B): top-level stalled-work rollup
   const list = document.getElementById('thread-list');
   list.replaceChildren();
   if (!consoleState.threads.length) {

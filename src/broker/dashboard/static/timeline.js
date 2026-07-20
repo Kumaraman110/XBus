@@ -113,9 +113,31 @@ export function threadListAttention(summary, nowMs, thresholdMs = STALL_THRESHOL
   return { needsAttention: false, reason: null };
 }
 
+/**
+ * Top-level roster rollup: aggregate the per-thread attention signals into ONE
+ * "N conversations need attention" summary for a dashboard banner. Uses threadListAttention
+ * (summary-only) over the threads list the console already fetches — NO per-thread turn fetch,
+ * no N+1. Returns { total, failed, expired, stalled, threadIds, needsAttention }.
+ */
+export function summarizeRosterAttention(threads, nowMs, thresholdMs = STALL_THRESHOLD_MS) {
+  const list = Array.isArray(threads) ? threads : [];
+  let failed = 0, expired = 0, stalled = 0;
+  const threadIds = [];
+  for (const t of list) {
+    const a = threadListAttention(t, nowMs, thresholdMs);
+    if (!a.needsAttention) continue;
+    if (a.reason === 'failed') failed += 1;
+    else if (a.reason === 'expired') expired += 1;
+    else stalled += 1;
+    if (t && t.threadId != null) threadIds.push(t.threadId);
+  }
+  const total = failed + expired + stalled;
+  return { total, failed, expired, stalled, threadIds, needsAttention: total > 0 };
+}
+
 if (typeof window !== 'undefined') {
   window.XBusTimeline = {
     TIMELINE_STATES, STALL_THRESHOLD_MS, turnStateLabel, deriveTurnState, isStalled,
-    summarizeThreadWork, threadListAttention,
+    summarizeThreadWork, threadListAttention, summarizeRosterAttention,
   };
 }

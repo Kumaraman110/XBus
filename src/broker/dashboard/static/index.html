@@ -50,6 +50,10 @@
   <main>
     <!-- Communication console (beta.6 Phase 2): operator ↔ session threads. -->
     <div class="sec-head"><h2>Console</h2><span class="sec-note">operator ↔ session threads</span></div>
+    <!-- Beta.10 (Train B): top-level stalled/unanswered-work banner. Aggregates per-thread
+         attention (summary-only, no N+1) into "N conversations need attention". Hidden when none;
+         clicking a chip focuses that thread. Populated by app.js from the same threads payload. -->
+    <section id="attention-banner" class="attention-banner" role="status" aria-live="polite" hidden></section>
     <section class="console">
       <div class="console-grid">
         <!-- Left: thread list + "new thread" composer target. -->

@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveTurnState, TIMELINE_STATES, turnStateLabel, isStalled, summarizeThreadWork, threadListAttention,
+  summarizeRosterAttention,
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
   // @ts-ignore — plain JS static asset, intentionally untyped
 } from '../../src/broker/dashboard/static/timeline.js';
@@ -134,5 +135,38 @@ describe('threadListAttention — summary-only signal (no per-thread turn fetch,
   });
   it('a replied last turn never needs attention', () => {
     expect(threadListAttention({ lastTurnState: 'replied', lastMessageAt: past(120) }, NOW).needsAttention).toBe(false);
+  });
+});
+
+describe('summarizeRosterAttention — top-level "N conversations need attention" rollup', () => {
+  const threads = [
+    { threadId: 't1', lastTurnState: 'replied', lastMessageAt: past(5) },       // healthy
+    { threadId: 't2', lastTurnState: 'failed', lastMessageAt: past(3) },        // failed
+    { threadId: 't3', lastTurnState: 'queued', lastMessageAt: past(30) },       // stalled (idle 30m)
+    { threadId: 't4', lastTurnState: 'expired', lastMessageAt: past(1) },       // expired
+    { threadId: 't5', lastTurnState: 'acknowledged', lastMessageAt: past(2) },  // recent, not stalled
+  ];
+  it('aggregates per-thread attention into totals + the affected thread ids', () => {
+    const r = summarizeRosterAttention(threads, NOW);
+    expect(r.total).toBe(3);                       // t2 + t3 + t4
+    expect(r.failed).toBe(1);
+    expect(r.expired).toBe(1);
+    expect(r.stalled).toBe(1);
+    expect(r.threadIds.sort()).toEqual(['t2', 't3', 't4']);
+    expect(r.needsAttention).toBe(true);
+  });
+  it('a fully-healthy roster needs no attention', () => {
+    const healthy = [
+      { threadId: 'a', lastTurnState: 'replied', lastMessageAt: past(2) },
+      { threadId: 'b', lastTurnState: 'acknowledged', lastMessageAt: past(1) },
+    ];
+    const r = summarizeRosterAttention(healthy, NOW);
+    expect(r.total).toBe(0);
+    expect(r.needsAttention).toBe(false);
+    expect(r.threadIds).toEqual([]);
+  });
+  it('tolerates an empty / missing thread list', () => {
+    expect(summarizeRosterAttention([], NOW).needsAttention).toBe(false);
+    expect(summarizeRosterAttention(undefined as unknown as [], NOW).total).toBe(0);
   });
 });

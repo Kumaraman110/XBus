@@ -514,3 +514,16 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
 .work-tile.work-alert{ background:var(--st-failed-bg); }
 .work-tile.work-alert .work-n{ color:var(--st-failed); }
 @media(max-width:560px){ .insp-work-tiles{ grid-template-columns:repeat(3,1fr); } }
+
+/* Beta.10 (Train B): top-level stalled/unanswered-work banner (roster attention rollup). */
+.attention-banner{ display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp2) var(--sp4);
+  margin:0 0 var(--sp3); padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
+  background:var(--st-failed-bg); border-left:3px solid var(--st-failed); }
+.attention-banner[hidden]{ display:none; }
+.attn-banner-head{ font:600 13px/1.3 var(--font-ui); color:var(--st-failed); }
+.attn-banner-sub{ font:500 12px/1.3 var(--font-mono); color:var(--text-2); }
+.attn-banner-chips{ display:inline-flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.attn-chip{ font:500 11px/1 var(--font-mono); color:var(--text-1); background:var(--field);
+  border:1px solid var(--glass-border); border-radius:var(--r-pill); padding:5px 10px; cursor:pointer; }
+.attn-chip:hover{ border-color:var(--accent-line); }
+.attn-chip:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
