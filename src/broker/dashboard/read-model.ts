@@ -77,6 +77,22 @@ export interface DashboardSession {
   lastSent: { to: string; at: string; state: string } | null;
   /** Last message this session RECEIVED (sender + when + delivery state), or null. */
   lastReceived: { from: string; at: string; state: string } | null;
+  /** BETA.10 WS3 (#2): runtime instance history for the inspector (present on the DETAIL view
+   *  only, not the roster list). Current + past component instances, newest-first, current flagged.
+   *  Physical/epoch internals stay in diagnostics — this surfaces the operator-facing shape. */
+  instances?: SessionInstance[];
+}
+
+/** BETA.10 WS3 (#2): a runtime instance (component) of a session, for the inspector history. */
+export interface SessionInstance {
+  instanceId: string;
+  role: string;               // 'hook' | 'mcp' | 'admin' (component role)
+  state: string;              // 'connected'|'disconnected' (normalized from live/closed/superseded)
+  processId: number;
+  connectedAt: string;
+  disconnectedAt: string | null;
+  lastSeenAt: string;
+  current: boolean;           // the live instance of the session's current epoch
 }
 
 export interface UnmanagedBanner {
@@ -265,7 +281,29 @@ export class DashboardReadModel {
 
   /** One session's detail (or null). Same safe projection as sessions(). */
   session(sessionId: string): DashboardSession | null {
-    return this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    const base = this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    if (!base) return null;
+    // BETA.10 WS3 (#2): attach the runtime instance history (DETAIL view only). newest-first;
+    // `current` = a live component in the session's CURRENT active_epoch. state normalized to
+    // connected/disconnected for the operator-facing shape (live→connected; closed/superseded→
+    // disconnected). Physical/epoch internals are not surfaced here (diagnostics only).
+    const activeEpoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
+    const rows = this.db.prepare(
+      `SELECT component_instance_id AS instanceId, role, state, process_id AS processId, epoch,
+              connected_at AS connectedAt, disconnected_at AS disconnectedAt, last_seen_at AS lastSeenAt
+         FROM component_instances WHERE session_id=? ORDER BY connected_at DESC`,
+    ).all(sessionId) as Array<{ instanceId: string; role: string; state: string; processId: number; epoch: number; connectedAt: string; disconnectedAt: string | null; lastSeenAt: string }>;
+    const instances: SessionInstance[] = rows.map((r) => ({
+      instanceId: r.instanceId,
+      role: r.role,
+      state: r.state === 'live' ? 'connected' : 'disconnected',
+      processId: r.processId,
+      connectedAt: r.connectedAt,
+      disconnectedAt: r.disconnectedAt,
+      lastSeenAt: r.lastSeenAt,
+      current: r.state === 'live' && activeEpoch !== null && r.epoch === activeEpoch,
+    }));
+    return { ...base, instances };
   }
 
   /**
