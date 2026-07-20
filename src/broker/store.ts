@@ -202,6 +202,22 @@ export class BrokerStore {
   }
 
   /**
+   * BETA.10 WS1 R4: reject a mutation from a superseded (stale) epoch. A caller's auth.epoch must
+   * equal the session's CURRENT active_epoch, else the connection was superseded and must not mutate
+   * identity/routing state. Mirrors DeliveryOps.assertCurrentEpoch; call at the head of every
+   * auth-scoped identity/routing mutation (registerAlias/renameSession/signalReadiness already, plus
+   * any future mutating path). MUST run inside the caller's transaction.
+   */
+  private assertCurrentEpoch(auth: SessionAuthority): void {
+    const s = this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(auth.sessionId) as { e: number } | undefined;
+    if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
+    if (s.e !== auth.epoch) {
+      this.audit('EPOCH_MISMATCH_REJECTED', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId });
+      throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
+    }
+  }
+
+  /**
    * Beta.5 Phase 1 (ADR 0016/0020 Q3): append ONE hash-chained `ledger_events` row in
    * the CALLER's transaction, so the audit projection shares the state mutation's fate
    * (no divergence). `actor` is the authenticated session id (or 'broker'/'installer').
@@ -780,6 +796,10 @@ export class BrokerStore {
   registerAlias(auth: SessionAuthority, rawAlias: string): { alias: string } {
     const alias = validateUserAlias(rawAlias);
     return this.db.transaction(() => {
+      // BETA.10 WS1 R4: fence stale epochs — a superseded connection must not register a routable
+      // alias (routing hijack). Mirrors renameSession/signalReadiness. Inside the txn so the check
+      // and the write share a consistent snapshot.
+      this.assertCurrentEpoch(auth);
       const now = this.clock.nowIso();
       const clash = this.db
         .prepare(`SELECT session_id FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`)
