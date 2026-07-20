@@ -420,3 +420,71 @@ a:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visi
   *, *::before, *::after{ animation:none !important; transition:none !important; }
   body::before{ animation:none; }
 }
+
+/* ══════════════ Beta.10 (Train B): agent management — roster toolbar, inspector, actions ══════════════ */
+
+/* Roster toolbar: search + filter selects + collections manager. Reuses the glass/field tokens. */
+.roster-toolbar{ display:flex; flex-wrap:wrap; gap:var(--sp3); align-items:center; margin:0 0 var(--sp3); }
+.roster-toolbar .roster-search{ flex:1 1 220px; min-width:180px; }
+.roster-search, .roster-filter{
+  font:500 13px/1 var(--font-ui); color:var(--text-1); background:var(--field);
+  border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:10px 12px; }
+.roster-search:focus-visible, .roster-filter:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* A "Manage" link in the row is a link-btn variant already; add a little spacing when paired. */
+.manage-btn{ margin-right:6px; }
+
+/* Inspector panel — a glass card, same family as the panels. */
+.inspector{ position:relative; padding:var(--sp5); margin:0 0 var(--sp4);
+  background:var(--glass-fill); border:1px solid var(--glass-border); border-radius:var(--r);
+  -webkit-backdrop-filter:var(--glass-filter); backdrop-filter:var(--glass-filter); }
+.inspector[hidden]{ display:none; }
+.insp-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--sp4); }
+.insp-title{ margin:0; font:600 16px/1.2 var(--font-display); color:var(--text-1); }
+.insp-close{ flex:0 0 auto; }
+.insp-facts{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:var(--sp2) var(--sp5); margin-bottom:var(--sp4); }
+.insp-fact{ display:flex; flex-direction:column; gap:2px; }
+.insp-k{ font:600 10px/1 var(--font-ui); letter-spacing:.1em; text-transform:uppercase; color:var(--text-3); }
+.insp-v{ font:500 13px/1.4 var(--font-mono); color:var(--text-1); word-break:break-all; }
+
+/* Collections membership chips (toggle). */
+.insp-collections{ margin-bottom:var(--sp4); }
+.insp-collections .insp-k{ display:block; margin-bottom:var(--sp2); }
+.chips{ display:flex; flex-wrap:wrap; gap:var(--sp2); }
+.chip-toggle{ cursor:pointer; border:1px solid var(--glass-border); background:var(--accent-soft);
+  color:var(--text-2); padding:6px 10px; border-radius:var(--r-pill); font:500 12px/1 var(--font-mono); }
+.chip-toggle.on{ color:var(--accent-ink); border-color:var(--accent-line); background:var(--accent); }
+.chip-toggle:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* Action row: buttons + the receive-control select. */
+.insp-actions{ display:flex; flex-wrap:wrap; gap:var(--sp2); align-items:center; padding-top:var(--sp4); border-top:1px solid var(--glass-border); }
+.insp-action{ font:600 12px/1 var(--font-ui); padding:9px 14px; border-radius:var(--r-sm);
+  background:var(--accent-soft); color:var(--text-1); border:1px solid var(--glass-border); cursor:pointer; }
+.insp-action:hover:not(:disabled){ border-color:var(--accent-line); }
+.insp-action.danger{ color:var(--err); border-color:color-mix(in oklab, var(--err) 40%, transparent); }
+.insp-action:disabled{ opacity:.5; cursor:not-allowed; }
+.insp-action:focus-visible, .insp-control-select:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+.insp-control{ display:inline-flex; align-items:center; gap:6px; font:600 10px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--text-3); }
+.insp-control-select{ font:500 12px/1 var(--font-ui); color:var(--text-1); background:var(--field); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:8px 10px; }
+.gated-note{ margin-left:6px; font:500 10px/1 var(--font-ui); color:var(--text-3); font-style:italic; }
+
+/* Action status line (pending/success/failure). Color never carries meaning alone (text too). */
+.insp-status{ margin-top:var(--sp3); min-height:18px; font:500 12px/1.4 var(--font-ui); color:var(--text-2); }
+.insp-status.pending{ color:var(--text-2); }
+.insp-status.ok{ color:var(--ok); }
+.insp-status.err{ color:var(--err); }
+.insp-status.muted{ color:var(--text-3); }
+
+/* Minimal modal (collections manager). */
+.modal-overlay{ position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; z-index:100; padding:var(--sp4); }
+.modal{ width:min(480px,100%); max-height:80vh; overflow:auto; padding:var(--sp5);
+  background:var(--glass-fill-2,var(--glass-fill)); border:1px solid var(--glass-border); border-radius:var(--r); box-shadow:var(--shadow); }
+.modal-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--sp4); }
+.modal-head h3{ margin:0; font:600 15px/1 var(--font-display); color:var(--text-1); }
+.coll-add{ display:flex; gap:var(--sp2); margin-bottom:var(--sp4); }
+.coll-add input{ flex:1; font:500 13px/1 var(--font-ui); color:var(--text-1); background:var(--field); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:9px 12px; }
+button.primary{ background:var(--accent); color:var(--accent-ink); border:none; padding:9px 16px; border-radius:var(--r-sm); font:600 12px/1 var(--font-ui); cursor:pointer; }
+.coll-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:var(--sp2); }
+.coll-list li{ display:flex; align-items:center; gap:var(--sp2); }
+.coll-name{ flex:1; font:500 13px/1 var(--font-mono); color:var(--text-1); }
+.link-btn.danger{ color:var(--err); }

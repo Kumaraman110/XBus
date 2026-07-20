@@ -93,7 +93,13 @@
       </div>
     </section>
 
-    <div class="sec-head"><h2 id="sessions-heading">Sessions</h2><span class="sec-note">delivery state by session</span></div>
+    <div class="sec-head"><h2 id="sessions-heading">Agents</h2><span class="sec-note">roster · search, filter, collections, manage</span></div>
+    <!-- Beta.10 (Train B): roster toolbar (search + status/control/collection filters + manage
+         collections). Populated by agents.js; empty + harmless if that module isn't loaded. -->
+    <div id="roster-toolbar" class="roster-toolbar" role="search" aria-label="Agent roster filters"></div>
+    <!-- Agent detail inspector — identity, physical instances, delivery capability, pending work,
+         and the authorized operator actions. Hidden until an agent's "Manage" is clicked. -->
+    <section id="inspector" class="inspector" aria-label="Agent inspector" hidden></section>
     <section class="sessions-section" aria-labelledby="sessions-heading">
       <div class="table-scroll">
         <table id="sessions">
@@ -140,6 +146,12 @@
   </main>
   </div>
 
+  <!-- Load order: collections (local grouping helpers) → app (auth + core render, publishes
+       XBusApi/XBusFriendlyStatus) → agents (roster mgmt + inspector, consumes both). All are
+       external files (strict CSP: script-src 'self'; no inline JS). collections.js + agents.js
+       are ES modules; app.js is a classic script. -->
+  <script type="module" src="/collections.js"></script>
   <script src="/app.js"></script>
+  <script type="module" src="/agents.js"></script>
 </body>
 </html>

@@ -58,6 +58,18 @@ function onExpired() {
   setStatus('Session expired — reopen from XBus (run `xbus dashboard`).', 'err');
 }
 
+/* Beta.10 (Train B): a small, explicit API surface so the agent-management module (agents.js)
+ * reuses the SAME authenticated fetch layer (token in sessionStorage → Authorization header)
+ * rather than re-implementing auth. This is the ONLY coupling seam between the modules. */
+window.XBusApi = {
+  get: (path) => api(path),
+  post: (path, obj) => apiPost(path, obj),
+  /** Re-render the roster from the cached sessions (used after a filter/collection change). */
+  rerender: () => { if (window.__sessions) renderSessions(window.__sessions); },
+  /** Full authenticated refresh (used after a mutating action so state matches the broker). */
+  refresh: () => refresh(),
+};
+
 /* ── small DOM helpers ── */
 function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.appendChild(text(txt)); return e; }
@@ -82,6 +94,8 @@ const FRIENDLY_STATUS = {
   'expired': 'Expired',
 };
 function friendlyStatus(label) { return FRIENDLY_STATUS[label] || label; }
+// Beta.10 (Train B): expose for the agent inspector (agents.js) so status wording stays consistent.
+window.XBusFriendlyStatus = friendlyStatus;
 
 /** A colored delivery-count cell (a "state pill"): the number carries the value, the
  *  column header + pill class carry the state (never color-alone). Zero renders muted. */
@@ -97,6 +111,14 @@ function deliveryCell(row, n, state) {
  *  (session id, connection/readiness, last sent/received) that the friendly row hides. */
 function detailsCell(row, s) {
   const td = document.createElement('td');
+  // Beta.10 (Train B): a "Manage" affordance opens the agent inspector (identity + instances +
+  // authorized actions). Present only when the agent-management module is loaded.
+  if (window.XBusAgents && window.XBusAgents.openInspector) {
+    const manage = el('button', 'link-btn manage-btn', 'Manage');
+    manage.type = 'button';
+    manage.addEventListener('click', () => window.XBusAgents.openInspector(s.sessionId));
+    td.appendChild(manage);
+  }
   const btn = el('button', 'link-btn', 'Details');
   btn.type = 'button';
   btn.setAttribute('aria-expanded', 'false');
@@ -128,7 +150,11 @@ function renderSessions(sessions) {
   const body = document.getElementById('sessions-body');
   body.replaceChildren();
   const showInternal = document.getElementById('show-internal') && document.getElementById('show-internal').checked;
-  const shown = (sessions || []).filter((s) => showInternal || !isInternal(s));
+  // Beta.10 (Train B): the agent-management module supplies the roster search/status/Collection
+  // filters (all client-side over already-authorized data). Absent (module not loaded) → identity.
+  const rosterFilter = (window.XBusAgents && window.XBusAgents.rosterFilter) || ((list) => list);
+  const afterFilters = rosterFilter((sessions || []).filter((s) => showInternal || !isInternal(s)));
+  const shown = afterFilters;
   const hiddenCount = (sessions || []).length - shown.length;
   if (!shown.length) {
     const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');

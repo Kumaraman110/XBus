@@ -296,7 +296,19 @@ the client). Route-level test exists: `tests/integration/dashboard-server.test.t
 - Dashboard exposure: **NONE.**
 - Browser/e2e coverage: store unit `session-controls.test.ts:118`. No UI.
 - Known defect: destructive; requires confirmation + audit in the UI per the release gate.
-- Disposition: slice, with an explicit confirm step.
+- **CROSS-TRAIN DEPENDENCY (KNOWN-3, flagged by the Adversarial Reviewer):** at base `c6c761c`
+  `operatorRemoveRecord` deletes aliases/session_instances/recipient_sequences/component_instances/
+  session_epochs/thread_participants/sessions but **NOT `name_ownership` (keyed by
+  logical_identity_id) nor `physical_session_map`** (both added in migration v10). A remove over the
+  current primitive therefore **orphans `name_ownership`** (breaks the 1:1 name↔identity invariant)
+  and **leaves a phantom `physical_session_map` row** (a later same-id register can phantom-reclaim /
+  collide on the recipient-sequence unique index). That is precisely "state contradicts the broker
+  after refresh/restart" — a release-gate FAILURE. KNOWN-3's fix (a shared map-invalidation helper
+  called from remove + reaper expiry + beta.10 adoption/transfer) is Train A's and is NOT at this base.
+- Disposition: **Train B ships the remove-record UI + E2E in an EXPLICIT DISABLED "pending broker
+  fix (KNOWN-3)" state** — the control is visible, clearly labeled not-yet-supported, and NEVER fires
+  the corrupting action. Enable-flip is a one-line change once KNOWN-3 lands. This satisfies the gate:
+  not a dead button (it explains why it's disabled), not presented as supported, does not corrupt state.
 
 #### C6. Stop managed session — **HIDDEN**
 - Broker: `operatorControl('stop_managed')` clears managed markers via `clearManagedSession()`, then
