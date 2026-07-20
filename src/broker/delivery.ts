@@ -398,31 +398,48 @@ export class DeliveryOps {
     // redelivery bumps logical_injection_number) would (a) be listed multiple times and
     // (b) surface an arbitrary/stale injection id. Mirrors injectionIdFor(); one row per
     // transport_written delivery, always carrying the current epoch-bound injection id.
+    // Section 2 lists already-presented, not-yet-completed work for THIS epoch:
+    //  - transport_written: injected, awaiting ack (or awaiting reply for a no-ack request); AND
+    //  - BLOCKER #3 (beta.9.1): ACCEPTED + requires_reply=1 acked in a PRIOR epoch (target_generation
+    //    < the current epoch). This is the reclaim-recovery case: a successor inherits an acked-but-
+    //    reply-still-owed obligation whose authority was re-homed to the new epoch by
+    //    store.rehomeAcceptedReplyAuthority; it MUST be able to DISCOVER it here to complete the reply.
+    //    SCOPE (minimal): only cross-epoch (recovered) accepted rows surface — a SAME-epoch accepted
+    //    row (target_generation = the current epoch) is NOT re-surfaced, so steady-state behavior after
+    //    a normal ack is byte-identical to beta.9 (the acker already knows it owes the reply). The body
+    //    is NEVER repeated (bodyIncluded:false); only explicit redelivery may re-show a body.
     const rows = this.db
       .prepare(
-        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at,
+        `SELECT m.message_id, m.sender_alias, m.recipient_alias, m.kind, m.correlation_id, m.causation_id, m.recipient_sequence, m.requires_ack, m.requires_reply, m.created_at, m.expires_at, d.state AS delivery_state,
                 (SELECT ci.injection_id FROM context_injections ci
                    WHERE ci.message_id=m.message_id AND ci.recipient_epoch=?
                    ORDER BY ci.logical_injection_number DESC LIMIT 1) AS injection_id
          FROM deliveries d JOIN messages m ON m.message_id=d.message_id
-         WHERE d.recipient_session_id=? AND d.state='${DeliveryState.TRANSPORT_WRITTEN}'
+         WHERE d.recipient_session_id=?
+           AND (d.state='${DeliveryState.TRANSPORT_WRITTEN}'
+                OR (d.state='${DeliveryState.ACCEPTED}' AND m.requires_reply=1
+                    AND d.target_generation IS NOT NULL AND d.target_generation < ?))
            AND (m.expires_at IS NULL OR m.expires_at > ?)
          ORDER BY m.recipient_sequence ASC LIMIT ?`,
       )
-      .all(auth.epoch, auth.sessionId, now, limit) as Array<Record<string, unknown>>;
+      .all(auth.epoch, auth.sessionId, auth.epoch, now, limit) as Array<Record<string, unknown>>;
     for (const r of rows) {
       if (freshIds.has(r.message_id as string)) continue;
       const requiresAck = (r.requires_ack as number) === 1;
       const requiresReply = (r.requires_reply as number) === 1;
-      // A non-ack message in transport_written is NOT "unacknowledged" — it is
-      // never going to be acked. (Fire-and-forget messages have already left
-      // transport_written for `completed`, so any non-ack row here is awaiting a
-      // reply.) Don't offer ack/reject for it, and don't label it as awaiting an
-      // ack the contract never required.
-      const state: InboxEntryState = requiresAck ? 'context_injected_unacknowledged' : 'application_accepted';
-      const allowedActions = requiresAck
-        ? ['ack', 'reject', 'reply', 'request-explicit-redelivery']
-        : [...(requiresReply ? ['reply'] : []), 'request-explicit-redelivery'];
+      const isAccepted = (r.delivery_state as string) === DeliveryState.ACCEPTED;
+      // An ACCEPTED reply-pending row is already acknowledged — the only outstanding action is
+      // the reply; never re-offer ack/reject for it. A transport_written row: a non-ack message
+      // is awaiting a reply (fire-and-forget already left for `completed`); an ack-required one is
+      // awaiting its ack.
+      const state: InboxEntryState = isAccepted
+        ? 'application_accepted'
+        : (requiresAck ? 'context_injected_unacknowledged' : 'application_accepted');
+      const allowedActions = isAccepted
+        ? ['reply', 'request-explicit-redelivery']
+        : (requiresAck
+          ? ['ack', 'reject', 'reply', 'request-explicit-redelivery']
+          : [...(requiresReply ? ['reply'] : []), 'request-explicit-redelivery']);
       entries.push({
         messageId: r.message_id as string, injectionId: (r.injection_id as string) ?? null,
         senderAlias: r.sender_alias as string, recipientAlias: r.recipient_alias as string, kind: r.kind as string,

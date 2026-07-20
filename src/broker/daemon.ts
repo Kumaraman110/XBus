@@ -816,6 +816,42 @@ export class BrokerDaemon {
   }
 
   /**
+   * BETA.10 WS3 (#1): operator-initiated redelivery of a message to its recipient. Message-scoped
+   * (a messageId, NOT a sessionId), so it is its own handler rather than an operatorControl action.
+   * Delegates to the OPERATOR-authority store method, which preserves the accepted-vs-transport
+   * distinction (ordinary redelivery vs explicit confirm-required replay of accepted work) and
+   * stamps the audit. `raw.confirmReplayAccepted` is the explicit destructive acknowledgement for
+   * replaying already-accepted work. A throw surfaces as a clean 4xx; the broker is unaffected.
+   */
+  operatorRedeliver(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const messageId = this.optString(p.messageId, 'messageId');
+    if (!messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'messageId required');
+    const confirmReplayAccepted = p.confirmReplayAccepted === true;
+    const result = this.store.operatorRedeliver(messageId, {
+      ...(typeof p.reason === 'string' ? { reason: p.reason } : {}),
+      confirmReplayAccepted,
+    });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /**
+   * BETA.10 WS3: operator replace of the full workspace Collections state (the dashboard POSTs the
+   * whole {collections, members}). Delegates to the OPERATOR-authority store method (atomic full
+   * swap; unique-active-name + no-dup + ordering enforced; never touches agents). A throw surfaces
+   * as a clean 4xx. Returns the new version stamp.
+   */
+  operatorReplaceCollections(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const collections = Array.isArray(p.collections) ? p.collections as Array<{ id: string; name: string; sortOrder?: number; state?: string }> : [];
+    const members = (p.members && typeof p.members === 'object' && !Array.isArray(p.members)) ? p.members as Record<string, string[]> : {};
+    const result = this.store.replaceCollections({ collections, members });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /**
    * Beta.7 (ADR 0025): register a live in-process handle to a managed background child THIS
    * broker just spawned, so a later stop_managed can SIGTERM it pid-recycling-safely. On the
    * child's exit we clear the session's managed markers (so a dead session never retains a

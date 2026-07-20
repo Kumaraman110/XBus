@@ -146,17 +146,37 @@ export class Reaper {
     let sessionsExpired = 0;
     for (const s of due) {
       // CAS on expired_at IS NULL → idempotent (a second sweep sees expired_at set).
+      // BETA.10 WS1 (ADR 0033) — EXPIRY = DORMANCY, NOT DELETION. `expired_at` is the dormancy
+      // flag (the reclaim path already gates on it via isExpiredResume). The durable USER handle
+      // is DELIBERATELY kept HELD (session_name / session_name_state are NOT cleared/retired here):
+      // clearing them would free the protected handle for takeover and defeat durable continuity
+      // (beta.9 did exactly that — the bug). Only the automatic alias is released for routing
+      // hygiene (below). readiness→disconnected marks it dormant.
       const res = this.db.prepare(
-        `UPDATE sessions SET expired_at=?, expiration_reason='recipient_inactive_15_days', readiness='disconnected', session_name_state='retired', normalized_session_name=NULL, pending_name_expires_at=NULL, updated_at=? WHERE session_id=? AND expired_at IS NULL`,
+        `UPDATE sessions SET expired_at=?, expiration_reason='recipient_inactive_15_days', readiness='disconnected', pending_name_expires_at=NULL, updated_at=? WHERE session_id=? AND expired_at IS NULL`,
       ).run(now, now, s.session_id);
       if (res.changes === 0) continue; // already expired by a concurrent/earlier pass
-      // Release any live alias rows (name returns to the pool for reuse).
+      // BETA.10 WS1 (ADR 0033): a DORMANT identity has no live owner — close its live component
+      // instances. A session that idled to expiry without a clean disconnect keeps role='mcp'
+      // state='live' rows, which hasLiveMcp() reads; leaving them live would make resolveReclaim
+      // treat the dormant identity as a LIVE incumbent and REFUSE the valid owner's reactivation
+      // (the "never evict a live incumbent" gate) — defeating secret-gated dormancy reclaim. The
+      // owner reactivates under a fresh epoch, so closing the dead epoch's components is correct.
+      this.db.prepare(`UPDATE component_instances SET state='closed', disconnected_at=? WHERE session_id=? AND state='live'`).run(now, s.session_id);
+      // Release live alias rows (the automatic session-<hex> alias returns to the pool). The
+      // durable USER name in name_ownership is NOT released — see below.
       this.db.prepare(`UPDATE aliases SET active=0, retired_at=? WHERE session_id=? AND active=1`).run(now, s.session_id);
-      // Beta.8 (ADR 0027): release the durable name-ownership row in the SAME sweep so the two
-      // name representations never diverge (no orphan 'active' name_ownership blocking reuse).
-      // The owner_secret_hash is preserved (a released identity keeps its secret) — only the
-      // routing (normalized_name/state) is cleared, matching the sessions-row retire above.
-      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, updated_at=? WHERE current_session_id=? AND name_state IN ('active','pending')`).run(now, s.session_id);
+      // BETA.10 WS1 (ADR 0033): DO NOT release name_ownership on expiry. A dormant identity KEEPS
+      // its name_ownership row 'active' with its owner_secret_hash and protected handle intact, so
+      // (a) the handle cannot be taken over without the secret, and (b) the valid owner can reclaim
+      // the identity + its preserved inbox under a fresh epoch. Dormancy is carried by the sessions
+      // row's expired_at, not by releasing the durable ownership. (beta.9 released it here — the
+      // handle-takeover / continuity-loss bug this fixes.)
+      // BETA.10 WS1 (ADR 0033): PURGE transient physical_session_map edges targeting the now-dormant
+      // logical identity. The map is a live-redirect cache; a dormant identity must be reached only
+      // by a secret-bearing reclaim, never by a stale secret-less map redirect. Delete edges where
+      // the expiring session is the canonical target, the physical source, or the logical identity.
+      this.db.prepare(`DELETE FROM physical_session_map WHERE canonical_session_id=? OR physical_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)`).run(s.session_id, s.session_id, s.session_id);
       // Dead-letter EVERY non-terminal delivery to this tombstoned recipient —
       // queued, retry_wait AND transport_written (see the transport_written rationale
       // in the doc-comment). Clearing lease_expires_at makes the terminal rows
@@ -164,6 +184,18 @@ export class Reaper {
       // untouched (this only advances non-terminal rows to dead_letter).
       this.db.prepare(
         `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_inactive_15_days', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}')`,
+      ).run(now, s.session_id);
+      // BLOCKER #3 (beta.9.1): an ACCEPTED (acked, reply-still-owed) delivery is EXCLUDED from the
+      // dead-letter above by design — dead-lettering it into the generic 'recipient_inactive_15_days'
+      // bucket would DISGUISE an unanswered reply obligation as a never-acked delivery, and leaving
+      // it 'accepted' leaves it immortal (no other pass terminates it). Instead give it an EXPLICIT,
+      // observable terminal that PRESERVES the "reply was owed and not delivered" signal: accepted ->
+      // expired (a legal edge) with a DISTINCT failure_category, keeping application_accepted_at so an
+      // observer can see the request WAS accepted but its reply never arrived. This lets the sender/
+      // operator distinguish never-delivered / delivered-but-unacked / acked-reply-outstanding /
+      // acked-but-abandoned-on-expiry — rather than silently reaping the defect away.
+      this.db.prepare(
+        `UPDATE deliveries SET state='${DeliveryState.EXPIRED}', failure_category='reply_pending_unanswered_15_days', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state='${DeliveryState.ACCEPTED}' AND (SELECT m.requires_reply FROM messages m WHERE m.message_id=deliveries.message_id)=1`,
       ).run(now, s.session_id);
       // Release any held leases for this recipient's now-dead-lettered deliveries.
       this.db.prepare(`UPDATE delivery_leases SET state='expired', released_at=? WHERE state='held' AND message_id IN (SELECT message_id FROM deliveries WHERE recipient_session_id=? AND state='${DeliveryState.DEAD_LETTER}' AND failure_category='recipient_inactive_15_days')`).run(now, s.session_id);

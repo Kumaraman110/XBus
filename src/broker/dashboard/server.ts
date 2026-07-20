@@ -84,6 +84,10 @@ export interface DashboardServerOptions {
   /** Beta.7 (ADR 0024): operator session-control callback (rename alias / pause-DND / pin /
    *  archive / remove-record / stop-managed). Payload carries {action, sessionId, ...}. */
   onOperatorControl?: (payload: unknown) => unknown;
+  /** Beta.10 WS3 (#1): operator redelivery callback (ordinary redelivery / confirm-required replay). */
+  onOperatorRedeliver?: (payload: unknown) => unknown;
+  /** Beta.10 WS3: operator Collections full-state replace callback. */
+  onOperatorCollections?: (payload: unknown) => unknown;
   /** Beta.7 (ADR 0025): operator schedule callback (create / pause / resume / cancel). */
   onOperatorSchedule?: (payload: unknown) => unknown;
   /** Max operator-send request-body bytes (defense-in-depth over LIMITS.TEXT_BYTES). Default 96 KiB. */
@@ -114,6 +118,8 @@ export class DashboardServer {
   private readonly onOperatorSend: ((payload: unknown) => unknown) | undefined;
   private readonly onMarkThreadRead: ((payload: unknown) => unknown) | undefined;
   private readonly onOperatorControl: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorRedeliver: ((payload: unknown) => unknown) | undefined;
+  private readonly onOperatorCollections: ((payload: unknown) => unknown) | undefined;
   private readonly onOperatorSchedule: ((payload: unknown) => unknown) | undefined;
   private readonly maxWriteBodyBytes: number;
   private streams = new Set<http.ServerResponse>();
@@ -132,6 +138,8 @@ export class DashboardServer {
     this.onOperatorSend = opts.onOperatorSend;
     this.onMarkThreadRead = opts.onMarkThreadRead;
     this.onOperatorControl = opts.onOperatorControl;
+    this.onOperatorRedeliver = opts.onOperatorRedeliver;
+    this.onOperatorCollections = opts.onOperatorCollections;
     this.onOperatorSchedule = opts.onOperatorSchedule;
     this.maxWriteBodyBytes = opts.maxWriteBodyBytes ?? 96 * 1024;
   }
@@ -297,7 +305,9 @@ export class DashboardServer {
     const control = /^\/api\/session\/([^/]+)\/control$/.exec(p); // beta.7 operator controls
     const scheduleNew = p === '/api/schedule';                    // beta.7 create schedule
     const scheduleState = /^\/api\/schedule\/([^/]+)\/state$/.exec(p); // pause/resume/cancel
-    if (!sendNew && !sendFollow && !markRead && !control && !scheduleNew && !scheduleState) return this.json(res, 404, { error: 'not_found' });
+    const redeliver = /^\/api\/message\/([^/]+)\/redeliver$/.exec(p); // beta.10 operator redelivery
+    const collectionsWrite = p === '/api/collections';               // beta.10 collections full-state replace
+    if (!sendNew && !sendFollow && !markRead && !control && !scheduleNew && !scheduleState && !redeliver && !collectionsWrite) return this.json(res, 404, { error: 'not_found' });
 
     const body = await this.readJsonBody(req, res, this.maxWriteBodyBytes);
     if (body === null) return; // already responded (413/400)
@@ -316,6 +326,18 @@ export class DashboardServer {
         if (!this.onOperatorControl) return this.json(res, 503, { error: 'write_unavailable' });
         // The target sessionId comes from the PATH (not a spoofable body field); action + params from the body.
         const result = await this.onOperatorControl({ ...body, sessionId: decodeURIComponent(control[1]!) });
+        return this.json(res, 200, result);
+      }
+      if (collectionsWrite) {
+        if (!this.onOperatorCollections) return this.json(res, 503, { error: 'write_unavailable' });
+        const result = await this.onOperatorCollections({ ...body });
+        return this.json(res, 200, result);
+      }
+      if (redeliver) {
+        if (!this.onOperatorRedeliver) return this.json(res, 503, { error: 'write_unavailable' });
+        // BETA.10 WS3 (#1): messageId from the PATH (not a spoofable body field); reason +
+        // confirmReplayAccepted (the destructive replay acknowledgement) from the body.
+        const result = await this.onOperatorRedeliver({ ...body, messageId: decodeURIComponent(redeliver[1]!) });
         return this.json(res, 200, result);
       }
       if (scheduleNew || scheduleState) {
@@ -350,6 +372,10 @@ export class DashboardServer {
       // feature needs its own design + acceptance; see the capability-closure ledger. A request to
       // `/api/unmanaged` now falls through to the 404 below like any other unknown /api path.
       if (p === '/api/audit') return this.json(res, 200, await this.reader.run('auditStatus'));
+      // BETA.10 WS3 (#5): broker/build/runtime/ledger health projection (read-only, off-loop).
+      if (p === '/api/health') return this.json(res, 200, await this.reader.run('health'));
+      // BETA.10 WS3: workspace Collections read (server-side, s11). Fail-closed empty on an s10 DB.
+      if (p === '/api/collections') return this.json(res, 200, await this.reader.run('collections'));
       if (p === '/api/ledger') {
         const beforeSeq = u.searchParams.has('beforeSeq') ? Number(u.searchParams.get('beforeSeq')) : undefined;
         const limit = u.searchParams.has('limit') ? Number(u.searchParams.get('limit')) : undefined;

@@ -753,6 +753,105 @@ export const MIGRATIONS: readonly Migration[] = [
       WHERE normalized_session_name IS NOT NULL AND session_name_state IN ('active','pending');
     `,
   },
+  {
+    version: 11,
+    name: 'workspace_collections_and_conversation_work_model',
+    sql: `
+      -- BETA.10 WS3 (ADR 0034) — the minimum durable workspace model. ADDITIVE-ONLY: new tables
+      -- with FKs among THEMSELVES only (never ALTER a populated s10 table, never re-key the inbox —
+      -- ADR-0027 canonical-session redirection is preserved). Bumps the wire tuple to
+      -- xbus-p1-stp1-s11 (fail-closed for older components). ONE implicit local workspace: a fixed
+      -- workspace_id='local' — NO tenancy/users/orgs/RBAC (out of authorized scope). All s10 data
+      -- is untouched, so the upgrade is lossless + idempotent (CREATE ... IF NOT EXISTS-safe under
+      -- the versioned runner, which only applies a version once).
+
+      -- ===== Collections: local, non-routable, ordered, renameable, archiveable roster grouping =====
+      -- A collection groups LOGICAL AGENTS (by logical_identity_id — the durable identity from v10,
+      -- NOT a physical/session id). Collections are NEVER message recipients and NEVER group
+      -- conversations — purely local organizational metadata.
+      CREATE TABLE collections (
+        collection_id    TEXT PRIMARY KEY,
+        workspace_id     TEXT NOT NULL DEFAULT 'local',
+        name             TEXT NOT NULL,
+        normalized_name  TEXT NOT NULL,               -- casefolded uniqueness key
+        sort_order       INTEGER NOT NULL DEFAULT 0,
+        state            TEXT NOT NULL DEFAULT 'active', -- 'active' | 'archived'
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+      );
+      -- Unique ACTIVE collection name per workspace (an archived collection frees the name).
+      CREATE UNIQUE INDEX ux_collection_active_name ON collections(workspace_id, normalized_name)
+        WHERE state='active';
+
+      CREATE TABLE collection_members (
+        collection_id    TEXT NOT NULL,
+        logical_agent_id TEXT NOT NULL,               -- == sessions.logical_identity_id (durable id)
+        sort_order       INTEGER NOT NULL DEFAULT 0,
+        created_at       TEXT NOT NULL,
+        PRIMARY KEY (collection_id, logical_agent_id), -- no duplicate member
+        FOREIGN KEY (collection_id) REFERENCES collections(collection_id) ON DELETE CASCADE
+      );
+      -- ON DELETE CASCADE: deleting a COLLECTION cleans its membership rows transactionally and does
+      -- NOT touch any agent/session. Removing an AGENT cleans its membership rows in the same txn as
+      -- the identity teardown (store-side, ADR 0033) — this index makes that cleanup cheap.
+      CREATE INDEX idx_collection_members_agent ON collection_members(logical_agent_id);
+
+      -- ===== Conversations + participants (the minimum immediately-consumed structures) =====
+      -- A conversation is a durable, workspace-local grouping of turns. This is ADDITIVE to the
+      -- existing threads/messages model (v8): threads remain the message-routing spine; conversations
+      -- are the workspace-level view. conversation_id is independent of any root message, so a
+      -- conversation can exist before/without messages (fixes the v8 thread_id==root-message coupling).
+      CREATE TABLE conversations (
+        conversation_id  TEXT PRIMARY KEY,
+        workspace_id     TEXT NOT NULL DEFAULT 'local',
+        title            TEXT,
+        state            TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'closed' | 'archived'
+        thread_id        TEXT,                          -- optional link to the v8 routing thread
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        last_activity_at TEXT
+      );
+      CREATE INDEX idx_conversations_workspace ON conversations(workspace_id, state, last_activity_at);
+
+      CREATE TABLE conversation_participants (
+        conversation_id  TEXT NOT NULL,
+        logical_agent_id TEXT NOT NULL,                 -- durable identity, follows reclaim (not session id)
+        role             TEXT NOT NULL DEFAULT 'member',
+        joined_at        TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, logical_agent_id),
+        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+      );
+
+      -- ===== Work items / tasks =====
+      CREATE TABLE work_items (
+        work_item_id     TEXT PRIMARY KEY,
+        workspace_id     TEXT NOT NULL DEFAULT 'local',
+        conversation_id  TEXT,                          -- optional link
+        assignee_agent_id TEXT,                         -- durable identity or NULL (unassigned)
+        title            TEXT NOT NULL,
+        state            TEXT NOT NULL DEFAULT 'open',   -- 'open' | 'in_progress' | 'done' | 'cancelled'
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE SET NULL
+      );
+      CREATE INDEX idx_work_items_workspace ON work_items(workspace_id, state);
+      CREATE INDEX idx_work_items_assignee ON work_items(assignee_agent_id);
+
+      -- ===== Artifacts =====
+      CREATE TABLE artifacts (
+        artifact_id      TEXT PRIMARY KEY,
+        workspace_id     TEXT NOT NULL DEFAULT 'local',
+        conversation_id  TEXT,
+        work_item_id     TEXT,
+        kind             TEXT NOT NULL,                 -- e.g. 'file' | 'link' | 'note'
+        ref              TEXT NOT NULL,                 -- path/url/id (by-value; no blob storage here)
+        created_at       TEXT NOT NULL,
+        FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE SET NULL,
+        FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id) ON DELETE SET NULL
+      );
+      CREATE INDEX idx_artifacts_conversation ON artifacts(conversation_id);
+    `,
+  },
 ];
 
 function checksum(sql: string): string {

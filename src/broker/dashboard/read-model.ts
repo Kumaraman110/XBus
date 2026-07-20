@@ -13,6 +13,8 @@
 import type { SqliteDriver } from '../../database/connection.js';
 import { verifyLedger } from '../ledger.js';
 import { OPERATOR_SESSION_ID } from '../operator.js';
+import { BUILD_ID, SCHEMA_VERSION } from '../../protocol/handshake.js';
+import { XBUS_VERSION } from '../../protocol/version.js';
 
 /** The dashboard-visible label for a session, derived top-down, first-match-wins from the
  *  FOUR real fields (ADR 0020 Q2 decision table). */
@@ -94,6 +96,22 @@ export interface DashboardSession {
   lastSent: { to: string; at: string; state: string } | null;
   /** Last message this session RECEIVED (sender + when + delivery state), or null. */
   lastReceived: { from: string; at: string; state: string } | null;
+  /** BETA.10 WS3 (#2): runtime instance history for the inspector (present on the DETAIL view
+   *  only, not the roster list). Current + past component instances, newest-first, current flagged.
+   *  Physical/epoch internals stay in diagnostics — this surfaces the operator-facing shape. */
+  instances?: SessionInstance[];
+}
+
+/** BETA.10 WS3 (#2): a runtime instance (component) of a session, for the inspector history. */
+export interface SessionInstance {
+  instanceId: string;
+  role: string;               // 'hook' | 'mcp' | 'admin' (component role)
+  state: string;              // 'connected'|'disconnected' (normalized from live/closed/superseded)
+  processId: number;
+  connectedAt: string;
+  disconnectedAt: string | null;
+  lastSeenAt: string;
+  current: boolean;           // the live instance of the session's current epoch
 }
 
 
@@ -305,7 +323,29 @@ export class DashboardReadModel {
 
   /** One session's detail (or null). Same safe projection as sessions(). */
   session(sessionId: string): DashboardSession | null {
-    return this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    const base = this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    if (!base) return null;
+    // BETA.10 WS3 (#2): attach the runtime instance history (DETAIL view only). newest-first;
+    // `current` = a live component in the session's CURRENT active_epoch. state normalized to
+    // connected/disconnected for the operator-facing shape (live→connected; closed/superseded→
+    // disconnected). Physical/epoch internals are not surfaced here (diagnostics only).
+    const activeEpoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
+    const rows = this.db.prepare(
+      `SELECT component_instance_id AS instanceId, role, state, process_id AS processId, epoch,
+              connected_at AS connectedAt, disconnected_at AS disconnectedAt, last_seen_at AS lastSeenAt
+         FROM component_instances WHERE session_id=? ORDER BY connected_at DESC`,
+    ).all(sessionId) as Array<{ instanceId: string; role: string; state: string; processId: number; epoch: number; connectedAt: string; disconnectedAt: string | null; lastSeenAt: string }>;
+    const instances: SessionInstance[] = rows.map((r) => ({
+      instanceId: r.instanceId,
+      role: r.role,
+      state: r.state === 'live' ? 'connected' : 'disconnected',
+      processId: r.processId,
+      connectedAt: r.connectedAt,
+      disconnectedAt: r.disconnectedAt,
+      lastSeenAt: r.lastSeenAt,
+      current: r.state === 'live' && activeEpoch !== null && r.epoch === activeEpoch,
+    }));
+    return { ...base, instances };
   }
 
   /**
@@ -479,6 +519,53 @@ export class DashboardReadModel {
       lastVerifiedAt = row?.at ?? null;
     } catch { lastVerifiedAt = null; } // table absent (older DB / pre-first-verify) → null
     return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null, lastVerifiedAt };
+  }
+
+  /**
+   * BETA.10 WS3 (#5) — broker/build/runtime/ledger health projection for the dashboard health panel.
+   * Shape matches the dashboard's locked consumption contract: { build, runtime, ledger, readWorker,
+   * capabilities }. The `ledger` block REUSES auditStatus() (no duplicate verifyLedger pass). `build`
+   * comes from the version constants; `runtime` from process (uptime/pid/node). `capabilities` is an
+   * explicit allowlist so the dashboard's probe lights the s10-neutral features (#1 redeliver, #2
+   * instances) deterministically rather than inferring. Read-only, off the broker loop.
+   */
+  health(): {
+    build: { version: string; buildId: string; schemaVersion: number };
+    runtime: { uptimeMs: number; pid: number; nodeVersion: string };
+    ledger: { ok: boolean; checked: number; firstBreakSeq: number | null; lastVerifiedAt: string | null };
+    readWorker: { inFlight: number; overloaded: boolean };
+    capabilities: string[];
+  } {
+    return {
+      build: { version: XBUS_VERSION, buildId: BUILD_ID, schemaVersion: SCHEMA_VERSION },
+      runtime: { uptimeMs: Math.round(process.uptime() * 1000), pid: process.pid, nodeVersion: process.version },
+      ledger: this.auditStatus(),
+      // The read worker's own depth isn't tracked in this projection layer (the worker wraps this
+      // call); report a stable not-overloaded baseline. A future worker-instrumented value can
+      // replace this without a shape change.
+      readWorker: { inFlight: 0, overloaded: false },
+      capabilities: ['redeliver', 'instances'],
+    };
+  }
+
+  /**
+   * BETA.10 WS3 — the workspace Collections read (dashboard contract), off-loop read-only. Mirrors
+   * BrokerStore.readCollections but on the read-worker's read-only handle. Ordered by sort_order.
+   */
+  collections(): { version: number; collections: Array<{ id: string; name: string; sortOrder: number; state: string }>; members: Record<string, string[]> } {
+    let cols: Array<{ id: string; name: string; sortOrder: number; state: string }> = [];
+    let memberRows: Array<{ cid: string; agent: string }> = [];
+    try {
+      cols = this.db.prepare(`SELECT collection_id AS id, name, sort_order AS sortOrder, state FROM collections WHERE workspace_id='local' ORDER BY sort_order ASC, normalized_name ASC`).all() as typeof cols;
+      memberRows = this.db.prepare(`SELECT collection_id AS cid, logical_agent_id AS agent FROM collection_members ORDER BY sort_order ASC`).all() as typeof memberRows;
+    } catch {
+      // s10 DB (collections tables absent) → fail-closed empty, never a partial/crash. The dashboard's
+      // capability probe treats this as "collections unavailable" and keeps localStorage.
+      return { version: 0, collections: [], members: {} };
+    }
+    const members: Record<string, string[]> = {};
+    for (const r of memberRows) { (members[r.agent] ??= []).push(r.cid); }
+    return { version: cols.length + memberRows.length + 1, collections: cols, members };
   }
 }
 
