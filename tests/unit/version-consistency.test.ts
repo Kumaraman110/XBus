@@ -27,8 +27,12 @@ const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.9.1';
 // abort-atomicity. Behavioral/tooling only — NO schema or wire change: it stays schema 10 /
 // xbus-p1-stp1-s10 (the beta.8 durable-identity migration v10 foundation is carried forward, and
 // already-issued beta.9 secrets keep verifying). Protocol + STP stay 1. beta.9 is the upgrade source.
-const EXPECTED_COMPATIBILITY_ID = 'xbus-p1-stp1-s10';
-const EXPECTED_SCHEMA_VERSION = 10;
+// BETA.10 WS3 (ADR 0034): the AUTHORIZED s10→s11 additive migration (workspace collections +
+// conversation/work model). Deliberate, user-signed-off schema-direction bump — the wire tuple
+// moves to s11 (fail-closed for older components). The product prerelease label is independent
+// (tracked by EXPECTED_PRODUCT_VERSION below) and is NOT bumped by this schema change.
+const EXPECTED_COMPATIBILITY_ID = 'xbus-p1-stp1-s11';
+const EXPECTED_SCHEMA_VERSION = 11;
 
 describe('version consistency (prevents the beta.3 install-rollback class)', () => {
   it('the authoritative product version is exactly the expected release identity', () => {

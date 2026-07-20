@@ -43,9 +43,11 @@ function insertNamedSession(db: SqliteDriver, id: string, name: string, now: str
 }
 
 describe('migration v10 — durable logical identity + name ownership', () => {
-  it('the global head schema is 10 and the wire tuple is xbus-p1-stp1-s10', () => {
-    expect(SCHEMA_VERSION).toBe(10);
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s10');
+  it('v10 remains a real applied migration; the global head is now 11 (beta.10 WS3 added v11)', () => {
+    // beta.10 WS3 (ADR 0034) appended v11 (workspace collections + conversation/work), so the HEAD
+    // schema is 11 / xbus-p1-stp1-s11. v10 stays a real, unchanged migration — assert it is present.
+    expect(SCHEMA_VERSION).toBe(11);
+    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s11');
     expect(MIGRATIONS.some((m) => m.version === 10 && m.name === 'durable_logical_identity_and_name_ownership')).toBe(true);
   });
 
@@ -70,7 +72,9 @@ describe('migration v10 — durable logical identity + name ownership', () => {
 
     const db2 = openDatabase(p, { applyPragmas: true });
     const r = runMigrations(db2, now);
-    expect(r.appliedNow).toEqual([10]);
+    // beta.10 WS3 appended v11, so a v9 DB now forward-migrates through 10 AND 11 to head (both
+    // additive: v10 name_ownership backfill, v11 collections/conversation/work tables — lossless).
+    expect(r.appliedNow).toEqual([10, 11]);
     // no row lost
     expect((db2.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c).toBe(before);
     // logical_identity_id backfilled = own session id

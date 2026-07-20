@@ -96,8 +96,9 @@ describe('migration v9 — 8→9 on a populated DB', () => {
     db.close();
     const db2 = openDatabase(p, { applyPragmas: true });
     const r = runMigrations(db2, now);
-    // beta.8 added v10, so a v8 DB now forward-migrates through 9 AND 10 to head — both additive.
-    expect(r.appliedNow).toEqual([9, 10]);
+    // beta.8 added v10 and beta.10 WS3 added v11, so a v8 DB now forward-migrates through 9, 10 AND
+    // 11 to head — all additive (v11 = collections + conversation/work tables; lossless).
+    expect(r.appliedNow).toEqual([9, 10, 11]);
     expect((db2.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c).toBe(before);
     const row = db2.prepare('SELECT claude_title, claude_title_source, managed_by_xbus, pinned, archived FROM sessions WHERE session_id=?').get('aaaa9999-0000-4000-8000-000000000009') as { claude_title: string | null; claude_title_source: string | null; managed_by_xbus: number; pinned: number; archived: number };
     expect(row.claude_title).toBeNull();
