@@ -21,16 +21,15 @@ const readJson = (p: string) => JSON.parse(fs.readFileSync(path.join(REPO, p), '
 // (beta.N) is a deliberate, reviewed act: change this literal and every surface
 // below must move with it. Compatibility + schema are INDEPENDENT of the product
 // version and must NOT move just because the prerelease label did.
-const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.9.1';
-// beta.9.1 (durable-identity correctness hotfix) is a prerelease PATCH over beta.9: CSPRNG owner
-// secrets, recycled-PID liveness rejection, the reply-pending-orphan fix, and D7 ledger
-// abort-atomicity. Behavioral/tooling only — NO schema or wire change: it stays schema 10 /
-// xbus-p1-stp1-s10 (the beta.8 durable-identity migration v10 foundation is carried forward, and
-// already-issued beta.9 secrets keep verifying). Protocol + STP stay 1. beta.9 is the upgrade source.
-// BETA.10 WS3 (ADR 0034): the AUTHORIZED s10→s11 additive migration (workspace collections +
-// conversation/work model). Deliberate, user-signed-off schema-direction bump — the wire tuple
-// moves to s11 (fail-closed for older components). The product prerelease label is independent
-// (tracked by EXPECTED_PRODUCT_VERSION below) and is NOT bumped by this schema change.
+const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.10';
+// beta.10 is the current release: durable role identity + auto inbox, the workspace Collections +
+// conversation/work data model (WS3), the provider-neutral adapter boundary (WS4), the dashboard
+// agent-management slice, and honest plugin/MCP/hook activation diagnostics (ADR 0036). beta.9.1 is
+// the upgrade source. BETA.10 WS3 (ADR 0034) carries the AUTHORIZED s10→s11 additive migration
+// (workspace collections + conversation/work model) — a deliberate, user-signed-off schema-direction
+// bump, so the wire tuple moves to s11 (fail-closed for older components). Compatibility + schema are
+// INDEPENDENT of the product prerelease label: the s11 tuple was set by the WS3 schema change, NOT by
+// this beta.9.1→beta.10 label bump, and must not move just because the label did.
 const EXPECTED_COMPATIBILITY_ID = 'xbus-p1-stp1-s11';
 const EXPECTED_SCHEMA_VERSION = 11;
 

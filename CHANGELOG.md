@@ -6,6 +6,42 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] — durable role identity, workspace data model, and honest activation
+
+The first net-new capability release since the durable-identity foundation. **This release carries an
+authorized additive schema migration (v11): the wire compatibility tuple moves `xbus-p1-stp1-s10` →
+`xbus-p1-stp1-s11` (fail-closed for older components).** beta.9.1 is the upgrade source; the s10→s11
+upgrade preserves all existing data and durable-identity secrets (verified: owner-secret hash
+unchanged across the migration), and a rollback to a beta.9.1 build fail-closes on the newer schema
+rather than corrupting the database. Application protocol and XBUS-STP wire versions stay at 1.
+
+- **Workspace Collections + conversation/work data model (WS3, ADR 0034).** Additive migration v11
+  adds workspace collections, conversation/participant, and work-item/artifact tables with their
+  server-side `/api/collections` surface. Existing s10 data (sessions, name ownership, messages,
+  deliveries, receipts, ledger) is preserved byte-for-byte and the v1..v10 migration checksums stay
+  locked.
+- **Provider-neutral session-identity adapter boundary (WS4, ADR 0035).** The broker core no longer
+  depends on a specific host's session model; a `SessionIdentitySource` adapter isolates it, with a
+  fake-adapter conformance suite and an architecture guard keeping the core provider-neutral.
+- **Name-ownership + identity-authority hardening (WS1).** A single name-ownership release primitive,
+  epoch-fenced `registerAlias` (routing-hijack fence), a split between identity teardown
+  (`remove` = destruction) and expiry (dormancy), and a static ownership-authority guard closing the
+  bypass-audit.
+- **Dashboard agent-management slice.** Roster filters and attention rollup, a local (non-routable)
+  Collections grouping, an inspector Work panel surfacing failures/pending work, redelivery-confirm
+  and capability-gated record removal, and a persistent post-listen error handler so a transient
+  socket error can no longer crash the dashboard server.
+- **Honest plugin / MCP / hook activation diagnostics (ADR 0036).** Activation is classified into
+  first-class states (`CONNECTED` / `PLUGIN_NOT_LOADED` / `MCP_DISCONNECTED` / `BROKER_UNAVAILABLE`
+  / `DEGRADED_HOOK_ONLY`) and surfaced by `xbus doctor` (stable `--json` enum + per-state exit code)
+  and at the Stop hook — a bare `claude` session (plugin not loaded) is never silently presented as
+  connected. The MCP server registers eagerly at `notifications/initialized` (so a tool-less first
+  turn is not misdiagnosed), and persistent, reversible activation is offered as an installer opt-in
+  (`xbus install --persistent`, fully removed on uninstall) with `xclaude` remaining the canonical
+  launcher.
+- **Hosted CI.** A GitHub Actions gate runs the hosted-safe test selection (with a drift guard and a
+  documented HOSTED_SAFE / LOCAL_ONLY classification manifest) on every change.
+
 ## [0.1.0-beta.9.1] — durable-identity correctness hotfix
 
 A prerelease patch over beta.9 fixing four durable-identity correctness/robustness defects. **No
