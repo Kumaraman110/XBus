@@ -169,7 +169,20 @@ export class DashboardServer {
     this.server = http.createServer((req, res) => { void this.handle(req, res); });
     await new Promise<void>((resolve, reject) => {
       this.server!.once('error', reject);
-      this.server!.listen(this.wantPort, this.host, () => { this.server!.removeListener('error', reject); resolve(); });
+      this.server!.listen(this.wantPort, this.host, () => {
+        this.server!.removeListener('error', reject);
+        // PERSISTENT post-listen handlers (mirrors src/ipc/server.ts). Without an 'error' listener
+        // a post-listen server 'error' (a connection-level fault a churning client can trigger)
+        // is an EventEmitter 'error' with no listener → Node throws it UNCAUGHT → the whole broker
+        // process exits (code 1, no unhandled-rejection log). Log + swallow: a transient socket
+        // fault must never take the broker down. 'clientError' (malformed request bytes / a client
+        // socket error) likewise: end the offending socket cleanly, never crash.
+        this.server!.on('error', (e: Error) => this.log(`dashboard server error (ignored): ${e.message}`));
+        this.server!.on('clientError', (_e, socket) => {
+          try { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); else socket.destroy(); } catch { /* ignore */ }
+        });
+        resolve();
+      });
     });
     this.log(`dashboard listening on ${this.url}`);
   }
