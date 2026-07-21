@@ -18,6 +18,7 @@ import { doHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
 import { normalizeSessionName } from '../identity/session-name.js';
 import { loadOwnerSecret, saveOwnerSecret } from './owner-secret-store.js';
+import { applyEagerRegisterBarrier } from './eager-register-barrier.js';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -144,7 +145,7 @@ export class McpServer {
     this.deps.write(JSON.stringify(obj) + '\n');
   }
 
-  private async ensureBroker(): Promise<void> {
+  private async ensureBroker(eager = false): Promise<void> {
     if (this.connected) return;
     // Beta.4 (ADR 0012 D7): make sure a broker is RUNNING before we connect — the
     // user never has to run `xbus start`. Race-safe + degraded-tolerant; a failure
@@ -158,6 +159,13 @@ export class McpServer {
     this.client.onClose(() => { this.connected = false; });
     await this.client.connect();
     await doHello(this.client, ComponentRole.MCP);
+    // BETA.10 Phase B — DETERMINISTIC eager-register race barrier (test-only; NO-OP in production).
+    // The broker is now reachable (connect + hello done) but the mcp component_instances row is NOT
+    // yet committed (that happens at register_session below). This is the exact ~ms window in which a
+    // Stop-hook activation diagnosis could mis-classify a genuinely plugin-loaded session. When armed
+    // by XBUS_TEST_EAGER_REGISTER_DELAY_MS AND on the eager path, hold here so a forced Stop lands
+    // inside the window — making the deferred race deterministically reproducible. Unset ⇒ no delay.
+    await applyEagerRegisterBarrier({ eager });
     // Beta.8 (ADR 0027): if we've previously been awarded this name and persisted its owner
     // secret, present it so a NEW Claude Code session id reclaims the durable identity's
     // name + inbox automatically (no manual resend). Best-effort: a missing secret just means
@@ -222,7 +230,7 @@ export class McpServer {
       // mcpComponentPresence(session).ever is true for every loaded session regardless of tool use.
       // Best-effort + non-blocking: a briefly-unreachable broker must never wedge the MCP handshake;
       // ensureBroker swallows connect failures and a later tool call retries. Fire-and-forget.
-      void this.ensureBroker().catch(() => { /* lazy tool-call path will retry; never block init */ });
+      void this.ensureBroker(true).catch(() => { /* lazy tool-call path will retry; never block init */ });
       return;
     }
     if (method === 'tools/list') {
