@@ -72,11 +72,13 @@ describe('build-identity model', () => {
     // The wire-bound compatibility value is the STABLE tuple, not the product
     // version. Beta.8's migration v10 moved the SCHEMA component 9 -> 10 (ADR 0027
     // durable logical identity, a deliberate fail-closed bump; beta.7's v9 had moved
-    // 8 -> 9); protocol + STP are still 1, so the wire BYTES/key-schedule are
-    // unchanged — only the schema integer in the tuple moves.
-    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s10');
+    // 8 -> 9); beta.10 WS3 (ADR 0034) then made the AUTHORIZED additive bump 10 -> 11
+    // (migration v11 — workspace collections + conversation/work model). Protocol + STP
+    // are still 1, so the wire BYTES/key-schedule are unchanged — only the schema integer
+    // in the tuple moves.
+    expect(WIRE_COMPATIBILITY_ID).toBe('xbus-p1-stp1-s11');
     expect(WIRE_COMPATIBILITY_ID).toBe(compatibilityId(SCHEMA_VERSION));
-    expect(SCHEMA_VERSION).toBe(10);
+    expect(SCHEMA_VERSION).toBe(11);
     // The pure arithmetic for OLD schemas is unchanged (version-independent fn).
     expect(compatibilityId(5)).toBe('xbus-p1-stp1-s5');
     expect(compatibilityId(6)).toBe('xbus-p1-stp1-s6');

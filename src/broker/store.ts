@@ -429,28 +429,57 @@ export class BrokerStore {
     const existing = this.db.prepare('SELECT owner_secret_hash AS hash FROM name_ownership WHERE logical_identity_id=?').get(logicalId) as { hash: string | null } | undefined;
     let plaintext: string | null = null;
     let hash: string | null = existing?.hash ?? null;
-    if (hash === null) { plaintext = this.mintOwnerSecret(); hash = BrokerStore.hashSecret(plaintext); }
-    // Release any OTHER identity that held this normalized name (superseded predecessor whose
-    // ownership row lingers) so ux_name_ownership_active never blocks the new active owner.
-    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, superseded_at=?, updated_at=? WHERE normalized_name=? AND logical_identity_id<>? AND name_state IN ('active','pending')`)
-      .run(now, now, norm.normalized, logicalId);
+    const freshlyMinted = hash === null;
+    if (freshlyMinted) { plaintext = this.mintOwnerSecret(); hash = BrokerStore.hashSecret(plaintext); }
+    // BETA.10 WS1 R2: release any OTHER identity that held this normalized name (superseded
+    // predecessor whose ownership row lingers) THROUGH THE ONE release primitive — so the released-
+    // column treatment can never diverge from the standalone release path. This one marks
+    // superseded_at (a predecessor superseded by a new active owner).
+    this.releaseNameOwnership({ normalizedNameNot: { name: norm.normalized, exceptLogicalId: logicalId } }, true, now);
     this.db.prepare(`INSERT INTO name_ownership (logical_identity_id, normalized_name, display_name, owner_secret_hash, name_state, current_session_id, superseded_at, created_at, updated_at)
                      VALUES (?,?,?,?, 'active', ?, NULL, ?, ?)
                      ON CONFLICT(logical_identity_id) DO UPDATE SET normalized_name=excluded.normalized_name, display_name=excluded.display_name, owner_secret_hash=excluded.owner_secret_hash, name_state='active', current_session_id=excluded.current_session_id, superseded_at=NULL, updated_at=excluded.updated_at`)
       .run(logicalId, norm.normalized, norm.display, hash, canonicalSessionId, now, now);
+    // BETA.10 WS1 R3: a FIRST protected award (fresh secret minted) is an identity-AUTHORITY
+    // transition (credential birth) → hash-chained ledger, closing the "award only audited" gap.
+    // NEVER the secret in the payload (only ids/name) — D7 invariant.
+    if (freshlyMinted) {
+      this.ledger('name.awarded', canonicalSessionId, { sessionId: canonicalSessionId }, { name: norm.display });
+    }
     return { ownerSecret: plaintext };
   }
 
   /** Mirror a name RELEASE (pending/unnamed/retired) into name_ownership for a logical identity.
    *  The owner_secret_hash is PRESERVED (a released name keeps its secret so the same identity
-   *  can re-acquire), only the routing (normalized_name/state) is cleared. */
+   *  can re-acquire), only the routing (normalized_name/state) is cleared. Routes through the ONE
+   *  release primitive (R2) so released-column semantics can never diverge. */
   private setNameOwnershipReleased(logicalId: string, now: string): void {
-    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, updated_at=? WHERE logical_identity_id=?`).run(now, logicalId);
+    this.releaseNameOwnership({ logicalId }, false, now);
   }
 
-  private nextFencingToken(): number {
-    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
-    return (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
+  /**
+   * BETA.10 WS1 R2 — THE single name-ownership RELEASE primitive. Every release (predecessor-
+   * supersede, standalone pending/unnamed release, and any future path) flows through here so the
+   * released-column treatment (name_state='released', normalized_name=NULL) is byte-identical
+   * everywhere — a future change to "released" semantics cannot silently skip one caller. The ONLY
+   * per-caller parameters are (a) the WHERE predicate and (b) whether superseded_at is stamped (a
+   * predecessor superseded by a new active owner stamps it; a self-release does not). owner_secret_hash
+   * is always PRESERVED (a released identity keeps its secret so it can re-acquire). Must run inside
+   * the caller's transaction.
+   */
+  private releaseNameOwnership(
+    where: { logicalId: string } | { normalizedNameNot: { name: string; exceptLogicalId: string } },
+    markSuperseded: boolean,
+    now: string,
+  ): void {
+    const supersededSet = markSuperseded ? 'superseded_at=?, ' : '';
+    if ('logicalId' in where) {
+      const params = markSuperseded ? [now, now, where.logicalId] : [now, where.logicalId];
+      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, ${supersededSet}updated_at=? WHERE logical_identity_id=?`).run(...params);
+    } else {
+      const params = markSuperseded ? [now, now, where.normalizedNameNot.name, where.normalizedNameNot.exceptLogicalId] : [now, where.normalizedNameNot.name, where.normalizedNameNot.exceptLogicalId];
+      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, ${supersededSet}updated_at=? WHERE normalized_name=? AND logical_identity_id<>? AND name_state IN ('active','pending')`).run(...params);
+    }
   }
 
   private nextEpochToken(): string {
