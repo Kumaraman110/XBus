@@ -292,12 +292,25 @@ describe('unregisterUserScope — ownership-scoped removal across both files', (
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined();
   });
 
-  it('does NOT remove an UNTAGGED user-authored hook that references our hook entry (scoped)', () => {
-    // A user manually added a hook invoking our hook-entry.js, WITHOUT an owner tag.
+  it('BETA.10 (ADR 0036): REMOVES a host-stripped (untagged) XBus hook at OUR install entry path on uninstall', () => {
+    // Claude re-serializes settings.json and drops the non-standard _xbusOwner tag, leaving an
+    // orphaned XBus hook pointing at OUR install-dir entry path (HOOK_JS). Pre-beta.10 the scoped
+    // uninstall skipped it (tag-only match) → the orphan survived uninstall and a bare `claude` kept
+    // announcing hook-only sessions for a removed product. The activation-honesty spec forbids that:
+    // an untagged handler matching OUR entry PATH is unambiguously ours (a user would not wire our
+    // private install-dir dist path themselves) and MUST be removed on uninstall.
     writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: NODE, args: [HOOK_JS] }] }] } });
     const u = unregisterUserScope(opts({ installId: 'mine' }));
-    expect(u.removed).toBe(false); // nothing of OURS (tagged 'mine') present → no-op
-    expect(JSON.stringify(readClaudeSettings(settingsPath)!.hooks)).toContain('hook-entry.js'); // user's hook kept
+    expect(u.removed).toBe(true);
+    expect(JSON.stringify(readClaudeSettings(settingsPath)?.hooks ?? {})).not.toContain('hook-entry.js'); // orphan removed
+  });
+
+  it('does NOT remove a hook at a DIFFERENT (non-XBus) entry path', () => {
+    // A genuinely user-authored hook that does NOT reference an XBus install entry is preserved.
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: NODE, args: ['C:/user/their-own-hook.js'] }] }] } });
+    const u = unregisterUserScope(opts({ installId: 'mine' }));
+    expect(u.removed).toBe(false);
+    expect(JSON.stringify(readClaudeSettings(settingsPath)?.hooks ?? {})).toContain('their-own-hook.js');
   });
 });
 

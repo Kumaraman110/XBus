@@ -212,7 +212,19 @@ export class McpServer {
       });
       return;
     }
-    if (method === 'notifications/initialized') return;
+    if (method === 'notifications/initialized') {
+      // BETA.10 (ADR 0036) — EAGER mcp-component registration. Historically the mcp component
+      // registered LAZILY (only on the first xbus_* tool call via ensureBroker), so a healthy
+      // plugin-loaded session whose first turn calls no tool had NO mcp component by its first Stop
+      // → the Stop-hook activation check misfired a FALSE "plugin did NOT load — run xclaude"
+      // (DEGRADED_HOOK_ONLY) at a correctly-launched user. Registering here — the client's
+      // "initialized" signal — makes the plugin-loaded fact true on the broker BEFORE any Stop, so
+      // mcpComponentPresence(session).ever is true for every loaded session regardless of tool use.
+      // Best-effort + non-blocking: a briefly-unreachable broker must never wedge the MCP handshake;
+      // ensureBroker swallows connect failures and a later tool call retries. Fire-and-forget.
+      void this.ensureBroker().catch(() => { /* lazy tool-call path will retry; never block init */ });
+      return;
+    }
     if (method === 'tools/list') {
       this.send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
       return;

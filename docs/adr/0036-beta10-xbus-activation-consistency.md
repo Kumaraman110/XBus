@@ -57,6 +57,27 @@ argue against silently switching everyone's activation model). So:
 - `DEGRADED_HOOK_ONLY` — retained ONLY as an explicit, reported state (a hook-only session that has
   announced but has no mcp capability) — never presented as normal/connected.
 
+## Detection input must be RELIABLE — eager MCP registration (the lazy-registration caveat)
+Deferring detection to Stop dodges the SessionStart connect-LATENCY race, but it introduced a
+CONVERSE hazard: the MCP server historically registered its `mcp` component LAZILY (only on the
+first `xbus_*` tool call, via ensureBroker). So a healthy, plugin-loaded `xclaude` session whose
+FIRST turn calls no tool had NO mcp component by its first Stop → the check misfired a FALSE
+`DEGRADED_HOOK_ONLY` ("plugin did NOT load — run xclaude") at a correctly-launched user, and burned
+the once-per-epoch emission. "Registered by Stop if it ever will" was FALSE because registration is
+tool-triggered, not eager. FIX: the MCP server registers EAGERLY at `notifications/initialized`
+(best-effort, non-blocking — a briefly-unreachable broker never wedges the handshake; the tool-call
+path still retries), so `mcpComponentPresence(session).ever` is true for every loaded session before
+any Stop. A future maintainer must NOT revert to lazy-only registration — the Stop-time detection's
+correctness DEPENDS on eager registration making the "plugin loaded" fact true independent of tool use.
+
+## Uninstall removes host-stripped orphans by ENTRY PATH (not just owner tag)
+Claude re-serializes `settings.json` and drops the non-standard `_xbusOwner` tag, so a scoped
+(installId) uninstall that matched only by tag left an orphaned XBus SessionStart hook — a bare
+`claude` then kept announcing hook-only sessions for a removed product (the exact split-state, now
+post-uninstall). FIX: on uninstall, `stripHooks` also removes an UNTAGGED handler whose entry PATH
+matches THIS install's dist entry (unambiguously ours — a user would not wire our private install-dir
+path). A handler bearing a DIFFERENT install's tag, or at a non-XBus path, is preserved.
+
 ## Honesty rules
 - The hook must NOT report a bare-`claude` session as "connected"; if the MCP marker is absent it
   reports `PLUGIN_NOT_LOADED` with the canonical relaunch command.

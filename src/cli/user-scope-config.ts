@@ -269,13 +269,21 @@ function stripHooks(s: ClaudeSettings, o: UserScopeOptions, ownerToMatch: string
     const cleaned = groups.map((g) => ({
       ...g,
       hooks: (g.hooks ?? []).filter((h) => {
-        // Remove ONLY a handler that is ours AND (matches the owner, or — for the
-        // unowned-legacy case — only when we are doing an unscoped strip). An UNTAGGED
-        // handler authored by the USER (even if it references our entry) is preserved
-        // on a scoped (installId) uninstall.
+        // Remove a handler that is ours (matched by ENTRY PATH via isXbusHookHandler — the command/
+        // args point at THIS install's plugin dist entries) AND one of:
+        //  - unscoped strip (ownerToMatch === null): remove any XBus-path handler; or
+        //  - it carries OUR install tag (tag === ownerToMatch); or
+        //  - BETA.10 (ADR 0036): it is UNTAGGED (tag === undefined) — the HOST-STRIPPED-owner case.
+        //    Claude re-serializes settings.json and drops the non-standard _xbusOwner tag, leaving an
+        //    orphaned XBus SessionStart hook that a scoped uninstall previously skipped → it survived
+        //    uninstall and a bare `claude` kept announcing hook-only sessions for a removed product.
+        //    The activation-honesty spec forbids that, so remove an untagged handler that matches OUR
+        //    entry PATH (unambiguously ours — a user would not independently wire our install-dir
+        //    dist path). A handler bearing a DIFFERENT install's tag (tag !== ownerToMatch, defined)
+        //    is NOT ours to remove and is preserved.
         const ours = isXbusHookHandler(h, o);
         const tag = h[XBUS_OWNER_TAG] as string | undefined;
-        const remove = ours && (ownerToMatch === null ? true : tag === ownerToMatch);
+        const remove = ours && (ownerToMatch === null || tag === ownerToMatch || tag === undefined);
         if (remove) changed = true;
         return !remove;
       }),
