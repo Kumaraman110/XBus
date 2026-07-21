@@ -34,6 +34,7 @@ export default tseslint.config(
       'examples/**', // standalone synthetic samples (e.g. contract-review); outside the TS project, like docs/**
       'eslint.config.js', // this config; not part of the TS project
       'vitest.config.ts', // tooling config; not in tsconfig `include`
+      'vitest.hosted.config.ts', // beta.10 hosted-CI tooling config; not in tsconfig `include` (same class as vitest.config.ts)
       '.lint-tmp/**', // local lint-triage scratch; never committed
       'src/broker/dashboard/static/**', // beta.5 inert browser UI (vanilla JS/HTML/CSS) — a
       // dashboard CLIENT, not part of the compiled TS product (tsconfig include is *.ts), so

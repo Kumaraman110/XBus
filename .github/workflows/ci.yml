@@ -46,14 +46,20 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Unit + the hosted-safe integration shards. NOTE: some integration/e2e tests are Windows-only
-      # (icacls/named-pipe ACLs) or spawn a real broker / managed child, and the artifact/release
-      # acceptance is local-only — see docs/ci-scope.md for the full exclusion list + rationale.
+      # Unit shards are entirely OS-agnostic — run the whole tests/unit dir.
       - name: Unit tests
         run: npm run test:unit
 
+      # HOSTED-SAFE integration shards ONLY, via an EXPLICIT allow-list (vitest.hosted.config.ts →
+      # tests/integration-scope.ts HOSTED_SAFE_INTEGRATION). This is fail-closed: Windows-only,
+      # artifact/release, and real-broker/managed-child/liveness shards (install-db-rollback,
+      # artifact-first-install, installer, install-user-scope, bundled-*, singleton, perf-objectives,
+      # …) are NOT selected here — they stay on the Windows/Reliability/Release lane via the full
+      # `test:integration`. A new, unclassified integration test is not run here and the drift guard
+      # (hosted-scope-guard.test.ts) fails until it is classified. See docs/ci-scope.md.
+      # Invoked directly through the locked vitest dev-dependency (no package.json change).
       - name: Integration tests (hosted-safe)
-        run: npm run test:integration
+        run: npx vitest run --config vitest.hosted.config.ts
 
       # Dependency audit per the project's release policy (fail on a real advisory).
       - name: Dependency audit

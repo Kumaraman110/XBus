@@ -6,10 +6,24 @@ Ubuntu runner under the approved Node (`22.13.x`, within the `>=22.13 <25` floor
 
 ## Runs in hosted CI
 - `npm ci` (locked install), `typecheck`, `lint`, `build`
-- `test:unit` — pure/unit shards
-- `test:integration` — the broker/store/delivery/migration/dashboard-server integration shards that
-  are OS-agnostic and use a temp SQLite DB + in-process broker (no admin, no real network)
+- `test:unit` — pure/unit shards (entirely OS-agnostic; whole `tests/unit` dir)
+- HOSTED-SAFE **integration** shards ONLY — the broker/store/delivery/migration/dashboard-server
+  shards that are OS-agnostic and use a temp SQLite DB + in-process broker (no admin, no real
+  network, no `.cmd`, no artifact assembly, no real install). Selected by an **explicit allow-list**,
+  NOT the whole `tests/integration` dir (see Enforcement below).
 - `npm audit --omit=dev --audit-level=high`
+
+## Enforcement (how the hosted scope is made exact — beta.10 Option A)
+The hosted lane does NOT run `npm run test:integration` (whole dir). It runs
+`npx vitest run --config vitest.hosted.config.ts`, whose `include` is the explicit
+`HOSTED_SAFE_INTEGRATION` list in `tests/integration-scope.ts` (the single source of truth: every
+integration test is classified `HOSTED_SAFE` or `LOCAL_ONLY` + reason). This is **fail-closed**: a
+new/unclassified integration test is NOT selected on the hosted lane, and the drift guard
+`tests/integration/hosted-scope-guard.test.ts` (itself hosted-safe) FAILS until it is classified —
+so a test can never silently fall into an undefined category. The full `test:integration` (whole
+dir) is UNCHANGED and remains the Windows / Reliability / Release-Engineer lane: the local-only
+shards below are still collected, run, and required there — they are not skipped; the hosted lane
+merely does not select them.
 
 ## Deliberately NOT in hosted CI (documented exclusions)
 - **Windows-only tests** — the secure-IPC ACL suite (`icacls`, named-pipe DACLs) and any
