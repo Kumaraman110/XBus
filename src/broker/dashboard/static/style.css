@@ -121,12 +121,12 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 /* ── LIQUID GLASS material — applied to every panel via a shared .glass-ish set of
    selectors. 3 layers: ::before = isolated blur (crisp text), ::after = aberration
    edge, content on top. ── */
-.threads-pane, .thread-pane, .sessions-section, #ledger, .banner, .error-banner, .audit{
+.threads-pane, .thread-pane, .sessions-section, #ledger, .error-banner, .audit{
   position:relative; isolation:isolate; border-radius:var(--r); box-shadow:var(--shadow);
   border:none; background:transparent;
 }
 .threads-pane::before, .thread-pane::before, .sessions-section::before, #ledger::before,
-.banner::before, .error-banner::before, .audit::before{
+.error-banner::before, .audit::before{
   content:""; position:absolute; inset:0; z-index:-1; border-radius:inherit;
   background:var(--glass-fill);
   -webkit-backdrop-filter:var(--glass-filter); backdrop-filter:var(--glass-filter);
@@ -202,10 +202,9 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 
 /* ── main + banners ── */
 main{ margin:0; padding:0 0 var(--sp4); }
-.banner, .error-banner{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
-  font-size:13px; color:var(--text-2); border-left:3px solid var(--warn); }
-.error-banner{ border-left-color:var(--err); color:var(--text-1); }
-.banner[hidden], .error-banner[hidden]{ display:none; }
+.error-banner{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
+  font-size:13px; border-left:3px solid var(--err); color:var(--text-1); }
+.error-banner[hidden]{ display:none; }
 .audit{ margin:var(--sp4) 0 0; padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
   font:400 12px/1.5 var(--font-mono); color:var(--text-3); border-left:3px solid var(--glass-border); }
 .audit:empty{ display:none; }
@@ -271,6 +270,9 @@ button.secondary{ background:var(--accent-soft); color:var(--text-1); box-shadow
 .turn-state{ font:500 11px/1 var(--font-mono); margin-top:8px; display:inline-flex; align-items:center; gap:6px; }
 .state-queued{ color:var(--st-queued); } .state-delivered{ color:var(--st-delivered); }
 .state-acknowledged{ color:var(--st-ack); } .state-replied{ color:var(--ok); } .state-failed{ color:var(--st-failed); }
+/* Beta.10 (Train B): the derived distinct timeline states. injected reuses the delivered accent;
+ * reply-pending reuses the ack accent; expired reuses the failed accent (deadline blew). */
+.state-injected{ color:var(--st-delivered); } .state-reply-pending{ color:var(--st-ack); } .state-expired{ color:var(--st-failed); }
 .retry-btn{ margin-left:8px; font:500 10.5px/1 var(--font-ui); color:var(--st-failed); background:var(--st-failed-bg);
   border:1px solid var(--st-failed-ln); border-radius:var(--r-sm); padding:4px 9px; }
 
@@ -420,3 +422,135 @@ a:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visi
   *, *::before, *::after{ animation:none !important; transition:none !important; }
   body::before{ animation:none; }
 }
+
+/* ══════════════ Beta.10 (Train B): agent management — roster toolbar, inspector, actions ══════════════ */
+
+/* Roster toolbar: search + filter selects + collections manager. Reuses the glass/field tokens. */
+.roster-toolbar{ display:flex; flex-wrap:wrap; gap:var(--sp3); align-items:center; margin:0 0 var(--sp3); }
+.roster-toolbar .roster-search{ flex:1 1 220px; min-width:180px; }
+.roster-search, .roster-filter{
+  font:500 13px/1 var(--font-ui); color:var(--text-1); background:var(--field);
+  border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:10px 12px; }
+.roster-search:focus-visible, .roster-filter:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* A "Manage" link in the row is a link-btn variant already; add a little spacing when paired. */
+.manage-btn{ margin-right:6px; }
+
+/* Inspector panel — a glass card, same family as the panels. */
+.inspector{ position:relative; padding:var(--sp5); margin:0 0 var(--sp4);
+  background:var(--glass-fill); border:1px solid var(--glass-border); border-radius:var(--r);
+  -webkit-backdrop-filter:var(--glass-filter); backdrop-filter:var(--glass-filter); }
+.inspector[hidden]{ display:none; }
+.insp-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--sp4); }
+.insp-title{ margin:0; font:600 16px/1.2 var(--font-display); color:var(--text-1); }
+.insp-close{ flex:0 0 auto; }
+.insp-facts{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:var(--sp2) var(--sp5); margin-bottom:var(--sp4); }
+.insp-fact{ display:flex; flex-direction:column; gap:2px; }
+.insp-k{ font:600 10px/1 var(--font-ui); letter-spacing:.1em; text-transform:uppercase; color:var(--text-3); }
+.insp-v{ font:500 13px/1.4 var(--font-mono); color:var(--text-1); word-break:break-all; }
+
+/* Collections membership chips (toggle). */
+.insp-collections{ margin-bottom:var(--sp4); }
+.insp-collections .insp-k{ display:block; margin-bottom:var(--sp2); }
+.chips{ display:flex; flex-wrap:wrap; gap:var(--sp2); }
+.chip-toggle{ cursor:pointer; border:1px solid var(--glass-border); background:var(--accent-soft);
+  color:var(--text-2); padding:6px 10px; border-radius:var(--r-pill); font:500 12px/1 var(--font-mono); }
+.chip-toggle.on{ color:var(--accent-ink); border-color:var(--accent-line); background:var(--accent); }
+.chip-toggle:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* Action row: buttons + the receive-control select. */
+.insp-actions{ display:flex; flex-wrap:wrap; gap:var(--sp2); align-items:center; padding-top:var(--sp4); border-top:1px solid var(--glass-border); }
+.insp-action{ font:600 12px/1 var(--font-ui); padding:9px 14px; border-radius:var(--r-sm);
+  background:var(--accent-soft); color:var(--text-1); border:1px solid var(--glass-border); cursor:pointer; }
+.insp-action:hover:not(:disabled){ border-color:var(--accent-line); }
+.insp-action.danger{ color:var(--err); border-color:color-mix(in oklab, var(--err) 40%, transparent); }
+.insp-action:disabled{ opacity:.5; cursor:not-allowed; }
+.insp-action:focus-visible, .insp-control-select:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+.insp-control{ display:inline-flex; align-items:center; gap:6px; font:600 10px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--text-3); }
+.insp-control-select{ font:500 12px/1 var(--font-ui); color:var(--text-1); background:var(--field); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:8px 10px; }
+.gated-note{ margin-left:6px; font:500 10px/1 var(--font-ui); color:var(--text-3); font-style:italic; }
+
+/* Action status line (pending/success/failure). Color never carries meaning alone (text too). */
+.insp-status{ margin-top:var(--sp3); min-height:18px; font:500 12px/1.4 var(--font-ui); color:var(--text-2); }
+.insp-status.pending{ color:var(--text-2); }
+.insp-status.ok{ color:var(--ok); }
+.insp-status.err{ color:var(--err); }
+.insp-status.muted{ color:var(--text-3); }
+
+/* Minimal modal (collections manager). */
+.modal-overlay{ position:fixed; inset:0; background:rgba(0,0,0,.5); display:flex; align-items:center; justify-content:center; z-index:100; padding:var(--sp4); }
+.modal{ width:min(480px,100%); max-height:80vh; overflow:auto; padding:var(--sp5);
+  background:var(--glass-fill-2,var(--glass-fill)); border:1px solid var(--glass-border); border-radius:var(--r); box-shadow:var(--shadow); }
+.modal-head{ display:flex; justify-content:space-between; align-items:center; margin-bottom:var(--sp4); }
+.modal-head h3{ margin:0; font:600 15px/1 var(--font-display); color:var(--text-1); }
+.coll-add{ display:flex; gap:var(--sp2); margin-bottom:var(--sp4); }
+.coll-add input{ flex:1; font:500 13px/1 var(--font-ui); color:var(--text-1); background:var(--field); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:9px 12px; }
+button.primary{ background:var(--accent); color:var(--accent-ink); border:none; padding:9px 16px; border-radius:var(--r-sm); font:600 12px/1 var(--font-ui); cursor:pointer; }
+.coll-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:var(--sp2); }
+.coll-list li{ display:flex; align-items:center; gap:var(--sp2); }
+.coll-name{ flex:1; font:500 13px/1 var(--font-mono); color:var(--text-1); }
+.link-btn.danger{ color:var(--err); }
+
+/* Beta.10 (Train B): thread "needs attention" flags + timeline header attention + last-activity. */
+.attn{ margin-left:6px; font:600 10px/1 var(--font-mono); padding:2px 6px; border-radius:var(--r-pill); }
+.attn-failed{ color:var(--st-failed); background:var(--st-failed-bg); }
+.attn-expired{ color:var(--st-failed); background:var(--st-failed-bg); }
+.attn-stalled{ color:var(--st-queued); background:var(--st-queued-bg); }
+.attn-text{ color:var(--st-failed) !important; }
+.last-activity{ font:500 12px/1 var(--font-mono); color:var(--text-3); white-space:nowrap; }
+
+/* Beta.10 (Train B): inspector Work panel — failures + pending work made prominent. */
+.insp-work{ margin:var(--sp3) 0; padding:var(--sp3) var(--sp4); border-radius:var(--r-sm);
+  background:var(--glass-fill); border:1px solid var(--glass-border); }
+.insp-work-head{ display:flex; align-items:baseline; gap:var(--sp3); flex-wrap:wrap; margin-bottom:var(--sp2); }
+.insp-work-attn{ font:600 12px/1.3 var(--font-ui); color:var(--text-2); }
+.insp-work-attn.err{ color:var(--st-failed); }
+.insp-work-attn.ok{ color:var(--ok); }
+.insp-work-tiles{ display:grid; grid-template-columns:repeat(5,1fr); gap:var(--sp2); }
+.work-tile{ display:flex; flex-direction:column; align-items:center; gap:2px; padding:var(--sp2) 4px; border-radius:var(--r-sm); background:var(--field); }
+.work-n{ font:700 16px/1 var(--font-display); color:var(--text-1); }
+.work-l{ font:500 9.5px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--text-3); }
+.work-tile.work-zero .work-n{ color:var(--text-3); }
+.work-tile.work-alert{ background:var(--st-failed-bg); }
+.work-tile.work-alert .work-n{ color:var(--st-failed); }
+@media(max-width:560px){ .insp-work-tiles{ grid-template-columns:repeat(3,1fr); } }
+
+/* Beta.10 (Train B): top-level stalled/unanswered-work banner (roster attention rollup). */
+.attention-banner{ display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp2) var(--sp4);
+  margin:0 0 var(--sp3); padding:var(--sp3) var(--sp5); border-radius:var(--r-sm);
+  background:var(--st-failed-bg); border-left:3px solid var(--st-failed); }
+.attention-banner[hidden]{ display:none; }
+.attn-banner-head{ font:600 13px/1.3 var(--font-ui); color:var(--st-failed); }
+.attn-banner-sub{ font:500 12px/1.3 var(--font-mono); color:var(--text-2); }
+.attn-banner-chips{ display:inline-flex; flex-wrap:wrap; gap:6px; align-items:center; }
+.attn-chip{ font:500 11px/1 var(--font-mono); color:var(--text-1); background:var(--field);
+  border:1px solid var(--glass-border); border-radius:var(--r-pill); padding:5px 10px; cursor:pointer; }
+.attn-chip:hover{ border-color:var(--accent-line); }
+.attn-chip:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
+
+/* Beta.10 (Train B) pre-staged (WS1): system-health panel (#5), instance history (#2), redeliver (#1). */
+.health-panel{ margin:0 0 var(--sp4); padding:var(--sp4) var(--sp5); border-radius:var(--r);
+  background:var(--glass-fill); border:1px solid var(--glass-border); }
+.health-panel[hidden]{ display:none; }
+.sec-note.err{ color:var(--st-failed); }
+.health-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:var(--sp2) var(--sp5); margin-top:var(--sp2); }
+.health-cell{ display:flex; flex-direction:column; gap:2px; }
+.health-k{ font:600 10px/1 var(--font-ui); letter-spacing:.1em; text-transform:uppercase; color:var(--text-3); }
+.health-v{ font:500 13px/1.4 var(--font-mono); color:var(--text-1); }
+.health-v.err{ color:var(--st-failed); }
+.insp-instances{ margin:var(--sp3) 0; }
+.insp-instances .insp-k{ display:block; margin-bottom:var(--sp2); }
+.inst-list{ display:flex; flex-direction:column; gap:4px; }
+.inst-row{ display:flex; flex-wrap:wrap; align-items:center; gap:var(--sp3); padding:6px 10px; border-radius:var(--r-sm); background:var(--field); font:500 12px/1 var(--font-mono); }
+.inst-row.inst-current{ border-left:2px solid var(--ok); }
+.inst-role{ font-weight:700; color:var(--text-1); text-transform:uppercase; letter-spacing:.05em; }
+.inst-state{ color:var(--text-2); }
+.state-inst-connected{ color:var(--ok); } .state-inst-disconnected{ color:var(--text-3); }
+.inst-pid, .inst-when{ color:var(--text-3); }
+.inst-badge{ font:600 9.5px/1 var(--font-ui); letter-spacing:.08em; text-transform:uppercase; color:var(--ok); background:var(--accent-soft); padding:3px 7px; border-radius:var(--r-pill); }
+.redeliver-btn{ margin-left:8px; font:500 10.5px/1 var(--font-ui); color:var(--st-delivered); background:var(--st-delivered-bg); border:1px solid var(--glass-border); border-radius:var(--r-sm); padding:5px 10px; cursor:pointer; }
+.redeliver-btn:hover{ border-color:var(--accent-line); }
+
+/* Beta.10 (Train B): clear-all-filters affordance in the roster toolbar. */
+.roster-clear{ margin-left:auto; } /* push to the right end of the flex toolbar */
+.state-cell .link-btn{ margin-left:4px; }

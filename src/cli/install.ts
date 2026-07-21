@@ -24,7 +24,7 @@ import { XBUS_VERSION } from '../protocol/version.js';
 import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, type InstallManifest } from '../launcher/install-paths.js';
 import { validateArtifact } from '../shared/artifact-contract.js';
 import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
-import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath } from './user-scope-config.js';
+import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, setPersistentEnable, clearPersistentEnable } from './user-scope-config.js';
 import { SCHEMA_VERSION } from '../protocol/handshake.js';
 import { snapshotDbCheckpointed, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
 import { openDatabase } from '../database/connection.js';
@@ -106,6 +106,13 @@ export interface InstallOptions {
    *  plain `claude` discovers it (no --plugin-dir). Default true. Tests/CI may set
    *  false (plugin-only install) or point `claudeConfigPath` at a temp file. */
   registerUserScope?: boolean;
+  /** BETA.10 (ADR 0036): OPT-IN persistent plugin enablement. When true, ALSO write
+   *  {"enabledPlugins": {"xbus": true}} into the user settings.json so a NORMAL `claude` launch
+   *  loads XBus (not just `xclaude`). OFF by default — the default install NEVER mutates persistent
+   *  Claude plugin activation. Idempotent; transactional; removed on uninstall. */
+  persistent?: boolean;
+  /** Force-take the enabledPlugins.xbus key even if a conflicting non-true value exists. */
+  forcePersistent?: boolean;
   /** Override the user Claude MCP config path (tests). Default: platform ~/.claude.json. */
   claudeConfigPath?: string;
   /** Override the user Claude SETTINGS path where hooks live (tests). Default:
@@ -437,6 +444,18 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
       };
       const usr = registerUserScope(usrOpts);
       if (usr.ok) userScopeToReverse = usrOpts; // arm the rollback for any LATER throw
+      // BETA.10 (ADR 0036): OPT-IN persistent enablement. Only when explicitly requested; the
+      // default install leaves persistent Claude plugin config untouched. Transactional + reversible;
+      // a failure here rolls the whole install back (never leave a half-applied persistent state).
+      if (usr.ok && opts.persistent === true) {
+        const pe = setPersistentEnable(settingsPath, opts.forcePersistent === true ? { force: true } : {});
+        if (!pe.ok) {
+          const partial: InstallManifest = { schema: 1, name: 'xbus', version: XBUS_VERSION, commit: readCommit(source), buildId: BUILD_ID, installedAt: now, installRoot, pluginDir, dataDir, files, backups };
+          if (userScopeToReverse) { try { unregisterUserScope(userScopeToReverse); } catch { /* best effort */ } }
+          const { rb, dbNote } = restoreDbThenRollback(partial);
+          return { ok: false, dryRun: false, plan, rolledBack: rb, error: `persistent enablement failed: ${pe.error}${dbNote}` };
+        }
+      }
       if (!usr.ok) {
         const partial: InstallManifest = { schema: 1, name: 'xbus', version: XBUS_VERSION, commit: readCommit(source), buildId: BUILD_ID, installedAt: now, installRoot, pluginDir, dataDir, files, backups };
         const { rb, dbNote } = restoreDbThenRollback(partial);
@@ -591,6 +610,15 @@ export function uninstall(opts: UninstallOptions = {}): UninstallResult {
         installId: manifest.installId,
       });
       if (u.removed) removed.push(`user-scope:${manifest.userScope.configPath}`);
+      // BETA.10 (ADR 0036): ALWAYS clear the persistent enablement on uninstall (removes ONLY the
+      // xbus enabledPlugins entry; other plugins/keys untouched; deletes an empty {} rather than
+      // leaving a bare object). Idempotent — a no-op if it was never opted in. This prevents a
+      // stale enabledPlugins.xbus surviving an uninstall (which would keep a bare `claude` trying to
+      // load a removed plugin). SessionStart hook removal is handled by unregisterUserScope above.
+      try {
+        const pc = clearPersistentEnable(manifest.userScope.settingsPath);
+        if (pc.changed) removed.push(`enabledPlugins:${manifest.userScope.settingsPath}`);
+      } catch { couldNotRemove.push(`enabledPlugins:${manifest.userScope.settingsPath}`); }
     } catch { couldNotRemove.push(`user-scope:${manifest.userScope.configPath}`); }
   }
   for (const target of toRemove) {

@@ -63,8 +63,15 @@ export interface HookGroup { matcher?: string; hooks: HookHandler[]; }
 /** The user settings file (~/.claude/settings.json). Unknown keys preserved. */
 export interface ClaudeSettings {
   hooks?: Record<string, HookGroup[]>;
+  /** BETA.10 (ADR 0036) persistent opt-in: {"enabledPlugins": {"xbus": true}} makes a normal
+   *  `claude` launch load the XBus plugin (MCP + hooks). Off by default; only written by
+   *  `xbus install --persistent`. Value shape follows Claude Code's plugin-enablement map. */
+  enabledPlugins?: Record<string, boolean>;
   [k: string]: unknown;
 }
+
+/** The plugin name XBus enables persistently (matches .claude-plugin/plugin.json `name`). */
+export const XBUS_PLUGIN_NAME = 'xbus';
 
 export interface UserScopeOptions {
   /** Path to the user MCP config (~/.claude.json). */
@@ -262,13 +269,21 @@ function stripHooks(s: ClaudeSettings, o: UserScopeOptions, ownerToMatch: string
     const cleaned = groups.map((g) => ({
       ...g,
       hooks: (g.hooks ?? []).filter((h) => {
-        // Remove ONLY a handler that is ours AND (matches the owner, or — for the
-        // unowned-legacy case — only when we are doing an unscoped strip). An UNTAGGED
-        // handler authored by the USER (even if it references our entry) is preserved
-        // on a scoped (installId) uninstall.
+        // Remove a handler that is ours (matched by ENTRY PATH via isXbusHookHandler — the command/
+        // args point at THIS install's plugin dist entries) AND one of:
+        //  - unscoped strip (ownerToMatch === null): remove any XBus-path handler; or
+        //  - it carries OUR install tag (tag === ownerToMatch); or
+        //  - BETA.10 (ADR 0036): it is UNTAGGED (tag === undefined) — the HOST-STRIPPED-owner case.
+        //    Claude re-serializes settings.json and drops the non-standard _xbusOwner tag, leaving an
+        //    orphaned XBus SessionStart hook that a scoped uninstall previously skipped → it survived
+        //    uninstall and a bare `claude` kept announcing hook-only sessions for a removed product.
+        //    The activation-honesty spec forbids that, so remove an untagged handler that matches OUR
+        //    entry PATH (unambiguously ours — a user would not independently wire our install-dir
+        //    dist path). A handler bearing a DIFFERENT install's tag (tag !== ownerToMatch, defined)
+        //    is NOT ours to remove and is preserved.
         const ours = isXbusHookHandler(h, o);
         const tag = h[XBUS_OWNER_TAG] as string | undefined;
-        const remove = ours && (ownerToMatch === null ? true : tag === ownerToMatch);
+        const remove = ours && (ownerToMatch === null || tag === ownerToMatch || tag === undefined);
         if (remove) changed = true;
         return !remove;
       }),
@@ -445,4 +460,85 @@ export function inspectUserScopeHooks(
     out[ev] = { registered: entry !== null, entry, owned, command };
   }
   return { settingsPath, events: out };
+}
+
+// ── BETA.10 (ADR 0036) persistent enablement opt-in ─────────────────────────────
+// `xbus install --persistent` writes {"enabledPlugins": {"xbus": true}} into the user settings.json
+// so a NORMAL `claude` launch loads the XBus plugin (MCP + hooks). OFF by default — only this
+// explicit op writes it. Transactional (backup → atomic tmp+rename → validate → rollback),
+// byte-exact-preserving of every other key, and OWNERSHIP-AWARE: uninstall removes ONLY the `xbus`
+// enabledPlugins entry it added, and refuses to clobber a conflicting non-true value without force.
+
+export interface PersistentPlan {
+  settingsPath: string;
+  property: string; // "enabledPlugins.xbus"
+  value: boolean; // true
+  alreadyEnabled: boolean; // entry already true (idempotent no-op)
+  conflict: boolean; // present but not true — we refuse to overwrite silently
+  conflictValue?: unknown;
+  createsFile: boolean; // no prior settings.json
+}
+
+/** Compute the persistent-enablement plan WITHOUT mutating anything (drives `--dry-run --json`). */
+export function planPersistentEnable(settingsPath: string): PersistentPlan {
+  const s = readClaudeSettings(settingsPath);
+  const cur = s?.enabledPlugins?.[XBUS_PLUGIN_NAME];
+  const conflict = cur !== undefined && cur !== true;
+  return {
+    settingsPath,
+    property: `enabledPlugins.${XBUS_PLUGIN_NAME}`,
+    value: true,
+    alreadyEnabled: cur === true,
+    conflict,
+    ...(conflict ? { conflictValue: cur } : {}),
+    createsFile: !fs.existsSync(settingsPath),
+  };
+}
+
+export interface PersistentResult { ok: boolean; dryRun: boolean; changed: boolean; alreadyEnabled?: boolean; conflict?: boolean; backupPath?: string; error?: string; plan: PersistentPlan; }
+
+/** Enable persistent load (idempotent). Preserves all other settings byte-for-byte; refuses a
+ *  conflicting foreign value unless force. Transactional with rollback on validation failure. */
+export function setPersistentEnable(settingsPath: string, opts: { dryRun?: boolean; force?: boolean } = {}): PersistentResult {
+  const plan = planPersistentEnable(settingsPath);
+  if (opts.dryRun) return { ok: true, dryRun: true, changed: false, alreadyEnabled: plan.alreadyEnabled, conflict: plan.conflict, plan };
+  if (plan.conflict && !opts.force) {
+    return { ok: false, dryRun: false, changed: false, conflict: true, error: `enabledPlugins.${XBUS_PLUGIN_NAME} already set to a non-true value (${JSON.stringify(plan.conflictValue)}); refusing to overwrite without force`, plan };
+  }
+  if (plan.alreadyEnabled) return { ok: true, dryRun: false, changed: false, alreadyEnabled: true, plan };
+  const cur = readClaudeSettings(settingsPath) ?? {};
+  const next: ClaudeSettings = { ...cur, enabledPlugins: { ...(cur.enabledPlugins ?? {}), [XBUS_PLUGIN_NAME]: true } };
+  let txn: FileTxn | undefined;
+  try {
+    txn = backupAndWrite(settingsPath, next);
+    const reread = readClaudeSettings(settingsPath);
+    if (reread?.enabledPlugins?.[XBUS_PLUGIN_NAME] !== true) throw new Error('post-write validation failed: enabledPlugins.xbus not true');
+    return { ok: true, dryRun: false, changed: true, ...(txn.backup ? { backupPath: txn.backup } : {}), plan };
+  } catch (e) {
+    rollbackTxn(txn);
+    return { ok: false, dryRun: false, changed: false, error: (e as Error).message, plan };
+  }
+}
+
+/** Remove ONLY the `xbus` enabledPlugins entry (uninstall). Leaves other plugins + keys byte-exact;
+ *  deletes an empty enabledPlugins object rather than leaving `{}`. Idempotent (no entry → no-op). */
+export function clearPersistentEnable(settingsPath: string, opts: { dryRun?: boolean } = {}): PersistentResult {
+  const plan = planPersistentEnable(settingsPath);
+  const cur = readClaudeSettings(settingsPath);
+  const present = cur?.enabledPlugins !== undefined && Object.prototype.hasOwnProperty.call(cur.enabledPlugins, XBUS_PLUGIN_NAME);
+  if (opts.dryRun) return { ok: true, dryRun: true, changed: present, plan };
+  if (!cur || !present) return { ok: true, dryRun: false, changed: false, plan };
+  const ep = { ...(cur.enabledPlugins ?? {}) };
+  delete ep[XBUS_PLUGIN_NAME];
+  const next: ClaudeSettings = { ...cur };
+  if (Object.keys(ep).length === 0) delete next.enabledPlugins; // don't leave a bare {}
+  else next.enabledPlugins = ep;
+  let txn: FileTxn | undefined;
+  try {
+    txn = backupAndWrite(settingsPath, next);
+    return { ok: true, dryRun: false, changed: true, ...(txn.backup ? { backupPath: txn.backup } : {}), plan };
+  } catch (e) {
+    rollbackTxn(txn);
+    return { ok: false, dryRun: false, changed: false, error: (e as Error).message, plan };
+  }
 }

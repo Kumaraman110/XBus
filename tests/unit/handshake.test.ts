@@ -56,11 +56,12 @@ describe('checkCompatibility (mixed-version matrix)', () => {
 
   it('ADR 0012/0019 §3: an older-schema client (s5) is rejected upgrade_component by the current broker', () => {
     // Beta.8 bumped SCHEMA_VERSION to 10 (ADR 0027 durable logical identity + name ownership,
-    // migration v10). A still-installed older plugin advertising a lower schema MUST be
-    // told to upgrade rather than be allowed to write against a schema it does not
-    // understand. This is the fail-closed guard the bump buys (ADR 0019 — no
-    // mixed-version operation).
-    expect(SCHEMA_VERSION).toBe(10);
+    // migration v10); beta.10 WS3 (ADR 0034) then made the AUTHORIZED additive s10→s11 bump
+    // (migration v11 — workspace collections + conversation/work model), so the current schema
+    // is 11. A still-installed older plugin advertising a lower schema MUST be told to upgrade
+    // rather than be allowed to write against a schema it does not understand. This is the
+    // fail-closed guard the bump buys (ADR 0019 — no mixed-version operation).
+    expect(SCHEMA_VERSION).toBe(11);
     const beta3 = client({ schemaVersion: 5 });
     const v = checkCompatibility(beta3, broker);
     expect(v.result).toBe('upgrade_component');

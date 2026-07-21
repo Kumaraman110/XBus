@@ -47,11 +47,13 @@
     </div>
   </section>
 
-  <section id="banner" class="banner" hidden></section>
-
   <main>
     <!-- Communication console (beta.6 Phase 2): operator ↔ session threads. -->
     <div class="sec-head"><h2>Console</h2><span class="sec-note">operator ↔ session threads</span></div>
+    <!-- Beta.10 (Train B): top-level stalled/unanswered-work banner. Aggregates per-thread
+         attention (summary-only, no N+1) into "N conversations need attention". Hidden when none;
+         clicking a chip focuses that thread. Populated by app.js from the same threads payload. -->
+    <section id="attention-banner" class="attention-banner" role="status" aria-live="polite" hidden></section>
     <section class="console">
       <div class="console-grid">
         <!-- Left: thread list + "new thread" composer target. -->
@@ -93,7 +95,13 @@
       </div>
     </section>
 
-    <div class="sec-head"><h2 id="sessions-heading">Sessions</h2><span class="sec-note">delivery state by session</span></div>
+    <div class="sec-head"><h2 id="sessions-heading">Agents</h2><span class="sec-note">roster · search, filter, collections, manage</span></div>
+    <!-- Beta.10 (Train B): roster toolbar (search + status/control/collection filters + manage
+         collections). Populated by agents.js; empty + harmless if that module isn't loaded. -->
+    <div id="roster-toolbar" class="roster-toolbar" role="search" aria-label="Agent roster filters"></div>
+    <!-- Agent detail inspector — identity, physical instances, delivery capability, pending work,
+         and the authorized operator actions. Hidden until an agent's "Manage" is clicked. -->
+    <section id="inspector" class="inspector" aria-label="Agent inspector" hidden></section>
     <section class="sessions-section" aria-labelledby="sessions-heading">
       <div class="table-scroll">
         <table id="sessions">
@@ -101,6 +109,7 @@
             <tr>
               <th scope="col">Session</th>
               <th scope="col">Status</th>
+              <th scope="col">Last activity</th>
               <th scope="col">Queued</th>
               <th scope="col">Delivered</th>
               <th scope="col">ACK</th>
@@ -109,7 +118,7 @@
               <th scope="col"><span class="sr-only">Details</span></th>
             </tr>
           </thead>
-          <tbody id="sessions-body"><tr><td colspan="8" class="state-cell">Loading…</td></tr></tbody>
+          <tbody id="sessions-body"><tr><td colspan="9" class="state-cell">Loading…</td></tr></tbody>
         </table>
       </div>
       <div class="tbl-foot">
@@ -119,6 +128,10 @@
         <p id="sessions-hidden-note" class="muted hidden-note" aria-live="polite"></p>
       </div>
     </section>
+
+    <!-- Beta.10 (Train B), #5 pre-staged: system-health panel (build/runtime/ledger/read-worker).
+         Capability-gated on GET /api/health — hidden until WS1 ships it (zero dead controls). -->
+    <section id="health-panel" class="health-panel" aria-label="System health" hidden></section>
 
     <div class="cols-2">
       <div>
@@ -140,6 +153,15 @@
   </main>
   </div>
 
+  <!-- Load order: helper ES modules (collections/timeline/capabilities/prestage) publish their
+       window.XBus* APIs → app (auth + core render, publishes XBusApi/XBusFriendlyStatus) → agents
+       (roster mgmt + inspector; probes caps, consumes the helpers). All external (strict CSP:
+       script-src 'self'; no inline JS). The helpers + agents are ES modules; app.js is classic. -->
+  <script type="module" src="/collections.js"></script>
+  <script type="module" src="/timeline.js"></script>
+  <script type="module" src="/capabilities.js"></script>
+  <script type="module" src="/prestage.js"></script>
   <script src="/app.js"></script>
+  <script type="module" src="/agents.js"></script>
 </body>
 </html>

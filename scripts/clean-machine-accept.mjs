@@ -102,10 +102,21 @@ try {
   }
   log('  all required installed files present');
 
-  // 3) doctor (from installed CLI)
+  // 3) doctor (from installed CLI). NOTE: this runs BEFORE the broker is started (step [6]), so a
+  //    fresh install correctly reports activation=BROKER_UNAVAILABLE. Beta.10 (ADR 0036) gives doctor
+  //    distinct per-state exit codes (CONNECTED=0, BROKER_UNAVAILABLE=12, …), so a pre-start doctor
+  //    now exits 12 BY DESIGN — that is correct, not a failure. Accept the no-broker states here and
+  //    validate the doctor JSON contract instead of asserting exit 0 (connectivity is proven at [6]).
   log('[4] doctor'); r = runCli(installedCli, ['doctor', '--json'], { XBUS_DATA_DIR: dataDir });
-  if (r.code !== 0) fail(`doctor exited ${r.code}: ${r.out.slice(0, 400)}`);
-  log('  doctor ok');
+  const ACCEPT_PRE_START = new Set([0, 12]); // 0=CONNECTED (broker already up), 12=BROKER_UNAVAILABLE (fresh install, expected)
+  if (!ACCEPT_PRE_START.has(r.code)) fail(`doctor exited ${r.code} (expected 0 or 12=BROKER_UNAVAILABLE pre-start): ${r.out.slice(0, 400)}`);
+  { // the doctor JSON contract must hold regardless of broker state (the installed build resolves its
+    // identity). Use parseJsonOut on stdout (a bypass banner may precede the JSON), not raw JSON.parse.
+    const dj = parseJsonOut(r.stdout);
+    if (typeof dj.activation !== 'string') fail(`doctor --json missing activation enum: ${r.stdout.slice(0, 400)}`);
+    if (r.code === 12 && dj.activation !== 'BROKER_UNAVAILABLE') fail(`exit 12 but activation=${dj.activation} (expected BROKER_UNAVAILABLE)`);
+  }
+  log(`  doctor ok (activation reported; exit ${r.code})`);
 
   // 4) launcher resolves the installed plugin + uses the FAKE claude (never real)
   log('[5] launcher (fake host)');

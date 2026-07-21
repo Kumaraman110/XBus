@@ -58,11 +58,43 @@ function onExpired() {
   setStatus('Session expired — reopen from XBus (run `xbus dashboard`).', 'err');
 }
 
+/* Beta.10 (Train B): a small, explicit API surface so the agent-management module (agents.js)
+ * reuses the SAME authenticated fetch layer (token in sessionStorage → Authorization header)
+ * rather than re-implementing auth. This is the ONLY coupling seam between the modules. */
+window.XBusApi = {
+  get: (path) => api(path),
+  post: (path, obj) => apiPost(path, obj),
+  /** Re-render the roster from the cached sessions (used after a filter/collection change). */
+  rerender: () => { if (window.__sessions) renderSessions(window.__sessions); },
+  /** Full authenticated refresh (used after a mutating action so state matches the broker). */
+  refresh: () => refresh(),
+};
+
+/* Token-ready signal (integration fix): agents.js must not run its authenticated capability probe
+ * until app.js has a tab token in sessionStorage — otherwise the probe GETs race the async
+ * nonce→token exchange and 401, leaving every optional capability dark. boot() resolves this once a
+ * token is present (true) or unavailable (false). Consumers: `await window.XBusTokenReady`. */
+window.XBusTokenReady = new Promise((resolve) => { window.__resolveTokenReady = resolve; });
+
 /* ── small DOM helpers ── */
 function text(s) { return document.createTextNode(s == null ? '' : String(s)); }
 function el(tag, cls, txt) { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.appendChild(text(txt)); return e; }
 function cell(row, value) { const td = document.createElement('td'); td.appendChild(text(value)); row.appendChild(td); return td; }
 function hhmmss(iso) { return iso ? String(iso).slice(11, 19) : ''; }
+/** Compact relative time ("just now" / "5m ago" / "3h ago" / "2d ago"), or "—" when absent.
+ *  Client-side from an ISO instant (no new broker data). Never throws on a bad value. */
+function relativeTime(iso) {
+  if (!iso) return '—';
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '—';
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 45) return 'just now';
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + 'm ago';
+  const hr = Math.round(min / 60);
+  if (hr < 24) return hr + 'h ago';
+  return Math.round(hr / 24) + 'd ago';
+}
 /** A 2-char monogram for the session avatar: initials of a hyphenated name, else first 2 chars. */
 function monogram(name) {
   const parts = String(name || '').split(/[-_ ]+/).filter(Boolean);
@@ -82,6 +114,8 @@ const FRIENDLY_STATUS = {
   'expired': 'Expired',
 };
 function friendlyStatus(label) { return FRIENDLY_STATUS[label] || label; }
+// Beta.10 (Train B): expose for the agent inspector (agents.js) so status wording stays consistent.
+window.XBusFriendlyStatus = friendlyStatus;
 
 /** A colored delivery-count cell (a "state pill"): the number carries the value, the
  *  column header + pill class carry the state (never color-alone). Zero renders muted. */
@@ -97,6 +131,14 @@ function deliveryCell(row, n, state) {
  *  (session id, connection/readiness, last sent/received) that the friendly row hides. */
 function detailsCell(row, s) {
   const td = document.createElement('td');
+  // Beta.10 (Train B): a "Manage" affordance opens the agent inspector (identity + instances +
+  // authorized actions). Present only when the agent-management module is loaded.
+  if (window.XBusAgents && window.XBusAgents.openInspector) {
+    const manage = el('button', 'link-btn manage-btn', 'Manage');
+    manage.type = 'button';
+    manage.addEventListener('click', () => window.XBusAgents.openInspector(s.sessionId));
+    td.appendChild(manage);
+  }
   const btn = el('button', 'link-btn', 'Details');
   btn.type = 'button';
   btn.setAttribute('aria-expanded', 'false');
@@ -123,38 +165,119 @@ function isInternal(s) {
   return s.sessionId.startsWith('cli-') || s.sessionId === 'local-operator' || String(s.project).startsWith('proj-cli');
 }
 
+/**
+ * G7 (Reliability scale finding): a per-row content SIGNATURE covering every field the row
+ * renders. Two payloads with the same sig produce an identical row, so we can SKIP rebuilding
+ * that row's DOM on a live-stream frame. Keeps the roster cheap toward ~120 sessions (the old
+ * code rebuilt the entire table every stream frame). Pure + exported for unit testing.
+ */
+function sessionRowSig(s) {
+  const d = s.delivery || {};
+  return [
+    s.sessionId, s.name, s.label, s.project, s.lastSeenSourceAt,
+    d.queued || 0, d.delivered || 0, d.acknowledged || 0, d.replied || 0, d.failed || 0,
+    isInternal(s) ? 1 : 0,
+  ].join(''); // unit-separator: cannot appear in these values
+}
+
+/** Build ONE roster row (<tr>) for a session. Extracted so the incremental renderer can rebuild
+ *  only the rows whose signature changed. */
+function buildSessionRow(s) {
+  const r = document.createElement('tr');
+  if (isInternal(s)) r.className = 'row-internal';
+  const nameStr = s.name || s.sessionId.slice(0, 8);
+  const label = document.createElement('td');
+  const svc = el('div', 'svc');
+  const ico = el('span', 'svc-ico badge-' + s.label, monogram(nameStr)); // state class tints the avatar edge
+  const main = el('div', 'svc-main');
+  main.appendChild(el('span', 'svc-name', nameStr));
+  if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
+  svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
+  const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
+  // Last-activity column from lastSeenSourceAt (compact relative time; exact ISO in title).
+  const la = document.createElement('td'); la.className = 'last-activity';
+  const laSpan = el('span', 'muted', relativeTime(s.lastSeenSourceAt));
+  if (s.lastSeenSourceAt) laSpan.title = s.lastSeenSourceAt;
+  la.appendChild(laSpan); r.appendChild(la);
+  const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
+  deliveryCell(r, d.queued, 'queued');
+  deliveryCell(r, d.delivered, 'delivered');
+  deliveryCell(r, d.acknowledged, 'ack');
+  deliveryCell(r, d.replied, 'replied');
+  deliveryCell(r, d.failed, 'failed');
+  detailsCell(r, s);
+  return r;
+}
+
+/** Keyed reconcile: make `body`'s children exactly `desired` (an ordered array of <tr>) with
+ *  MINIMAL DOM ops — remove absent rows, then insert/move only where the order actually differs.
+ *  Reused (unchanged-sig) rows are the SAME node, so they are neither rebuilt nor moved when in
+ *  place. This is the G7 win: a stream frame with unchanged data touches (near) zero DOM. */
+function reconcileRows(body, desired) {
+  const want = new Set(desired);
+  for (const child of Array.from(body.children)) if (!want.has(child)) body.removeChild(child);
+  for (let i = 0; i < desired.length; i++) {
+    const node = desired[i];
+    const current = body.children[i];
+    if (current !== node) body.insertBefore(node, current || null);
+  }
+}
+
+// Row cache: sessionId → { tr, sig }. Survives across renders so unchanged rows are reused.
+const rosterRowCache = new Map();
+// Diagnostics so the browser/Reliability can VERIFY the G7 improvement: a frame with unchanged
+// data must do 0 row rebuilds. window.__rosterStats.rebuilds increments per row DOM (re)build.
+window.__rosterStats = { rebuilds: 0, renders: 0 };
+
 function renderSessions(sessions) {
   window.__sessions = sessions; // cache for re-render on filter toggle + the console selector
+  window.__rosterStats.renders += 1;
   const body = document.getElementById('sessions-body');
-  body.replaceChildren();
   const showInternal = document.getElementById('show-internal') && document.getElementById('show-internal').checked;
-  const shown = (sessions || []).filter((s) => showInternal || !isInternal(s));
+  // Beta.10 (Train B): the agent-management module supplies the roster search/status/Collection
+  // filters (all client-side over already-authorized data). Absent (module not loaded) → identity.
+  const rosterFilter = (window.XBusAgents && window.XBusAgents.rosterFilter) || ((list) => list);
+  const shown = rosterFilter((sessions || []).filter((s) => showInternal || !isInternal(s)));
   const hiddenCount = (sessions || []).length - shown.length;
   if (!shown.length) {
-    const r = body.insertRow(); const c = cell(r, sessions && sessions.length ? 'No user sessions — toggle “Internal sessions” to see XBus internals.' : 'No sessions yet.');
-    c.colSpan = 8; c.className = 'state-cell';
-  } else for (const s of shown) {
-    const r = document.createElement('tr');
-    if (isInternal(s)) r.className = 'row-internal';
-    // Session cell: a monogram avatar + the name + a muted project/description subtitle
-    // (matches the locked mock — a plain two-line identity cell, not a bordered badge).
-    const nameStr = s.name || s.sessionId.slice(0, 8);
-    const label = document.createElement('td');
-    const svc = el('div', 'svc');
-    const ico = el('span', 'svc-ico badge-' + s.label, monogram(nameStr)); // state class tints the avatar edge
-    const main = el('div', 'svc-main');
-    main.appendChild(el('span', 'svc-name', nameStr));
-    if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
-    svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
-    const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
-    const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
-    deliveryCell(r, d.queued, 'queued');
-    deliveryCell(r, d.delivered, 'delivered');
-    deliveryCell(r, d.acknowledged, 'ack');
-    deliveryCell(r, d.replied, 'replied');
-    deliveryCell(r, d.failed, 'failed');
-    detailsCell(r, s);
-    body.appendChild(r);
+    rosterRowCache.clear();
+    body.replaceChildren();
+    const r = body.insertRow();
+    const c = document.createElement('td'); c.colSpan = 9; c.className = 'state-cell';
+    // Distinguish the three empty cases so the operator knows WHY it's empty + how to recover:
+    //  (a) filters hid everything → say so + offer a one-click Clear;
+    //  (b) only internal sessions exist → point at the Internal toggle;
+    //  (c) genuinely no sessions yet.
+    const filtersActive = window.XBusAgents && window.XBusAgents.activeFilters && window.XBusAgents.activeFilters();
+    if ((sessions || []).length && filtersActive) {
+      c.appendChild(text('No agents match your filters. '));
+      const clr = el('button', 'link-btn', 'Clear filters'); clr.type = 'button';
+      clr.addEventListener('click', () => { if (window.XBusAgents && window.XBusAgents.clearFilters) window.XBusAgents.clearFilters(); });
+      c.appendChild(clr);
+    } else if ((sessions || []).length) {
+      c.appendChild(text('No user sessions — toggle “Internal sessions” to see XBus internals.'));
+    } else {
+      c.appendChild(text('No sessions yet.'));
+    }
+    r.appendChild(c);
+  } else {
+    // Incremental/keyed re-render (G7): reuse rows whose signature is unchanged; rebuild only the
+    // changed ones; reconcile order with minimal DOM ops. No whole-table rebuild per frame.
+    const desired = [];
+    const seen = new Set();
+    for (const s of shown) {
+      seen.add(s.sessionId);
+      const sig = sessionRowSig(s);
+      let entry = rosterRowCache.get(s.sessionId);
+      if (!entry || entry.sig !== sig) {
+        entry = { tr: buildSessionRow(s), sig };
+        rosterRowCache.set(s.sessionId, entry);
+        window.__rosterStats.rebuilds += 1;
+      }
+      desired.push(entry.tr);
+    }
+    for (const key of Array.from(rosterRowCache.keys())) if (!seen.has(key)) rosterRowCache.delete(key);
+    reconcileRows(body, desired);
   }
   // A muted footer note when internal sessions are hidden, so the filter is discoverable.
   const note = document.getElementById('sessions-hidden-note');
@@ -249,11 +372,10 @@ function renderLedger(events) {
     body.appendChild(row);
   }
 }
-function renderBanner(banner) {
-  const elx = document.getElementById('banner');
-  if (banner && banner.possibleUnmanaged > 0) { elx.hidden = false; elx.textContent = banner.possibleUnmanaged + ' Claude session(s) may be running that started before XBus and aren’t managed yet — resume or restart them so XBus registers them at SessionStart.'; }
-  else { elx.hidden = true; }
-}
+/* NOTE: the unmanaged-sessions banner was REMOVED (product decision, beta.10 Train B). AgenTel
+ * makes no operational claim about sessions that started before it, so there is no banner, no
+ * request to that former endpoint, and no wording implying verified absence. A future
+ * unmanaged-runtime feature is a separate, out-of-scope design. */
 
 /* ── console state ── */
 const consoleState = { selectedThreadId: null, threads: [], routableSessions: [] };
@@ -278,8 +400,45 @@ function renderSessionSelect(sessions) {
   document.getElementById('new-thread-btn').disabled = false;
 }
 
+/* Beta.10 (Train B): top-level "N conversations need attention" banner. Aggregates the per-thread
+ * attention signals (summary-only via timeline.js — no per-thread fetch, no N+1) across the whole
+ * threads list into one actionable rollup. Each chip focuses that thread when clicked. Hidden when
+ * nothing needs attention. Text carries meaning (never color alone) for accessibility. */
+function renderAttentionBanner(threads) {
+  const banner = document.getElementById('attention-banner');
+  if (!banner) return;
+  const T = window.XBusTimeline;
+  if (!T) { banner.hidden = true; return; }
+  const roll = T.summarizeRosterAttention(threads || [], Date.now());
+  if (!roll.needsAttention) { banner.hidden = true; banner.replaceChildren(); return; }
+  banner.hidden = false;
+  banner.replaceChildren();
+  const n = roll.total;
+  const head = el('span', 'attn-banner-head', n + (n === 1 ? ' conversation needs attention' : ' conversations need attention'));
+  banner.appendChild(head);
+  const bits = [];
+  if (roll.failed) bits.push(roll.failed + ' failed');
+  if (roll.expired) bits.push(roll.expired + ' expired');
+  if (roll.stalled) bits.push(roll.stalled + ' awaiting reply');
+  banner.appendChild(el('span', 'attn-banner-sub', bits.join(' · ')));
+  // Focus chips: click to select the affected thread (limited to a sane number so the banner
+  // stays compact at scale; the count above is the full total).
+  const chips = el('span', 'attn-banner-chips');
+  for (const tid of roll.threadIds.slice(0, 8)) {
+    const t = (threads || []).find((x) => x.threadId === tid);
+    const label = t ? (t.peerName || (t.peerSessionId ? t.peerSessionId.slice(0, 8) : tid.slice(0, 6))) : tid.slice(0, 6);
+    const chip = el('button', 'attn-chip', label);
+    chip.type = 'button';
+    chip.addEventListener('click', () => { void selectThread(tid); });
+    chips.appendChild(chip);
+  }
+  if (roll.threadIds.length > 8) chips.appendChild(el('span', 'muted', '+' + (roll.threadIds.length - 8) + ' more'));
+  banner.appendChild(chips);
+}
+
 function renderThreadList(threads) {
   consoleState.threads = threads || [];
+  renderAttentionBanner(consoleState.threads); // Beta.10 (Train B): top-level stalled-work rollup
   const list = document.getElementById('thread-list');
   list.replaceChildren();
   if (!consoleState.threads.length) {
@@ -293,6 +452,17 @@ function renderThreadList(threads) {
     main.appendChild(el('span', 'thread-item-peer', t.peerName || (t.peerSessionId ? t.peerSessionId.slice(0, 8) : 'unknown')));
     main.appendChild(el('span', 'thread-item-sub', t.subject || ('turn ' + t.lastThreadSequence + ' · ' + t.lastTurnState)));
     li.appendChild(main);
+    // Beta.10 (Train B): a "needs attention" flag for stalled/failed/expired threads, derived
+    // from the summary alone (no per-thread turn fetch — no N+1). Text + title carry meaning
+    // (never color alone), so it is accessible.
+    const T = window.XBusTimeline;
+    const attn = T ? T.threadListAttention(t, Date.now()) : { needsAttention: false };
+    if (attn.needsAttention) {
+      const flag = el('span', 'attn attn-' + attn.reason, attn.reason === 'failed' ? '!failed' : attn.reason === 'expired' ? '!expired' : '!stalled');
+      flag.title = attn.reason === 'stalled' ? 'No reply yet — this conversation has been idle past the stall threshold.'
+        : attn.reason === 'expired' ? 'A turn expired before it completed.' : 'A turn failed.';
+      li.appendChild(flag);
+    }
     if (t.unreadCount > 0) li.appendChild(el('span', 'unread', String(t.unreadCount)));
     // Keyboard-operable: a thread row behaves as a button (Enter/Space select it) + is
     // focusable + announces selection state for assistive tech.
@@ -338,7 +508,20 @@ function renderTimeline(thread) {
   header.hidden = false;
   peerEl.textContent = thread.peerName || 'unknown';
   subjEl.textContent = thread.subject ? '· ' + thread.subject : '';
-  stateEl.textContent = thread.state === 'closed' ? 'closed' : (thread.turns.length + ' turn(s)');
+  // Beta.10 (Train B): summarize stalled/unanswered work for the OPEN thread (full per-turn
+  // rollup — turns are already loaded here, so no extra fetch). Surfaces what needs attention.
+  const T = window.XBusTimeline;
+  const work = T ? T.summarizeThreadWork(thread.turns, Date.now()) : { needsAttention: false };
+  stateEl.className = 'muted' + (work.needsAttention ? ' attn-text' : '');
+  if (thread.state === 'closed') stateEl.textContent = 'closed';
+  else if (work.needsAttention) {
+    const bits = [];
+    if (work.failed) bits.push(work.failed + ' failed');
+    if (work.expired) bits.push(work.expired + ' expired');
+    const stalledOnly = work.stalled - work.failed - work.expired;
+    if (stalledOnly > 0) bits.push(stalledOnly + ' awaiting reply');
+    stateEl.textContent = thread.turns.length + ' turn(s) · needs attention: ' + bits.join(', ');
+  } else stateEl.textContent = thread.turns.length + ' turn(s)';
 
   tl.replaceChildren();
   if (!thread.turns.length) { tl.appendChild(el('p', 'empty', 'No turns yet.')); }
@@ -350,17 +533,33 @@ function renderTimeline(thread) {
     meta.appendChild(el('span', null, hhmmss(turn.createdAt)));
     div.appendChild(meta);
     div.appendChild(el('div', 'turn-body', turn.text));
-    const st = el('div', 'turn-state state-' + turn.deliveryState);
-    let label = turn.deliveryState;
-    if (turn.ackStatus === 'rejected') label = 'rejected by recipient';
-    else if (turn.deliveryState === 'queued' && turn.authorType === 'operator') label = 'queued — waiting for recipient checkpoint';
-    else if (turn.deliveryState === 'failed') label = 'failed' + (turn.failureCategory ? ' (' + turn.failureCategory + ')' : '');
+    // Beta.10 (Train B): derive the distinct timeline state (queued/injected/acknowledged/
+    // reply-pending/replied/failed/expired) client-side from the projection fields. Fall back to
+    // the raw deliveryState if the timeline module isn't present.
+    const T = window.XBusTimeline;
+    const tstate = T ? T.deriveTurnState(turn, Date.now()) : turn.deliveryState;
+    const st = el('div', 'turn-state state-' + tstate);
+    let label = T ? T.turnStateLabel(tstate) : turn.deliveryState;
+    if (tstate === 'failed' && turn.ackStatus === 'rejected') label = 'Rejected by recipient';
+    else if (tstate === 'failed' && turn.failureCategory) label = 'Failed (' + turn.failureCategory + ')';
     st.appendChild(text(label));
-    // Safe retry for a FAILED operator turn: re-send with a fresh idempotency key in the thread.
-    if (turn.deliveryState === 'failed' && turn.authorType === 'operator') {
+    // Safe retry for a FAILED or EXPIRED operator turn: re-send with a fresh idempotency key.
+    if ((tstate === 'failed' || tstate === 'expired') && turn.authorType === 'operator') {
       const btn = el('button', 'secondary retry-btn', 'Retry'); btn.type = 'button';
       btn.addEventListener('click', () => retryTurn(thread, turn, btn));
       st.appendChild(btn);
+    }
+    // #1 (pre-staged, WS1): explicit REDELIVERY — re-present this turn's body to the recipient.
+    // Gated on BOTH the redeliver capability (endpoint exists) AND eligibility (operator turn that
+    // reached/attempted the recipient). Pre-WS1 caps.redeliver is false → nothing renders (no dead
+    // control). Distinct from Retry: redelivery re-injects the SAME message id, not a fresh send.
+    const caps = window.__caps || {};
+    const P = window.XBusPrestage;
+    if (caps.redeliver && P && P.canRedeliverTurn(turn, tstate)) {
+      const rbtn = el('button', 'secondary redeliver-btn', 'Redeliver'); rbtn.type = 'button';
+      rbtn.title = 'Re-present this message to the recipient (the model may process it again).';
+      rbtn.addEventListener('click', () => redeliverTurn(thread, turn, rbtn));
+      st.appendChild(rbtn);
     }
     div.appendChild(st);
     tl.appendChild(div);
@@ -425,6 +624,50 @@ async function retryTurn(thread, turn, btn) {
   refreshThreads();
 }
 
+/* #1 explicit operator REDELIVERY — POST /api/message/:id/redeliver {reason?, confirmReplayAccepted?}.
+ * Re-presents the SAME message body to the recipient (distinct from Retry's fresh send). Only wired
+ * when caps.redeliver. TWO-PHASE for the accepted-replay flow (WS3 contract):
+ *   1. First attempt WITHOUT confirmReplayAccepted. Ordinary (not-yet-accepted) work → outcome
+ *      'redelivered', done.
+ *   2. If the broker REFUSES (400 CONFIRMATION/ILLEGAL_STATE/DUPLICATE — replaying ALREADY-ACCEPTED
+ *      work), present an explicit DESTRUCTIVE/duplicate-work confirmation. Only on operator confirm
+ *      do we resend with confirmReplayAccepted:true → outcome 'replayed' (+ a new attemptId).
+ * NEVER silently replays accepted work. Honest pending/success/failure; re-reads the thread so the
+ * timeline reflects authoritative state. The endpoint stamps local-operator + audits broker-side. */
+async function redeliverTurn(thread, turn, btn) {
+  btn.disabled = true;
+  const prior = btn.textContent; btn.textContent = 'Redelivering…';
+  composerError('');
+  // Phase 1: ordinary redelivery (no confirmation).
+  let r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console' });
+  // Phase 2: the broker refused because this is ALREADY-ACCEPTED work → require explicit confirm.
+  if (!r.ok && redeliverNeedsReplayConfirm(r)) {
+    btn.textContent = prior;
+    const ok = window.confirm(
+      'This message was already ACCEPTED by the recipient. Redelivering will make the recipient '
+      + 'process it AGAIN (duplicate work), recorded as a new replay attempt.\n\nReplay anyway?');
+    if (!ok) { btn.disabled = false; composerError('Replay cancelled — the accepted message was not re-sent.'); return; }
+    btn.disabled = true; btn.textContent = 'Replaying…';
+    r = await apiPost('/api/message/' + encodeURIComponent(turn.messageId) + '/redeliver', { reason: 'operator-console', confirmReplayAccepted: true });
+  }
+  if (!r.ok) {
+    btn.disabled = false; btn.textContent = prior;
+    composerError('Redelivery failed (' + r.status + '): ' + (r.body.message || r.body.error || 'error'));
+    return;
+  }
+  // Authoritative re-read; the derived timeline state will reflect the new attempt.
+  await loadThread(thread.threadId);
+  refreshThreads();
+}
+
+/** Did the broker refuse an ordinary redelivery because the work was already ACCEPTED (so a replay
+ *  needs explicit confirmation)? Matches the WS3 contract's confirmation-required error codes. Pure. */
+function redeliverNeedsReplayConfirm(res) {
+  if (!res || res.ok) return false;
+  const code = (res.body && (res.body.error || res.body.code)) || '';
+  return res.status === 400 && /CONFIRMATION|ILLEGAL_STATE|DUPLICATE/i.test(String(code));
+}
+
 async function startNewThread() {
   const sel = document.getElementById('session-select');
   const to = sel.value;
@@ -465,10 +708,9 @@ function showError(msg) {
 }
 
 async function refresh() {
-  const [{ sessions }, ledger, banner, audit, threads] = await Promise.all([
+  const [{ sessions }, ledger, audit, threads] = await Promise.all([
     api('/api/sessions'),
     api('/api/ledger?limit=100'),
-    api('/api/unmanaged').catch(() => null),
     api('/api/audit').catch(() => null),
     api('/api/threads').catch(() => ({ threads: [] })),
   ]);
@@ -476,7 +718,6 @@ async function refresh() {
   renderSessions(sessions);
   renderHeroKpis(sessions, audit);
   renderLedger(ledger.events || []);
-  if (banner) renderBanner(banner);
   renderAudit(audit);
   renderThreadList(threads.threads || []);
   showError(null); // clear any prior error on a good refresh
@@ -529,6 +770,9 @@ async function boot() {
   let token = sessionStorage.getItem(TOKEN_KEY);
   const nonce = takeNonceFromFragment();
   if (!token && nonce) { token = await exchangeNonce(nonce); if (token) sessionStorage.setItem(TOKEN_KEY, token); }
+  // Signal token readiness so agents.js runs its capability probe only AFTER a token exists
+  // (avoids the probe-vs-exchange race that leaves optional capabilities dark).
+  if (window.__resolveTokenReady) { window.__resolveTokenReady(!!token); window.__resolveTokenReady = null; }
   if (!token) { setStatus('No session token — open the dashboard via `xbus dashboard`.', 'err'); return; }
   try {
     await refresh();

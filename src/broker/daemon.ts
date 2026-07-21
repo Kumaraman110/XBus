@@ -345,6 +345,8 @@ export class BrokerDaemon {
           return this.onGetMetrics(conn, frame);
         case 'get_status':
           return this.onStatus(conn, frame);
+        case 'activation_diagnose':
+          return this.onActivationDiagnose(conn, frame);
         case 'heartbeat':
           return this.reply(conn, 'heartbeat_ack', { ok: true }, frame.requestId);
         case 'shutdown':
@@ -816,6 +818,42 @@ export class BrokerDaemon {
   }
 
   /**
+   * BETA.10 WS3 (#1): operator-initiated redelivery of a message to its recipient. Message-scoped
+   * (a messageId, NOT a sessionId), so it is its own handler rather than an operatorControl action.
+   * Delegates to the OPERATOR-authority store method, which preserves the accepted-vs-transport
+   * distinction (ordinary redelivery vs explicit confirm-required replay of accepted work) and
+   * stamps the audit. `raw.confirmReplayAccepted` is the explicit destructive acknowledgement for
+   * replaying already-accepted work. A throw surfaces as a clean 4xx; the broker is unaffected.
+   */
+  operatorRedeliver(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const messageId = this.optString(p.messageId, 'messageId');
+    if (!messageId) throw new XBusError(XBusErrorCode.PROTOCOL_VIOLATION, 'messageId required');
+    const confirmReplayAccepted = p.confirmReplayAccepted === true;
+    const result = this.store.operatorRedeliver(messageId, {
+      ...(typeof p.reason === 'string' ? { reason: p.reason } : {}),
+      confirmReplayAccepted,
+    });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /**
+   * BETA.10 WS3: operator replace of the full workspace Collections state (the dashboard POSTs the
+   * whole {collections, members}). Delegates to the OPERATOR-authority store method (atomic full
+   * swap; unique-active-name + no-dup + ordering enforced; never touches agents). A throw surfaces
+   * as a clean 4xx. Returns the new version stamp.
+   */
+  operatorReplaceCollections(raw: unknown): unknown {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    const collections = Array.isArray(p.collections) ? p.collections as Array<{ id: string; name: string; sortOrder?: number; state?: string }> : [];
+    const members = (p.members && typeof p.members === 'object' && !Array.isArray(p.members)) ? p.members as Record<string, string[]> : {};
+    const result = this.store.replaceCollections({ collections, members });
+    try { this.onSessionStateChanged?.(); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /**
    * Beta.7 (ADR 0025): register a live in-process handle to a managed background child THIS
    * broker just spawned, so a later stop_managed can SIGTERM it pid-recycling-safely. On the
    * child's exit we clear the session's managed markers (so a dead session never retains a
@@ -1186,6 +1224,24 @@ export class BrokerDaemon {
       session,
     };
     this.reply(conn, 'get_status_ack', payload, frame.requestId);
+  }
+
+  /**
+   * BETA.10 (ADR 0036) — activation diagnosis for the Stop hook / doctor. Keyed on the AUTHENTICATED
+   * connection's session (this.connAuth), never a caller-supplied id, so a caller can't probe another
+   * session. This is a READ + a best-effort once-only audit (no ownership/routing mutation); the HOOK
+   * role is authorized (no assertAllowed(mcp-only) gate — it needs no mcp authority to read its own
+   * session's component presence). Returns the state enum + evidence for an honest diagnostic.
+   */
+  private onActivationDiagnose(conn: ServerConn, frame: Frame): void {
+    const auth = this.connAuth.get(conn.id);
+    if (!auth) {
+      // No authenticated session on this connection — cannot diagnose; report unknown, no emit.
+      this.reply(conn, 'activation_diagnose_ack', { state: 'PLUGIN_NOT_LOADED', epoch: null, mcpEver: false, mcpLive: false, hookPresent: false, firstEmission: false }, frame.requestId);
+      return;
+    }
+    const d = this.store.diagnoseActivationOnce(auth.sessionId);
+    this.reply(conn, 'activation_diagnose_ack', { ...d, sessionId: auth.sessionId }, frame.requestId);
   }
 
   private receiveModeOf(sessionId: string): string {

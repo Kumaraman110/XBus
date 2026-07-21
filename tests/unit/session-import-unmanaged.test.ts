@@ -1,10 +1,14 @@
 /**
- * Dormant IMPORT (metadata-only) + conservative aggregate UNMANAGED detection
- * (beta.5 Phase 1; ADR 0013 D5/D6, ADR 0020 Q1).
+ * Dormant IMPORT (metadata-only) (beta.5 Phase 1; ADR 0013 D5, ADR 0020 Q1).
  * Proves: scanTranscripts reads ONLY the directory listing + stat (NEVER opens a transcript
  * body — asserted by spying on fs.readFileSync/openSync); importDormantSessions upserts
  * unroutable dormant rows + one ledger event each, is idempotent, and never downgrades an
- * existing session; the unmanaged aggregate is a clamped count-only signal.
+ * existing session.
+ *
+ * NOTE (beta.10 Train B): the conservative aggregate UNMANAGED-detection helpers
+ * (computeUnmanagedBanner / countLiveClaudeProcesses) and their tests were REMOVED with the
+ * unmanaged-sessions dashboard feature (product decision — no data beats fabricated certainty).
+ * Session-import (dormant metadata) is a SEPARATE, retained capability and is unaffected.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import os from 'node:os';
@@ -15,7 +19,6 @@ import { runMigrations } from '../../src/database/migrations.js';
 import { BrokerStore } from '../../src/broker/store.js';
 import { FakeClock, SeqIdGen } from '../../src/shared/clock.js';
 import { scanTranscripts } from '../../src/broker/session-import.js';
-import { computeUnmanagedBanner, countLiveClaudeProcesses } from '../../src/broker/unmanaged.js';
 import { verifyLedger } from '../../src/broker/ledger.js';
 
 let dir: string; let projectsDir: string;
@@ -90,27 +93,5 @@ describe('importDormantSessions', () => {
     const r = store.importDormantSessions(scanTranscripts(projectsDir));
     expect(r.skipped).toBeGreaterThanOrEqual(1);
     expect((db.prepare('SELECT management_state AS m FROM sessions WHERE session_id=?').get(SID1) as { m: string }).m).toBe('active');
-  });
-});
-
-describe('computeUnmanagedBanner + countLiveClaudeProcesses', () => {
-  it('aggregate = max(0, liveClaude - managedOrDormant), clamped', () => {
-    expect(computeUnmanagedBanner({ liveClaudeProcesses: 5, managedOrDormantSessions: 3 })).toEqual({ possibleUnmanaged: 2 });
-    expect(computeUnmanagedBanner({ liveClaudeProcesses: 2, managedOrDormantSessions: 4 })).toEqual({ possibleUnmanaged: 0 }); // clamped, never negative
-    expect(computeUnmanagedBanner({ liveClaudeProcesses: NaN, managedOrDormantSessions: 3 })).toEqual({ possibleUnmanaged: 0 });
-  });
-
-  it('countLiveClaudeProcesses parses a process listing by NAME only (no env/memory read)', () => {
-    // Injected exec returns a fake listing; we count only name matches.
-    const winListing = '"claude.exe","1234","Console","1","50,000 K"\n"node.exe","5678","Console","1","20,000 K"\n"claude.exe","9012","Console","1","40,000 K"';
-    const posixListing = 'claude\nnode\nbash\nclaude\n/usr/bin/claude';
-    const listing = process.platform === 'win32' ? winListing : posixListing;
-    const n = countLiveClaudeProcesses(() => listing);
-    expect(n).toBeGreaterThanOrEqual(2);
-  });
-
-  it('countLiveClaudeProcesses returns 0 on any exec failure (conservative, never throws)', () => {
-    expect(countLiveClaudeProcesses(() => { throw new Error('tool missing'); })).toBe(0);
-    expect(countLiveClaudeProcesses(() => '')).toBe(0);
   });
 });

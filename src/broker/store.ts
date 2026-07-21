@@ -32,6 +32,17 @@ import type { SendInput } from '../protocol/schemas.js';
  *  an optional operator-set subject for a NEW thread. */
 export type OperatorSendInput = SendInput & { threadId?: string; parentMessageId?: string; subject?: string };
 
+/** BETA.10 (ADR 0036) — result of a Stop-hook activation diagnosis (see diagnoseActivationOnce). */
+export interface ActivationDiagnosis {
+  state: 'CONNECTED' | 'PLUGIN_NOT_LOADED' | 'MCP_DISCONNECTED' | 'BROKER_UNAVAILABLE' | 'DEGRADED_HOOK_ONLY';
+  epoch: number | null;
+  mcpEver: boolean;
+  mcpLive: boolean;
+  hookPresent: boolean;
+  /** True iff THIS call emitted the once-only PLUGIN_NOT_LOADED audit for (session, epoch). */
+  firstEmission: boolean;
+}
+
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
@@ -199,6 +210,22 @@ export class BrokerStore {
         JSON.stringify(fields),
         this.clock.nowIso(),
       );
+  }
+
+  /**
+   * BETA.10 WS1 R4: reject a mutation from a superseded (stale) epoch. A caller's auth.epoch must
+   * equal the session's CURRENT active_epoch, else the connection was superseded and must not mutate
+   * identity/routing state. Mirrors DeliveryOps.assertCurrentEpoch; call at the head of every
+   * auth-scoped identity/routing mutation (registerAlias/renameSession/signalReadiness already, plus
+   * any future mutating path). MUST run inside the caller's transaction.
+   */
+  private assertCurrentEpoch(auth: SessionAuthority): void {
+    const s = this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(auth.sessionId) as { e: number } | undefined;
+    if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
+    if (s.e !== auth.epoch) {
+      this.audit('EPOCH_MISMATCH_REJECTED', { sessionId: auth.sessionId, instanceId: auth.componentInstanceId });
+      throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
+    }
   }
 
   /**
@@ -379,6 +406,84 @@ export class BrokerStore {
   }
 
   /**
+   * BETA.10 (ADR 0036) activation diagnostics — did an mcp component EVER register for this session
+   * in its current epoch (ANY state: live, superseded, or closed)? This is the plugin-loaded signal,
+   * and it is deliberately NOT `hasLiveMcp` (live-now): at the Stop hook we need "was the plugin ever
+   * loaded this session" to distinguish PLUGIN_NOT_LOADED (never — bare `claude`) from
+   * MCP_DISCONNECTED (loaded then the channel dropped). Read-only; no state change; usable by a
+   * hook-role query. Returns {ever, live} so callers can grade the state.
+   */
+  mcpComponentPresence(sessionId: string): { ever: boolean; live: boolean } {
+    const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e;
+    if (epoch === undefined) return { ever: false, live: false };
+    const ever = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp'`).get(sessionId, epoch) as { n: number }).n > 0;
+    const live = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp' AND state='live'`).get(sessionId, epoch) as { n: number }).n > 0;
+    return { ever, live };
+  }
+
+  /** Has a HOOK component ever registered for this session (any state, current epoch)? Paired with
+   *  mcpComponentPresence to detect the DEGRADED_HOOK_ONLY split-state (hook announced, mcp never). */
+  hookComponentPresent(sessionId: string): boolean {
+    const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e;
+    if (epoch === undefined) return false;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='hook'`).get(sessionId, epoch) as { n: number }).n > 0;
+  }
+
+  /**
+   * BETA.10 (ADR 0036) — Stop-hook activation diagnosis. Classifies the plugin/MCP activation state
+   * for a session at its CURRENT epoch from broker-owned facts (component_instances roles), and, when
+   * the plugin is absent (no mcp component EVER this epoch), records ONE best-effort
+   * PLUGIN_NOT_LOADED audit event — keyed on (session_id, epoch) so it fires at most once per
+   * activation attempt. This is the once-only source of truth (Adversarial's audit-derived design):
+   * derived from the EXISTING audit_events table, so it survives a broker restart (property 3) and a
+   * new epoch (a real `xclaude` relaunch bumps the epoch → a fresh plugin-absent epoch re-diagnoses,
+   * property 4), with NO new schema/state-file/wire field.
+   *
+   * Atomic + idempotent (properties 1+2): the classify → check-prior-audit → insert runs in ONE
+   * db.transaction, so concurrent/repeated Stop hooks serialize and produce AT MOST ONE audit +
+   * `firstEmission:true`. NEVER classifies at SessionStart — the caller (Stop hook) guarantees the
+   * hook-before-mcp race (store.ts registration-order note) is resolved by end of first turn.
+   *
+   * Pure diagnostic: no ownership/routing mutation, no ledger, no message loss. Returns the state +
+   * evidence for the caller (hook diagnostic / doctor) and whether THIS call emitted the audit.
+   */
+  diagnoseActivationOnce(sessionId: string): ActivationDiagnosis {
+    return this.db.transaction((): ActivationDiagnosis => {
+      const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
+      if (epoch === null) {
+        // No such session row — treat as plugin-not-loaded (nothing registered at all).
+        return { state: 'PLUGIN_NOT_LOADED', epoch: null, mcpEver: false, mcpLive: false, hookPresent: false, firstEmission: false };
+      }
+      const { ever: mcpEver, live: mcpLive } = this.mcpComponentPresence(sessionId);
+      const hookPresent = this.hookComponentPresent(sessionId);
+
+      // State: mcp EVER present distinguishes PLUGIN_NOT_LOADED (never) from MCP_DISCONNECTED
+      // (existed then channel dropped). CONNECTED requires a LIVE mcp component right now.
+      let state: ActivationDiagnosis['state'];
+      if (mcpLive) state = 'CONNECTED';
+      else if (mcpEver) state = 'MCP_DISCONNECTED';
+      else if (hookPresent) state = 'DEGRADED_HOOK_ONLY'; // hook announced, mcp never — the split-state
+      else state = 'PLUGIN_NOT_LOADED';
+
+      // Emit the plugin-absence audit AT MOST ONCE per (session, epoch). Only for the plugin-absent
+      // states (PLUGIN_NOT_LOADED / DEGRADED_HOOK_ONLY); CONNECTED/MCP_DISCONNECTED don't warn.
+      let firstEmission = false;
+      if (state === 'PLUGIN_NOT_LOADED' || state === 'DEGRADED_HOOK_ONLY') {
+        const prior = this.db.prepare(
+          `SELECT COUNT(*) AS n FROM audit_events
+             WHERE event_type='PLUGIN_NOT_LOADED' AND actor_session_id=?
+               AND json_extract(safe_metadata_json,'$.epoch')=?`,
+        ).get(sessionId, epoch) as { n: number };
+        if (prior.n === 0) {
+          this.audit('PLUGIN_NOT_LOADED', { sessionId, epoch, state });
+          firstEmission = true;
+        }
+      }
+      return { state, epoch, mcpEver, mcpLive, hookPresent, firstEmission };
+    });
+  }
+
+  /**
    * Resolve a reclaim attempt. Given a requested name + an ownership secret, decide whether
    * this registration should be REDIRECTED onto an existing canonical session (the durable
    * identity that owns the name + inbox). Returns the canonical session id to redirect to, or
@@ -413,28 +518,57 @@ export class BrokerStore {
     const existing = this.db.prepare('SELECT owner_secret_hash AS hash FROM name_ownership WHERE logical_identity_id=?').get(logicalId) as { hash: string | null } | undefined;
     let plaintext: string | null = null;
     let hash: string | null = existing?.hash ?? null;
-    if (hash === null) { plaintext = this.mintOwnerSecret(); hash = BrokerStore.hashSecret(plaintext); }
-    // Release any OTHER identity that held this normalized name (superseded predecessor whose
-    // ownership row lingers) so ux_name_ownership_active never blocks the new active owner.
-    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, superseded_at=?, updated_at=? WHERE normalized_name=? AND logical_identity_id<>? AND name_state IN ('active','pending')`)
-      .run(now, now, norm.normalized, logicalId);
+    const freshlyMinted = hash === null;
+    if (freshlyMinted) { plaintext = this.mintOwnerSecret(); hash = BrokerStore.hashSecret(plaintext); }
+    // BETA.10 WS1 R2: release any OTHER identity that held this normalized name (superseded
+    // predecessor whose ownership row lingers) THROUGH THE ONE release primitive — so the released-
+    // column treatment can never diverge from the standalone release path. This one marks
+    // superseded_at (a predecessor superseded by a new active owner).
+    this.releaseNameOwnership({ normalizedNameNot: { name: norm.normalized, exceptLogicalId: logicalId } }, true, now);
     this.db.prepare(`INSERT INTO name_ownership (logical_identity_id, normalized_name, display_name, owner_secret_hash, name_state, current_session_id, superseded_at, created_at, updated_at)
                      VALUES (?,?,?,?, 'active', ?, NULL, ?, ?)
                      ON CONFLICT(logical_identity_id) DO UPDATE SET normalized_name=excluded.normalized_name, display_name=excluded.display_name, owner_secret_hash=excluded.owner_secret_hash, name_state='active', current_session_id=excluded.current_session_id, superseded_at=NULL, updated_at=excluded.updated_at`)
       .run(logicalId, norm.normalized, norm.display, hash, canonicalSessionId, now, now);
+    // BETA.10 WS1 R3: a FIRST protected award (fresh secret minted) is an identity-AUTHORITY
+    // transition (credential birth) → hash-chained ledger, closing the "award only audited" gap.
+    // NEVER the secret in the payload (only ids/name) — D7 invariant.
+    if (freshlyMinted) {
+      this.ledger('name.awarded', canonicalSessionId, { sessionId: canonicalSessionId }, { name: norm.display });
+    }
     return { ownerSecret: plaintext };
   }
 
   /** Mirror a name RELEASE (pending/unnamed/retired) into name_ownership for a logical identity.
    *  The owner_secret_hash is PRESERVED (a released name keeps its secret so the same identity
-   *  can re-acquire), only the routing (normalized_name/state) is cleared. */
+   *  can re-acquire), only the routing (normalized_name/state) is cleared. Routes through the ONE
+   *  release primitive (R2) so released-column semantics can never diverge. */
   private setNameOwnershipReleased(logicalId: string, now: string): void {
-    this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, updated_at=? WHERE logical_identity_id=?`).run(now, logicalId);
+    this.releaseNameOwnership({ logicalId }, false, now);
   }
 
-  private nextFencingToken(): number {
-    this.db.prepare('UPDATE fencing_counter SET value = value + 1 WHERE id = 1').run();
-    return (this.db.prepare('SELECT value FROM fencing_counter WHERE id = 1').get() as { value: number }).value;
+  /**
+   * BETA.10 WS1 R2 — THE single name-ownership RELEASE primitive. Every release (predecessor-
+   * supersede, standalone pending/unnamed release, and any future path) flows through here so the
+   * released-column treatment (name_state='released', normalized_name=NULL) is byte-identical
+   * everywhere — a future change to "released" semantics cannot silently skip one caller. The ONLY
+   * per-caller parameters are (a) the WHERE predicate and (b) whether superseded_at is stamped (a
+   * predecessor superseded by a new active owner stamps it; a self-release does not). owner_secret_hash
+   * is always PRESERVED (a released identity keeps its secret so it can re-acquire). Must run inside
+   * the caller's transaction.
+   */
+  private releaseNameOwnership(
+    where: { logicalId: string } | { normalizedNameNot: { name: string; exceptLogicalId: string } },
+    markSuperseded: boolean,
+    now: string,
+  ): void {
+    const supersededSet = markSuperseded ? 'superseded_at=?, ' : '';
+    if ('logicalId' in where) {
+      const params = markSuperseded ? [now, now, where.logicalId] : [now, where.logicalId];
+      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, ${supersededSet}updated_at=? WHERE logical_identity_id=?`).run(...params);
+    } else {
+      const params = markSuperseded ? [now, now, where.normalizedNameNot.name, where.normalizedNameNot.exceptLogicalId] : [now, where.normalizedNameNot.name, where.normalizedNameNot.exceptLogicalId];
+      this.db.prepare(`UPDATE name_ownership SET name_state='released', normalized_name=NULL, ${supersededSet}updated_at=? WHERE normalized_name=? AND logical_identity_id<>? AND name_state IN ('active','pending')`).run(...params);
+    }
   }
 
   private nextEpochToken(): string {
@@ -479,7 +613,24 @@ export class BrokerStore {
       // which presents no secret and drives checkpoint delivery) must resolve to the SAME
       // canonical session — otherwise the hook would pull an empty inbox against the phantom
       // physical id. The map is authoritative and read on every register.
-      const mapped = this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(physicalSessionId) as { c: string } | undefined;
+      // BETA.10 WS1 (ADR 0033) — DEFENSE-IN-DEPTH map resolution. Follow a physical_session_map edge
+      // ONLY when its canonical target still EXISTS and is REDIRECT-ELIGIBLE (a live/connected
+      // lifecycle, NOT dormant/expired and NOT removed/missing). A secret-less register must never be
+      // redirected onto a dormant or torn-down identity (that was the resurrection/inbox-adoption
+      // hole). If the edge is dangling (target row gone) or ineligible (target expired/dormant), it is
+      // a stale cache entry: transactionally PURGE it and fall through to normal registration. A
+      // secret-BEARING reclaim does not depend on this edge — it goes through resolveReclaim below.
+      const mappedRaw = this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(physicalSessionId) as { c: string } | undefined;
+      let mapped: { c: string } | undefined = mappedRaw;
+      if (mappedRaw) {
+        const tgt = this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(mappedRaw.c) as { expired_at: string | null } | undefined;
+        const eligible = !!tgt && tgt.expired_at === null; // exists AND not dormant/expired
+        if (!eligible) {
+          // Self-heal: purge the stale/ineligible edge so it can never be followed secret-lessly.
+          this.db.prepare('DELETE FROM physical_session_map WHERE physical_session_id=?').run(physicalSessionId);
+          mapped = undefined;
+        }
+      }
       // A fresh secret-bearing reclaim (mcp only): decide the canonical target + liveness gate.
       const reclaim = role === ComponentRole.MCP
         ? this.resolveReclaim(inputRaw.requestedSessionName, inputRaw.ownerSecret, physicalSessionId)
@@ -763,6 +914,10 @@ export class BrokerStore {
   registerAlias(auth: SessionAuthority, rawAlias: string): { alias: string } {
     const alias = validateUserAlias(rawAlias);
     return this.db.transaction(() => {
+      // BETA.10 WS1 R4: fence stale epochs — a superseded connection must not register a routable
+      // alias (routing hijack). Mirrors renameSession/signalReadiness. Inside the txn so the check
+      // and the write share a consistent snapshot.
+      this.assertCurrentEpoch(auth);
       const now = this.clock.nowIso();
       const clash = this.db
         .prepare(`SELECT session_id FROM aliases WHERE alias_ci=? AND scope='global' AND active=1`)
@@ -1443,6 +1598,129 @@ export class BrokerStore {
     });
   }
 
+  /**
+   * BETA.10 WS3 (#1) — operator-initiated redelivery, PRESERVING the accepted-vs-transport
+   * distinction (the user-mandated safety rule). The operator (local-operator, no live component)
+   * re-drives a message to its recipient. Two paths, kept DISTINGUISHABLE:
+   *  - ORDINARY REDELIVERY: the delivery is NOT yet accepted (queued / retry_wait / transport_written)
+   *    — the recipient has not acted on it. Re-arm it to 'queued' for a fresh injection. Audited
+   *    OPERATOR_REDELIVERY.
+   *  - EXPLICIT REPLAY of ALREADY-ACCEPTED work (state='accepted'): the recipient already accepted
+   *    the body — replaying it is DESTRUCTIVE / duplicate model-visible work. It is REFUSED unless
+   *    the caller passes confirmReplayAccepted=true (explicit destructive acknowledgement). On
+   *    confirm it mints a NEW attempt identity, audits DISTINCTLY as OPERATOR_ACCEPTED_REPLAY (never
+   *    as an ordinary redelivery), re-arms to 'queued' for re-injection, and preserves the prior
+   *    accepted history in the audit trail. NEVER a silent re-inject of an accepted body.
+   */
+  operatorRedeliver(messageId: string, opts: { reason?: string; confirmReplayAccepted?: boolean } = {}):
+    { messageId: string; outcome: 'redelivered' | 'replayed' | 'not_found'; replay: boolean; attemptId?: string; state?: string } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      const d = this.db.prepare('SELECT state, recipient_session_id AS rsid FROM deliveries WHERE message_id=?').get(messageId) as { state: string; rsid: string } | undefined;
+      if (!d) return { messageId, outcome: 'not_found' as const, replay: false };
+      const reason = (opts.reason ?? '').slice(0, 120);
+      if (d.state === DeliveryState.ACCEPTED) {
+        // Destructive/duplicate replay of accepted work — require explicit acknowledgement.
+        if (opts.confirmReplayAccepted !== true) {
+          this.audit('OPERATOR_ACCEPTED_REPLAY_REFUSED_UNCONFIRMED', { sessionId: d.rsid, messageId });
+          throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, 'replaying already-accepted work is destructive/duplicate; pass confirmReplayAccepted to proceed');
+        }
+        const attemptId = this.ids.next(); // NEW auditable attempt identity
+        // Re-arm for re-injection. The prior accepted state is recorded in the audit metadata so the
+        // replay is fully traceable (a new attempt, not an overwrite of history).
+        this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, application_accepted_at=NULL, target_instance_id=NULL, next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state='${DeliveryState.ACCEPTED}'`).run(now, messageId);
+        this.audit('OPERATOR_ACCEPTED_REPLAY', { sessionId: d.rsid, messageId, attemptId, reason, priorState: 'accepted' });
+        return { messageId, outcome: 'replayed' as const, replay: true, attemptId, state: DeliveryState.QUEUED };
+      }
+      // Ordinary redelivery: not-yet-accepted work. Re-arm to queued for re-injection.
+      if (d.state === DeliveryState.QUEUED || d.state === DeliveryState.RETRY_WAIT || d.state === DeliveryState.TRANSPORT_WRITTEN) {
+        this.db.prepare(`UPDATE deliveries SET state='${DeliveryState.QUEUED}', transport_written_at=NULL, target_instance_id=NULL, next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE message_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}')`).run(now, messageId);
+        this.audit('OPERATOR_REDELIVERY', { sessionId: d.rsid, messageId, reason });
+        return { messageId, outcome: 'redelivered' as const, replay: false, state: DeliveryState.QUEUED };
+      }
+      // Terminal state (completed/rejected/expired/dead_letter/cancelled) — nothing to redeliver.
+      throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `cannot redeliver a delivery in terminal state ${d.state}`);
+    });
+  }
+
+  /**
+   * BETA.10 WS3 — read the workspace Collections state (dashboard contract). Ordered by sort_order.
+   * { version, collections:[{id,name,sortOrder,state}], members:{logicalAgentId:[collectionId]} }.
+   * `version` = a monotonic stamp (max updated_at count proxy) so the client can detect staleness;
+   * here we use the row count + latest updated_at hashed to a simple increasing integer is overkill,
+   * so we return the number of collections mutations via a COUNT of rows as a coarse version — the
+   * dashboard only needs SOME changing value; a full vector isn't required for local single-writer.
+   */
+  readCollections(): { version: number; collections: Array<{ id: string; name: string; sortOrder: number; state: string }>; members: Record<string, string[]> } {
+    const cols = this.db.prepare(
+      `SELECT collection_id AS id, name, sort_order AS sortOrder, state FROM collections WHERE workspace_id='local' ORDER BY sort_order ASC, normalized_name ASC`,
+    ).all() as Array<{ id: string; name: string; sortOrder: number; state: string }>;
+    const memberRows = this.db.prepare(
+      `SELECT collection_id AS cid, logical_agent_id AS agent FROM collection_members ORDER BY sort_order ASC`,
+    ).all() as Array<{ cid: string; agent: string }>;
+    const members: Record<string, string[]> = {};
+    for (const r of memberRows) { (members[r.agent] ??= []).push(r.cid); }
+    // version = a coarse monotonic-ish stamp: total collections + total memberships (changes on any
+    // structural mutation). Single local writer, so exact vector clocks are unnecessary.
+    const version = cols.length + memberRows.length + 1;
+    return { version, collections: cols, members };
+  }
+
+  /**
+   * BETA.10 WS3 — REPLACE the full workspace Collections state (the dashboard POSTs the whole
+   * {collections, members}). Atomic full-state swap in ONE transaction: delete-then-reinsert so a
+   * collection dropped from the payload is DELETED (its membership cascades) but NO agent is ever
+   * touched. Enforces: unique ACTIVE normalized name per workspace (ux_collection_active_name), no
+   * duplicate member (PK + de-dup here), ordering (sort_order). A duplicate active name or a
+   * malformed row aborts the whole swap (no partial state). Operator-authority (audited).
+   */
+  replaceCollections(state: { collections: Array<{ id: string; name: string; sortOrder?: number; state?: string }>; members: Record<string, string[]> }): { version: number } {
+    return this.db.transaction(() => {
+      const now = this.clock.nowIso();
+      // Guard duplicate ACTIVE normalized names up front (clearer error than the UNIQUE index abort).
+      const activeNorm = new Set<string>();
+      for (const c of state.collections) {
+        const st = c.state ?? 'active';
+        if (st === 'active') {
+          const norm = c.name.trim().toLowerCase();
+          if (activeNorm.has(norm)) throw new XBusError(XBusErrorCode.ILLEGAL_STATE_TRANSITION, `duplicate active collection name: ${c.name}`);
+          activeNorm.add(norm);
+        }
+      }
+      // Full swap: membership first (FK), then collections. Only these two tables — never sessions/
+      // name_ownership/agents. ON DELETE CASCADE would also clear membership, but we clear explicitly.
+      this.db.prepare('DELETE FROM collection_members').run();
+      this.db.prepare(`DELETE FROM collections WHERE workspace_id='local'`).run();
+      const validIds = new Set<string>();
+      for (const c of state.collections) {
+        const st = c.state ?? 'active';
+        this.db.prepare(
+          `INSERT INTO collections (collection_id, workspace_id, name, normalized_name, sort_order, state, created_at, updated_at) VALUES (?, 'local', ?, ?, ?, ?, ?, ?)`,
+        ).run(c.id, c.name, c.name.trim().toLowerCase(), c.sortOrder ?? 0, st, now, now);
+        validIds.add(c.id);
+      }
+      // Memberships: de-dup (collection,agent), skip refs to collections not in the new set.
+      for (const [agent, cids] of Object.entries(state.members)) {
+        const seen = new Set<string>();
+        let order = 0;
+        for (const cid of cids) {
+          if (!validIds.has(cid) || seen.has(cid)) continue; // drop dangling/duplicate refs
+          seen.add(cid);
+          this.db.prepare('INSERT INTO collection_members (collection_id, logical_agent_id, sort_order, created_at) VALUES (?,?,?,?)').run(cid, agent, order++, now);
+        }
+      }
+      this.ledger('OPERATOR_COLLECTIONS_REPLACED', OPERATOR_LEDGER_ACTOR, {}, { collections: state.collections.length });
+      return { version: this.readCollectionsVersion() };
+    });
+  }
+
+  /** Coarse monotonic-ish version stamp for the collections state (single local writer). */
+  private readCollectionsVersion(): number {
+    const c = (this.db.prepare(`SELECT COUNT(*) AS n FROM collections WHERE workspace_id='local'`).get() as { n: number }).n;
+    const m = (this.db.prepare('SELECT COUNT(*) AS n FROM collection_members').get() as { n: number }).n;
+    return c + m + 1;
+  }
+
   /** Pin / unpin a session (keep it surfaced in the console). Orthogonal to state/lifecycle. */
   operatorSetPinned(sessionId: string, pinned: boolean): { sessionId: string; pinned: boolean } {
     return this.db.transaction(() => {
@@ -1484,12 +1762,34 @@ export class BrokerStore {
       // the id by value, not FK) and NEVER touch the transcript file on disk (transcript_path is
       // read-only here). component_instances/session_epochs carry no FK, but prune them too so a
       // removed session leaves no dangling per-session rows.
+      // BETA.10 WS1 (ADR 0033) — REMOVE = EXPLICIT DESTRUCTION. Before deleting the sessions row,
+      // terminalize every UNFINISHED delivery to this recipient with an explicit reason so no
+      // adoptable/silent orphan survives (queued/retry_wait/transport_written/accepted → dead_letter,
+      // failure_category='recipient_removed'). Messages/deliveries rows themselves are preserved as
+      // history (referenced by value, not FK); only their live state is closed out.
+      this.db.prepare(
+        `UPDATE deliveries SET state='${DeliveryState.DEAD_LETTER}', failure_category='recipient_removed', next_attempt_at=NULL, lease_expires_at=NULL, updated_at=? WHERE recipient_session_id=? AND state IN ('${DeliveryState.QUEUED}','${DeliveryState.RETRY_WAIT}','${DeliveryState.TRANSPORT_WRITTEN}','${DeliveryState.ACCEPTED}')`,
+      ).run(this.clock.nowIso(), sessionId);
       this.db.prepare('DELETE FROM aliases WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM session_instances WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM recipient_sequences WHERE recipient_session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM component_instances WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM session_epochs WHERE session_id=?').run(sessionId);
       this.db.prepare('DELETE FROM thread_participants WHERE session_id=?').run(sessionId);
+      // BETA.10 WS1 (ADR 0033): release + DELETE the durable name_ownership row (the freed handle
+      // returns to the pool, normally claimable by a new owner), and GC EVERY physical_session_map
+      // edge referencing this identity as physical source, canonical target, or logical identity.
+      // Together with the sessions DELETE this makes the identity UNRECLAIMABLE through any stale
+      // mapping and INVALIDATES the old ownership secret (no active/pending name_ownership row for
+      // resolveReclaim to match). This is the KNOWN-3 fix: remove no longer orphans the durable-
+      // identity tables (which previously enabled secret-less resurrection + inbox adoption).
+      this.db.prepare('DELETE FROM physical_session_map WHERE canonical_session_id=? OR physical_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId, sessionId);
+      this.db.prepare('DELETE FROM name_ownership WHERE current_session_id=? OR logical_identity_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId, sessionId);
+      // BETA.10 WS3: clean the removed identity's Collections membership transactionally (in this
+      // same remove txn). Deleting an AGENT cleans its collection_members rows; the collections
+      // themselves are untouched (removing a member never deletes a collection). Keyed on the
+      // durable logical id (membership follows the identity, not a physical session id).
+      this.db.prepare('DELETE FROM collection_members WHERE logical_agent_id=(SELECT logical_identity_id FROM sessions WHERE session_id=?)').run(sessionId);
       this.db.prepare('DELETE FROM sessions WHERE session_id=?').run(sessionId);
       this.ledger('OPERATOR_SESSION_RECORD_REMOVED', OPERATOR_LEDGER_ACTOR, { sessionId }, { transcriptPreserved: true });
       return { sessionId, removed: true };

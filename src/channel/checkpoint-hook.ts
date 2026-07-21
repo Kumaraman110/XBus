@@ -21,6 +21,7 @@ import { IpcClient } from '../ipc/client.js';
 import { buildCheckpointInjection, type PeerMessageForInjection } from './instructions.js';
 import { doHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
+import { classifyActivation } from './activation-state.js';
 
 export interface HookInput {
   hook_event_name?: string;
@@ -77,18 +78,41 @@ export async function runCheckpoint(input: HookInput, cfg: HookConfig): Promise<
     });
     const pull = await client.request('checkpoint_pull_hook', { checkpointId: input.checkpointId ?? uuidv7(), limit: maxPer });
     const messages = (pull.payload as { messages: PeerMessageForInjection[] }).messages ?? [];
-    if (messages.length === 0) {
+    const event = input.hook_event_name ?? 'UserPromptSubmit';
+
+    // BETA.10 (ADR 0036) — activation-consistency diagnostic, ONLY at the Stop hook (never at
+    // SessionStart: the documented hook-before-MCP registration race would false-positive on every
+    // healthy launch). By Stop, a plugin-loaded session's MCP has registered if it ever will, so
+    // "no mcp component EVER this epoch" is a true negative = the plugin did not load (bare `claude`).
+    // The broker emits the PLUGIN_NOT_LOADED audit AT MOST ONCE per (session, epoch); we surface the
+    // honest diagnostic to the user only on that first emission. We NEVER claim connected, and this
+    // does NOT touch the durable inbox — any queued messages stay queued for delivery after a correct
+    // `xclaude` relaunch.
+    let activationNotice = '';
+    if (event === 'Stop') {
+      try {
+        const diag = await client.request('activation_diagnose', {});
+        const p = diag.payload as { state?: string; firstEmission?: boolean };
+        if (diag.frameType !== 'error' && p.firstEmission === true && (p.state === 'PLUGIN_NOT_LOADED' || p.state === 'DEGRADED_HOOK_ONLY')) {
+          const v = classifyActivation({ mcpComponentRegistered: false, hookAnnounced: p.state === 'DEGRADED_HOOK_ONLY', brokerReachable: true });
+          activationNotice = `\n\n[XBus] ${v.summary}${v.remedy ? ` To connect XBus: ${v.remedy}.` : ''} Queued messages (if any) remain durable and will deliver after a connected relaunch.`;
+        }
+      } catch { /* diagnosis is best-effort; never block Claude on it */ }
+    }
+
+    if (messages.length === 0 && activationNotice === '') {
       return { exitCode: 0, injected: 0 };
     }
 
     const nonce = randomNonce();
-    const injection = buildCheckpointInjection(messages, nonce);
-    const event = input.hook_event_name ?? 'UserPromptSubmit';
+    // Combine any pending-message injection with the (once-only) activation notice. When there are
+    // no messages but there IS a notice, the notice alone is the additionalContext.
+    const injection = (messages.length > 0 ? buildCheckpointInjection(messages, nonce) : '') + activationNotice;
     const out = JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: injection } });
 
     // Stop continuation is bounded and opt-in. Never continue if stop already
     // active (anti-loop) and never when there was nothing to inject.
-    const wantContinue = cfg.autoContinueOnStop === true && event === 'Stop' && input.stop_hook_active !== true;
+    const wantContinue = cfg.autoContinueOnStop === true && event === 'Stop' && input.stop_hook_active !== true && messages.length > 0;
     return { stdout: out, exitCode: wantContinue ? 2 : 0, injected: messages.length };
   } finally {
     client.close();

@@ -1,0 +1,66 @@
+name: CI
+
+# BETA.10 release-engineering (task #284). Hosted verification so stable 1.0 does not depend
+# EXCLUSIVELY on local multi-agent evidence. This workflow runs the hosted-safe gate; it does NOT
+# modify release artifacts, does NOT publish, and never touches any developer's golden install
+# (it runs in a clean ephemeral GitHub runner with no access to ~/.claude).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege: read-only checkout, no write/packages/id-token scopes. No secrets are referenced
+# by any step (the gate needs none), so a compromised dependency step cannot exfiltrate a secret.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Approved runtime: the project floor is ">=22.13 <25" (package.json engines). Pin 22.13.x —
+      # inside the floor and NOT the machine-PATH v25 that is out of floor.
+      - name: Use approved Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.x'
+          cache: 'npm'
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # Unit shards are entirely OS-agnostic — run the whole tests/unit dir.
+      - name: Unit tests
+        run: npm run test:unit
+
+      # HOSTED-SAFE integration shards ONLY, via an EXPLICIT allow-list (vitest.hosted.config.ts →
+      # tests/integration-scope.ts HOSTED_SAFE_INTEGRATION). This is fail-closed: Windows-only,
+      # artifact/release, and real-broker/managed-child/liveness shards (install-db-rollback,
+      # artifact-first-install, installer, install-user-scope, bundled-*, singleton, perf-objectives,
+      # …) are NOT selected here — they stay on the Windows/Reliability/Release lane via the full
+      # `test:integration`. A new, unclassified integration test is not run here and the drift guard
+      # (hosted-scope-guard.test.ts) fails until it is classified. See docs/ci-scope.md.
+      # Invoked directly through the locked vitest dev-dependency (no package.json change).
+      - name: Integration tests (hosted-safe)
+        run: npx vitest run --config vitest.hosted.config.ts
+
+      # Dependency audit per the project's release policy (fail on a real advisory).
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high

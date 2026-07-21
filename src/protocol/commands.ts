@@ -25,6 +25,7 @@ export type FrameType =
   | 'redeliver' | 'redeliver_ack'
   | 'signal_readiness' | 'signal_readiness_ack'
   | 'get_status' | 'get_status_ack'
+  | 'activation_diagnose' | 'activation_diagnose_ack'
   | 'error'
   | 'shutdown' | 'shutdown_ack'
   | 'set_control' | 'set_control_ack'

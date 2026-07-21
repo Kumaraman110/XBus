@@ -292,12 +292,25 @@ describe('unregisterUserScope — ownership-scoped removal across both files', (
     expect(readClaudeConfig(configPath)!.mcpServers!.xbus).toBeDefined();
   });
 
-  it('does NOT remove an UNTAGGED user-authored hook that references our hook entry (scoped)', () => {
-    // A user manually added a hook invoking our hook-entry.js, WITHOUT an owner tag.
+  it('BETA.10 (ADR 0036): REMOVES a host-stripped (untagged) XBus hook at OUR install entry path on uninstall', () => {
+    // Claude re-serializes settings.json and drops the non-standard _xbusOwner tag, leaving an
+    // orphaned XBus hook pointing at OUR install-dir entry path (HOOK_JS). Pre-beta.10 the scoped
+    // uninstall skipped it (tag-only match) → the orphan survived uninstall and a bare `claude` kept
+    // announcing hook-only sessions for a removed product. The activation-honesty spec forbids that:
+    // an untagged handler matching OUR entry PATH is unambiguously ours (a user would not wire our
+    // private install-dir dist path themselves) and MUST be removed on uninstall.
     writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: NODE, args: [HOOK_JS] }] }] } });
     const u = unregisterUserScope(opts({ installId: 'mine' }));
-    expect(u.removed).toBe(false); // nothing of OURS (tagged 'mine') present → no-op
-    expect(JSON.stringify(readClaudeSettings(settingsPath)!.hooks)).toContain('hook-entry.js'); // user's hook kept
+    expect(u.removed).toBe(true);
+    expect(JSON.stringify(readClaudeSettings(settingsPath)?.hooks ?? {})).not.toContain('hook-entry.js'); // orphan removed
+  });
+
+  it('does NOT remove a hook at a DIFFERENT (non-XBus) entry path', () => {
+    // A genuinely user-authored hook that does NOT reference an XBus install entry is preserved.
+    writeSettings({ hooks: { Stop: [{ hooks: [{ type: 'command', command: NODE, args: ['C:/user/their-own-hook.js'] }] }] } });
+    const u = unregisterUserScope(opts({ installId: 'mine' }));
+    expect(u.removed).toBe(false);
+    expect(JSON.stringify(readClaudeSettings(settingsPath)?.hooks ?? {})).toContain('their-own-hook.js');
   });
 });
 
@@ -460,12 +473,23 @@ describe('inspectUserScopeHooks (read-only doctor view)', () => {
     expect(tagOnly.events.SessionStart.command).toBeNull();
   });
 
-  it('path detection is robust to Windows separator/case drift', () => {
-    // Host may re-serialize with mixed separators/case; a normalized compare still matches.
-    const driftedEntry = SESSION_START_JS.replace(/\//g, '\\').toUpperCase();
-    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [driftedEntry] }] }] } });
-    const v = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS });
-    expect(v.events.SessionStart.registered).toBe(true);
+  it('path detection is robust to separator drift (both platforms) and case drift (Windows only)', () => {
+    // The doctor's path normalization (user-scope-config.ts norm()) canonicalizes separators on
+    // EVERY platform (\ → /), but lowercases ONLY on win32 — deliberately, because a case-sensitive
+    // filesystem (Linux CI) must NOT treat differently-cased paths as equal. So:
+    //  • separator drift → matches everywhere;
+    //  • case drift → matches on Windows/macOS-style casefold hosts, but correctly does NOT match on
+    //    a case-sensitive host. This test asserts each per the platform it actually runs on, so it is
+    //    green on both the Windows dev box and the Linux hosted CI runner.
+    // (1) separator-only drift: universal match.
+    const sepDrift = SESSION_START_JS.replace(/\//g, '\\');
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [sepDrift] }] }] } });
+    expect(inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS }).events.SessionStart.registered).toBe(true);
+    // (2) separator + CASE drift: matches iff the host casefolds paths (win32).
+    const caseDrift = SESSION_START_JS.replace(/\//g, '\\').toUpperCase();
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [caseDrift] }] }] } });
+    const caseMatches = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS }).events.SessionStart.registered;
+    expect(caseMatches).toBe(process.platform === 'win32');
   });
 
   it('does NOT claim a foreign untagged hook even when expectedEntries is supplied', () => {

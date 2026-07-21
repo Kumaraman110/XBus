@@ -205,16 +205,25 @@ describe('durable identity reclaim — the fix', () => {
     expect(mapped.c).toBe(sidA);
   });
 
-  it('reaper releases name_ownership in the same sweep (no orphan active ownership)', () => {
+  it('reaper KEEPS name_ownership HELD on expiry (dormancy, not release — ADR 0033)', () => {
+    // BETA.10 WS1 (ADR 0033): expiry = DORMANCY, not deletion. beta.9 released name_ownership in the
+    // sweep (freeing the handle for takeover); that is the handle-takeover / continuity-loss bug the
+    // split-teardown decision fixes. The dormant identity now KEEPS its name_ownership 'active' with
+    // its owner_secret_hash + handle intact, so only the valid owner secret can reactivate it — a
+    // secret-less fresh claim of the same name is parked pending, not handed the handle.
     const sidA = sid();
-    reg({ sessionId: sidA, requestedSessionName: 'legacy' });
+    const a = reg({ sessionId: sidA, requestedSessionName: 'legacy' });
     clock.advance(16 * 24 * 60 * 60_000);
     reaper.sweep();
-    const own = db.prepare(`SELECT name_state AS s, normalized_name AS n FROM name_ownership WHERE current_session_id=?`).get(sidA) as { s: string; n: string | null } | undefined;
-    expect(own?.s).toBe('released');
-    expect(own?.n).toBeNull();
-    // a fresh session can now take the name.
+    const own = db.prepare(`SELECT name_state AS s, normalized_name AS n, owner_secret_hash AS h FROM name_ownership WHERE current_session_id=?`).get(sidA) as { s: string; n: string | null; h: string | null } | undefined;
+    expect(own?.s, 'expiry keeps the handle held, not released').toBe('active');
+    expect(own?.n, 'the durable name is still held for secret-gated reclaim').toBe('legacy');
+    expect(own?.h, 'the owner secret hash is preserved for reactivation').not.toBeNull();
+    // A secret-less fresh session cannot take the dormant handle — parked pending.
     const fresh = reg({ requestedSessionName: 'legacy' });
-    expect(fresh.sessionNameState).toBe('active');
+    expect(fresh.sessionNameState, 'dormant handle not takeable without the secret').not.toBe('active');
+    // The valid owner secret reactivates the ORIGINAL identity.
+    const back = reg({ requestedSessionName: 'legacy', ownerSecret: a.ownerSecret! });
+    expect(back.sessionId, 'valid secret reactivates the dormant identity').toBe(sidA);
   });
 });

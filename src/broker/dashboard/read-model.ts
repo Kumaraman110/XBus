@@ -13,6 +13,8 @@
 import type { SqliteDriver } from '../../database/connection.js';
 import { verifyLedger } from '../ledger.js';
 import { OPERATOR_SESSION_ID } from '../operator.js';
+import { BUILD_ID, SCHEMA_VERSION } from '../../protocol/handshake.js';
+import { XBUS_VERSION } from '../../protocol/version.js';
 
 /** The dashboard-visible label for a session, derived top-down, first-match-wins from the
  *  FOUR real fields (ADR 0020 Q2 decision table). */
@@ -66,6 +68,25 @@ export interface DashboardSession {
   internal: boolean;
   firstSeenAt: string | null;
   lastSeenSourceAt: string | null;
+  /** Beta.10 (Train B): operator-lifecycle + control state surfaced so the console can render
+   *  authoritative state after a mutation (the release gate: state must not contradict the broker
+   *  after refresh/restart). ADDITIVE — the columns already exist (migrations v3 + v10); this only
+   *  projects them. `receiveControl` LEFT-JOINs session_controls (absent row → 'active').
+   *  `managed` is `managed_by_xbus`; `managedPid` is the recorded pid (NOT a liveness proof — the
+   *  daemon's live in-process handle is the only kill-safe liveness signal, returned by stop_managed). */
+  pinned: boolean;
+  archived: boolean;
+  archivedAt: string | null;
+  receiveControl: string; // 'active' | 'paused' | 'do_not_disturb' | 'manual_checkpoint'
+  claudeTitle: string | null; // Claude-native display title (ADR 0024) — NEVER a routable alias
+  managed: boolean;
+  managedPid: number | null;
+  /** Beta.10 (Train B) inspector: the DURABLE logical identity this physical session belongs to
+   *  (ADR 0027). For a session that has never been reclaimed this equals its own session_id. */
+  logicalIdentityId: string | null;
+  /** Count of physical Claude-session ids that have been REDIRECTED onto this canonical session
+   *  (superseded twins in physical_session_map), PLUS the canonical itself. 1 = never reclaimed. */
+  physicalInstances: number;
   /** Delivery-state breakdown for messages addressed TO this session (blocker #6). */
   delivery: { queued: number; delivered: number; acknowledged: number; replied: number; failed: number };
   /** legacy fields kept for existing consumers/tests. */
@@ -75,18 +96,24 @@ export interface DashboardSession {
   lastSent: { to: string; at: string; state: string } | null;
   /** Last message this session RECEIVED (sender + when + delivery state), or null. */
   lastReceived: { from: string; at: string; state: string } | null;
+  /** BETA.10 WS3 (#2): runtime instance history for the inspector (present on the DETAIL view
+   *  only, not the roster list). Current + past component instances, newest-first, current flagged.
+   *  Physical/epoch internals stay in diagnostics — this surfaces the operator-facing shape. */
+  instances?: SessionInstance[];
 }
 
-export interface UnmanagedBanner {
-  /** Conservative aggregate count of possibly-unmanaged sessions (ADR 0013 D6). Computed
-   *  broker-side from a NON-INVASIVE live-`claude`-process count minus the managed+dormant
-   *  sessions the read model reports; the read-only worker never spawns processes, so it
-   *  reports `managedOrDormant` and 0 for `possibleUnmanaged` unless the broker posts a
-   *  live-process count. Never per-session, never invasive (ADR 0013 D6). */
-  possibleUnmanaged: number;
-  /** The count of managed+dormant sessions the read model knows (the subtrahend). */
-  managedOrDormant: number;
+/** BETA.10 WS3 (#2): a runtime instance (component) of a session, for the inspector history. */
+export interface SessionInstance {
+  instanceId: string;
+  role: string;               // 'hook' | 'mcp' | 'admin' (component role)
+  state: string;              // 'connected'|'disconnected' (normalized from live/closed/superseded)
+  processId: number;
+  connectedAt: string;
+  disconnectedAt: string | null;
+  lastSeenAt: string;
+  current: boolean;           // the live instance of the session's current epoch
 }
+
 
 export interface LedgerPage {
   events: Array<{ seq: number; eventType: string; actor: string; subject: unknown; payload: unknown; createdAt: string; entryHash: string }>;
@@ -158,6 +185,18 @@ export function isInternalSession(sessionId: string, projectId: string): boolean
   return slug === 'proj-cli' || slug === 'proj-install' || slug === 'proj-operator' || slug === '__xbus_operator__';
 }
 
+/** Decode the packed `session_controls.receiving` code into the receive-control mode string.
+ *  Mirrors ControlsStore.getControl (controls.ts): 1/absent=active, 0=paused, 2=dnd, 3=manual.
+ *  A NULL (no session_controls row via the LEFT JOIN) means the ControlsStore default 'active'. */
+function receiveControlFromCode(code: number | null): string {
+  switch (code) {
+    case 0: return 'paused';
+    case 2: return 'do_not_disturb';
+    case 3: return 'manual_checkpoint';
+    default: return 'active'; // 1 or NULL/unknown
+  }
+}
+
 /** Map a raw delivery state to the console's five user-facing states (queued/delivered/
  *  acknowledged/replied/failed) — the same rollup the session read model uses. */
 function mapDeliveryState(state: string): string {
@@ -177,18 +216,24 @@ export class DashboardReadModel {
   /** All sessions with their derived label + safe metadata (newest-first by first_seen). */
   sessions(): DashboardSession[] {
     const rows = this.db.prepare(
-      `SELECT session_id AS sessionId, session_name AS name, session_name_state AS nameState,
-              management_state AS mgmt, source_last AS source, identify_confidence AS conf,
-              agent_type AS agentType, project_alias AS projectAlias, project_id AS projectId,
-              state AS connState, readiness, expired_at AS expiredAt,
-              first_seen_at AS firstSeenAt, last_seen_source_at AS lastSeenSourceAt
-         FROM sessions
+      `SELECT s.session_id AS sessionId, s.session_name AS name, s.session_name_state AS nameState,
+              s.management_state AS mgmt, s.source_last AS source, s.identify_confidence AS conf,
+              s.agent_type AS agentType, s.project_alias AS projectAlias, s.project_id AS projectId,
+              s.state AS connState, s.readiness, s.expired_at AS expiredAt,
+              s.first_seen_at AS firstSeenAt, s.last_seen_source_at AS lastSeenSourceAt,
+              -- Beta.10 (Train B): operator-lifecycle + control projection (ADDITIVE; columns exist).
+              s.pinned AS pinned, s.archived AS archived, s.archived_at AS archivedAt,
+              s.claude_title AS claudeTitle, s.managed_by_xbus AS managed, s.managed_pid AS managedPid,
+              s.logical_identity_id AS logicalIdentityId, c.receiving AS receiving
+         FROM sessions s
+         -- LEFT JOIN so a session with no explicit control row reads as 'active' (the ControlsStore default).
+         LEFT JOIN session_controls c ON c.session_id = s.session_id
          -- Beta.8 (ADR 0027): a physical session id that has been REDIRECTED onto a canonical
          -- durable identity (name+inbox reclaimed by a new Claude session id) must not appear as
          -- a separate row — the console shows the ONE canonical session, never a phantom
          -- superseded twin. The canonical row itself is never a map KEY, so it is unaffected.
-         WHERE session_id NOT IN (SELECT physical_session_id FROM physical_session_map)
-         ORDER BY COALESCE(first_seen_at, created_at) DESC`,
+         WHERE s.session_id NOT IN (SELECT physical_session_id FROM physical_session_map)
+         ORDER BY COALESCE(s.first_seen_at, s.created_at) DESC`,
     ).all() as Array<Record<string, unknown>>;
 
     // BOUNDED aggregates (blocker #6): a FIXED number of set-wide GROUP BY queries, NOT one
@@ -199,6 +244,12 @@ export class DashboardReadModel {
     const deliveryByState = new Map<string, Record<string, number>>();
     for (const d of this.db.prepare(`SELECT recipient_session_id AS sid, state, COUNT(*) AS n FROM deliveries GROUP BY recipient_session_id, state`).all() as Array<{ sid: string; state: string; n: number }>) {
       const m = deliveryByState.get(d.sid) ?? {}; m[d.state] = d.n; deliveryByState.set(d.sid, m);
+    }
+    // Physical-instance count per canonical session (redirected twins), ONE GROUP BY (no N+1).
+    // A canonical with no reclaims has no row here → its count is just itself (1, added below).
+    const redirectCount = new Map<string, number>();
+    for (const p of this.db.prepare(`SELECT canonical_session_id AS sid, COUNT(*) AS n FROM physical_session_map GROUP BY canonical_session_id`).all() as Array<{ sid: string; n: number }>) {
+      redirectCount.set(p.sid, p.n);
     }
     // Last SENT per sender: the newest message row per sender_session_id, joined to its delivery
     // state. `NOT EXISTS a newer row for the same sender` picks exactly the latest (index-assisted).
@@ -252,6 +303,15 @@ export class DashboardReadModel {
         internal: isInternalSession(sid, (r.projectId as string) ?? ''),
         firstSeenAt: (r.firstSeenAt as string | null) ?? null,
         lastSeenSourceAt: (r.lastSeenSourceAt as string | null) ?? null,
+        pinned: (r.pinned as number) === 1,
+        archived: (r.archived as number) === 1,
+        archivedAt: (r.archivedAt as string | null) ?? null,
+        receiveControl: receiveControlFromCode(r.receiving as number | null),
+        claudeTitle: (r.claudeTitle as string | null) ?? null,
+        managed: (r.managed as number) === 1,
+        managedPid: (r.managedPid as number | null) ?? null,
+        logicalIdentityId: (r.logicalIdentityId as string | null) ?? null,
+        physicalInstances: 1 + (redirectCount.get(sid) ?? 0),
         delivery,
         queued: delivery.queued,
         unacknowledged: delivery.delivered,
@@ -263,7 +323,29 @@ export class DashboardReadModel {
 
   /** One session's detail (or null). Same safe projection as sessions(). */
   session(sessionId: string): DashboardSession | null {
-    return this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    const base = this.sessions().find((s) => s.sessionId === sessionId) ?? null;
+    if (!base) return null;
+    // BETA.10 WS3 (#2): attach the runtime instance history (DETAIL view only). newest-first;
+    // `current` = a live component in the session's CURRENT active_epoch. state normalized to
+    // connected/disconnected for the operator-facing shape (live→connected; closed/superseded→
+    // disconnected). Physical/epoch internals are not surfaced here (diagnostics only).
+    const activeEpoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
+    const rows = this.db.prepare(
+      `SELECT component_instance_id AS instanceId, role, state, process_id AS processId, epoch,
+              connected_at AS connectedAt, disconnected_at AS disconnectedAt, last_seen_at AS lastSeenAt
+         FROM component_instances WHERE session_id=? ORDER BY connected_at DESC`,
+    ).all(sessionId) as Array<{ instanceId: string; role: string; state: string; processId: number; epoch: number; connectedAt: string; disconnectedAt: string | null; lastSeenAt: string }>;
+    const instances: SessionInstance[] = rows.map((r) => ({
+      instanceId: r.instanceId,
+      role: r.role,
+      state: r.state === 'live' ? 'connected' : 'disconnected',
+      processId: r.processId,
+      connectedAt: r.connectedAt,
+      disconnectedAt: r.disconnectedAt,
+      lastSeenAt: r.lastSeenAt,
+      current: r.state === 'live' && activeEpoch !== null && r.epoch === activeEpoch,
+    }));
+    return { ...base, instances };
   }
 
   /**
@@ -418,14 +500,6 @@ export class DashboardReadModel {
     return mapDeliveryState(r?.state ?? 'queued');
   }
 
-  /** Aggregate banner data (ADR 0013 D6). The read-only worker cannot spawn a process
-   *  listing, so it reports the managed+dormant count (the honest subtrahend); the broker
-   *  computes the final `possibleUnmanaged` from a non-invasive live-process count. */
-  unmanagedBanner(): UnmanagedBanner {
-    const managedOrDormant = (this.db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE management_state IN ('active','dormant') AND expired_at IS NULL`).get() as { n: number }).n;
-    return { possibleUnmanaged: 0, managedOrDormant };
-  }
-
   /**
    * Audit-ledger chain health (blocker #7). Runs verifyLedger over the read-only handle and
    * reports {ok, checked, firstBreak?}. `lastVerifiedAt` is the broker's most recent periodic/
@@ -445,6 +519,58 @@ export class DashboardReadModel {
       lastVerifiedAt = row?.at ?? null;
     } catch { lastVerifiedAt = null; } // table absent (older DB / pre-first-verify) → null
     return { ok: v.ok, checked: v.checked, firstBreakSeq: v.firstBreak?.seq ?? null, lastVerifiedAt };
+  }
+
+  /**
+   * BETA.10 WS3 (#5) — broker/build/runtime/ledger health projection for the dashboard health panel.
+   * Shape matches the dashboard's locked consumption contract: { build, runtime, ledger, readWorker,
+   * capabilities }. The `ledger` block REUSES auditStatus() (no duplicate verifyLedger pass). `build`
+   * comes from the version constants; `runtime` from process (uptime/pid/node). `capabilities` is an
+   * explicit allowlist so the dashboard's probe lights the s10-neutral features (#1 redeliver, #2
+   * instances) deterministically rather than inferring. Read-only, off the broker loop.
+   */
+  health(): {
+    build: { version: string; buildId: string; schemaVersion: number };
+    runtime: { uptimeMs: number; pid: number; nodeVersion: string };
+    ledger: { ok: boolean; checked: number; firstBreakSeq: number | null; lastVerifiedAt: string | null };
+    readWorker: { inFlight: number; overloaded: boolean };
+    capabilities: string[];
+  } {
+    return {
+      build: { version: XBUS_VERSION, buildId: BUILD_ID, schemaVersion: SCHEMA_VERSION },
+      runtime: { uptimeMs: Math.round(process.uptime() * 1000), pid: process.pid, nodeVersion: process.version },
+      ledger: this.auditStatus(),
+      // The read worker's own depth isn't tracked in this projection layer (the worker wraps this
+      // call); report a stable not-overloaded baseline. A future worker-instrumented value can
+      // replace this without a shape change.
+      readWorker: { inFlight: 0, overloaded: false },
+      // Integration (Package D): 'remove_safe' advertises that this broker build has the KNOWN-3
+      // fix — operatorRemoveRecord atomically GCs physical_session_map + deletes name_ownership +
+      // terminalizes deliveries to recipient_removed + cleans collection_members (WS1 R1 162d44a).
+      // The dashboard gates its remove_record control on this capability, so remove only lights on
+      // a broker that supports the safe teardown (never the pre-KNOWN-3 corrupting primitive).
+      capabilities: ['redeliver', 'instances', 'remove_safe'],
+    };
+  }
+
+  /**
+   * BETA.10 WS3 — the workspace Collections read (dashboard contract), off-loop read-only. Mirrors
+   * BrokerStore.readCollections but on the read-worker's read-only handle. Ordered by sort_order.
+   */
+  collections(): { version: number; collections: Array<{ id: string; name: string; sortOrder: number; state: string }>; members: Record<string, string[]> } {
+    let cols: Array<{ id: string; name: string; sortOrder: number; state: string }> = [];
+    let memberRows: Array<{ cid: string; agent: string }> = [];
+    try {
+      cols = this.db.prepare(`SELECT collection_id AS id, name, sort_order AS sortOrder, state FROM collections WHERE workspace_id='local' ORDER BY sort_order ASC, normalized_name ASC`).all() as typeof cols;
+      memberRows = this.db.prepare(`SELECT collection_id AS cid, logical_agent_id AS agent FROM collection_members ORDER BY sort_order ASC`).all() as typeof memberRows;
+    } catch {
+      // s10 DB (collections tables absent) → fail-closed empty, never a partial/crash. The dashboard's
+      // capability probe treats this as "collections unavailable" and keeps localStorage.
+      return { version: 0, collections: [], members: {} };
+    }
+    const members: Record<string, string[]> = {};
+    for (const r of memberRows) { (members[r.agent] ??= []).push(r.cid); }
+    return { version: cols.length + memberRows.length + 1, collections: cols, members };
   }
 }
 
