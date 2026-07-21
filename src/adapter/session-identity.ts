@@ -12,6 +12,8 @@
  * Claude-specific identifier. This is NOT a claim of Codex production support — it is the seam that
  * makes such support trivial + fully testable later.
  */
+import os from 'node:os';
+import path from 'node:path';
 
 /** How the host reports the current runtime session id (a DISPOSABLE per-process instance id). */
 export interface SessionIdentitySource {
@@ -35,7 +37,7 @@ export class ClaudeCodeAdapter implements SessionIdentitySource {
   readonly canWake = true;
   constructor(
     private readonly env: NodeJS.ProcessEnv = process.env,
-    private readonly homedir: () => string = () => require('node:os').homedir() as string,
+    private readonly homedir: () => string = () => os.homedir(),
   ) {}
   resolveSessionId(fallback: string | null = null): string | null {
     return this.env.CLAUDE_CODE_SESSION_ID || fallback || null;
@@ -43,7 +45,7 @@ export class ClaudeCodeAdapter implements SessionIdentitySource {
   transcriptsRoot(): string | null {
     const override = this.env.XBUS_CLAUDE_PROJECTS_DIR;
     if (override) return override;
-    return require('node:path').join(this.homedir(), '.claude', 'projects');
+    return path.join(this.homedir(), '.claude', 'projects');
   }
 }
 
