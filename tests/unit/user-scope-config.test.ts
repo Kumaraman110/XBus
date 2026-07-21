@@ -460,12 +460,23 @@ describe('inspectUserScopeHooks (read-only doctor view)', () => {
     expect(tagOnly.events.SessionStart.command).toBeNull();
   });
 
-  it('path detection is robust to Windows separator/case drift', () => {
-    // Host may re-serialize with mixed separators/case; a normalized compare still matches.
-    const driftedEntry = SESSION_START_JS.replace(/\//g, '\\').toUpperCase();
-    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [driftedEntry] }] }] } });
-    const v = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS });
-    expect(v.events.SessionStart.registered).toBe(true);
+  it('path detection is robust to separator drift (both platforms) and case drift (Windows only)', () => {
+    // The doctor's path normalization (user-scope-config.ts norm()) canonicalizes separators on
+    // EVERY platform (\ → /), but lowercases ONLY on win32 — deliberately, because a case-sensitive
+    // filesystem (Linux CI) must NOT treat differently-cased paths as equal. So:
+    //  • separator drift → matches everywhere;
+    //  • case drift → matches on Windows/macOS-style casefold hosts, but correctly does NOT match on
+    //    a case-sensitive host. This test asserts each per the platform it actually runs on, so it is
+    //    green on both the Windows dev box and the Linux hosted CI runner.
+    // (1) separator-only drift: universal match.
+    const sepDrift = SESSION_START_JS.replace(/\//g, '\\');
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [sepDrift] }] }] } });
+    expect(inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS }).events.SessionStart.registered).toBe(true);
+    // (2) separator + CASE drift: matches iff the host casefolds paths (win32).
+    const caseDrift = SESSION_START_JS.replace(/\//g, '\\').toUpperCase();
+    writeSettings({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: NODE, args: [caseDrift] }] }] } });
+    const caseMatches = inspectUserScopeHooks(settingsPath, { SessionStart: SESSION_START_JS }).events.SessionStart.registered;
+    expect(caseMatches).toBe(process.platform === 'win32');
   });
 
   it('does NOT claim a foreign untagged hook even when expectedEntries is supplied', () => {
