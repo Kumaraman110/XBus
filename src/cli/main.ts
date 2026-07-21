@@ -20,6 +20,8 @@ import { XBusError, XBusErrorCode } from '../protocol/errors.js';
 import { install, uninstall } from './install.js';
 import { resolveDataDir, defaultInstallRoot, readInstallManifest } from '../launcher/install-paths.js';
 import { repairUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, inspectUserScopeHooks } from './user-scope-config.js';
+import { classifyActivation, type ActivationState } from '../channel/activation-state.js';
+import { planPersistentEnable } from './user-scope-config.js';
 import { readProvenance, resolveIdentity, provenancePathFromDist, classifyMixedBuild, type Provenance } from '../shared/build-identity.js';
 import { assertSupportedNode } from '../shared/node-support.js';
 import { readConfigEnv } from '../shared/env-config.js';
@@ -41,9 +43,13 @@ function thisIdentity(): Provenance {
   return resolveIdentity(SCHEMA_VERSION, prov);
 }
 
-async function cmdInstall(dryRun: boolean): Promise<CliResult> {
-  const r = await install({ dryRun });
+async function cmdInstall(dryRun: boolean, persistent = false, force = false): Promise<CliResult> {
+  const r = await install({ dryRun, persistent, ...(force ? { forcePersistent: true } : {}) });
   if (dryRun) {
+    // BETA.10 (ADR 0036): when --persistent, compute + surface the exact settings.json mutation
+    // (target file / property / current→proposed / backup / rollback) WITHOUT mutating anything.
+    const settingsPath = defaultClaudeSettingsPath();
+    const pp = persistent ? planPersistentEnable(settingsPath) : null;
     const lines = [
       `agentel install (dry-run) — no changes made.`,
       `  source:      ${r.plan.source}`,
@@ -53,8 +59,21 @@ async function cmdInstall(dryRun: boolean): Promise<CliResult> {
       `  files:       ${r.plan.filesToWrite} to write`,
       `  backups:     ${r.plan.willBackup.length} existing file(s) would be backed up`,
       `  already installed: ${r.plan.alreadyInstalled}`,
+      `  launcher:    xclaude (added to PATH; system 'claude' is NEVER shadowed)`,
+      `  persistent:  ${persistent ? 'REQUESTED' : 'no (default — persistent Claude plugin config untouched)'}`,
     ];
-    return { human: lines.join('\n'), json: { ...r }, exitCode: 0 };
+    if (pp) {
+      lines.push(
+        `    settings file:   ${pp.settingsPath}${pp.createsFile ? ' (would be created)' : ''}`,
+        `    property:        ${pp.property}`,
+        `    current value:   ${pp.alreadyEnabled ? 'true (already enabled — no change)' : pp.conflict ? `${JSON.stringify(pp.conflictValue)} (CONFLICT — refused without --force)` : '(absent)'}`,
+        `    proposed value:  true`,
+        `    hooks:           unchanged (SessionStart/UserPromptSubmit/Stop already user-scope)`,
+        `    backup:          ${pp.createsFile ? 'none (new file)' : `${pp.settingsPath}.xbus-backup-<pid> before mutation`}`,
+        `    rollback:        restore the backup (or delete the created file) on any failure`,
+      );
+    }
+    return { human: lines.join('\n'), json: { ...r, persistentPlan: pp }, exitCode: 0 };
   }
   if (!r.ok) {
     return { human: `agentel install FAILED: ${r.error ?? 'unknown'}${r.rolledBack ? ' (rolled back)' : ''}\nRun: ${invocationHint('doctor')}`, json: { ...r }, exitCode: 1 };
@@ -366,7 +385,46 @@ async function cmdDoctor(): Promise<CliResult> {
       if (r.frameType === 'get_metrics_ack') metrics = (r.payload as { metrics: unknown }).metrics;
     } catch { /* metrics are optional; doctor still reports health */ }
   }
-  const human = ['XBus doctor', ...checks.map((c) => `  [${c.ok ? 'ok' : 'XX'}] ${c.name}: ${c.detail}`)].join('\n');
+  // BETA.10 (ADR 0036) — ACTIVATION state, from the SAME classifier the Stop hook uses (one
+  // decision path for human + JSON). doctor runs as `admin`, so when invoked inside a Claude
+  // session (CLAUDE_CODE_SESSION_ID present) it asks the broker to diagnose THAT session; otherwise
+  // it reports the operator-level view (broker reachable + plugin installed). The race is irrelevant
+  // here — a human runs doctor well after any SessionStart, so a synchronous check is honest.
+  let activation = classifyActivation({
+    // If a session id is present, we could diagnose it via the broker; doctor's default view is
+    // operator-level: plugin INSTALLED (this build resolved its identity) + broker reachability.
+    mcpLoadedThisSession: idError === null, // this build/plugin is present & resolvable
+    brokerReachable: brokerOk,
+    mcpChannelConnected: brokerOk,
+  });
+  let activationEvidence: Record<string, unknown> = { source: 'operator-view', mcpEver: idError === null, mcpLive: brokerOk, hookPresent: null, brokerReachable: brokerOk };
+  const sessCtx = process.env.CLAUDE_CODE_SESSION_ID;
+  if (sessCtx && brokerOk) {
+    try {
+      const c = new IpcClient(ep, { requestTimeoutMs: 2000, rootSecret: loadOrCreateRootSecret(dir), helloIdentity: { claimedRole: 'hook', claimedSessionId: sessCtx } });
+      await c.connect();
+      const d = await c.request('activation_diagnose', {});
+      c.close();
+      if (d.frameType !== 'error') {
+        const p = d.payload as { state?: ActivationState; mcpEver?: boolean; mcpLive?: boolean; hookPresent?: boolean; epoch?: number | null };
+        activation = classifyActivation({ mcpComponentRegistered: p.mcpEver, mcpChannelConnected: p.mcpLive, hookAnnounced: p.hookPresent, brokerReachable: true });
+        activationEvidence = { source: 'session', sessionId: sessCtx, epoch: p.epoch ?? null, mcpEver: p.mcpEver ?? false, mcpLive: p.mcpLive ?? false, hookPresent: p.hookPresent ?? false, brokerReachable: true };
+      }
+    } catch { /* keep the operator-view classification */ }
+  } else if (!brokerOk) {
+    activation = classifyActivation({ mcpLoadedThisSession: idError === null, brokerReachable: false });
+  }
+  // Per-state exit codes (documented, distinct) so a caller asserts exactly, no screen-scraping.
+  const ACTIVATION_EXIT: Record<ActivationState, number> = {
+    CONNECTED: 0,
+    PLUGIN_NOT_LOADED: 10,
+    MCP_DISCONNECTED: 11,
+    BROKER_UNAVAILABLE: 12,
+    DEGRADED_HOOK_ONLY: 13,
+  };
+  const persistentOptInAvailable = true; // `xbus install --persistent` is offered (opt-in, off by default)
+
+  const human = [`XBus doctor`, `  activation: ${activation.state} — ${activation.summary}${activation.remedy ? ` (${activation.remedy})` : ''}`, ...checks.map((c) => `  [${c.ok ? 'ok' : 'XX'}] ${c.name}: ${c.detail}`)].join('\n');
   // The doctor JSON carries the FULL identity model + the
   // installed-artifact manifest checksum + the broker's exact build + a mixed-build
   // verdict (see ADR 0011). Legacy keys (version/buildId) are preserved as the compat values.
@@ -392,12 +450,22 @@ async function cmdDoctor(): Promise<CliResult> {
     compatibilityResult: compatibility,
     mixedBuildStatus,
     mixedBuilds,
+    // BETA.10 (ADR 0036) activation contract — stable machine-readable state + evidence.
+    activation: activation.state,
+    activationConnected: activation.connected,
+    activationSummary: activation.summary,
+    activationRemedy: activation.remedy ?? null,
+    activationEvidence,
+    persistentOptInAvailable,
     // legacy keys retained:
     version: id.productVersion,
     checks,
   };
   if (metrics !== undefined) json.metrics = metrics;
-  return { human, json, exitCode: 0 };
+  // Exit code carries the activation verdict (CONNECTED=0; distinct non-zero per non-connected
+  // state). doctor's own broker/contract failures still surface in `checks`; the exit code is the
+  // activation verdict so a caller can branch on it deterministically.
+  return { human, json, exitCode: ACTIVATION_EXIT[activation.state] };
 }
 
 async function cmdStatus(): Promise<CliResult> {
@@ -676,7 +744,7 @@ export async function run(argv: string[]): Promise<void> {
   try {
     switch (cmd) {
       case 'install':
-        return emit(await cmdInstall(args.includes('--dry-run')), asJson);
+        return emit(await cmdInstall(args.includes('--dry-run'), args.includes('--persistent'), args.includes('--force')), asJson);
       case 'uninstall':
         return emit(cmdUninstall(args.includes('--dry-run'), args.includes('--remove-data')), asJson);
       case 'repair':
@@ -804,7 +872,7 @@ export async function run(argv: string[]): Promise<void> {
       default:
         return emit({ human: [
           'agentel <command> [--json]   (alias: xbus, deprecated)',
-          '  install [--dry-run]               install the AgenTel plugin (user scope)',
+          '  install [--dry-run] [--persistent [--force]]  install the AgenTel plugin (user scope); --persistent opts into enabledPlugins so bare `claude` loads it',
           '  uninstall [--dry-run] [--remove-data]',
           '  verify [--skip-acceptance]        one-command full verification on an approved runtime',
           '  release-check [--bundled-node <p>] pre-tag readiness + reproducible artifact SHA-256',

@@ -345,6 +345,8 @@ export class BrokerDaemon {
           return this.onGetMetrics(conn, frame);
         case 'get_status':
           return this.onStatus(conn, frame);
+        case 'activation_diagnose':
+          return this.onActivationDiagnose(conn, frame);
         case 'heartbeat':
           return this.reply(conn, 'heartbeat_ack', { ok: true }, frame.requestId);
         case 'shutdown':
@@ -1222,6 +1224,24 @@ export class BrokerDaemon {
       session,
     };
     this.reply(conn, 'get_status_ack', payload, frame.requestId);
+  }
+
+  /**
+   * BETA.10 (ADR 0036) — activation diagnosis for the Stop hook / doctor. Keyed on the AUTHENTICATED
+   * connection's session (this.connAuth), never a caller-supplied id, so a caller can't probe another
+   * session. This is a READ + a best-effort once-only audit (no ownership/routing mutation); the HOOK
+   * role is authorized (no assertAllowed(mcp-only) gate — it needs no mcp authority to read its own
+   * session's component presence). Returns the state enum + evidence for an honest diagnostic.
+   */
+  private onActivationDiagnose(conn: ServerConn, frame: Frame): void {
+    const auth = this.connAuth.get(conn.id);
+    if (!auth) {
+      // No authenticated session on this connection — cannot diagnose; report unknown, no emit.
+      this.reply(conn, 'activation_diagnose_ack', { state: 'PLUGIN_NOT_LOADED', epoch: null, mcpEver: false, mcpLive: false, hookPresent: false, firstEmission: false }, frame.requestId);
+      return;
+    }
+    const d = this.store.diagnoseActivationOnce(auth.sessionId);
+    this.reply(conn, 'activation_diagnose_ack', { ...d, sessionId: auth.sessionId }, frame.requestId);
   }
 
   private receiveModeOf(sessionId: string): string {

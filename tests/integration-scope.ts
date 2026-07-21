@@ -25,6 +25,7 @@
 
 /** Runs on the hosted Ubuntu lane (and locally). OS-agnostic, in-process, no artifact/Windows deps. */
 export const HOSTED_SAFE_INTEGRATION: readonly string[] = [
+  'activation-diagnose.test.ts',
   'adapter-conformance.test.ts',
   'adapter-registration-enforcement.test.ts',
   'beta3-to-beta4-upgrade.test.ts',
@@ -92,6 +93,7 @@ export const LOCAL_ONLY_INTEGRATION: ReadonlyArray<{ file: string; reason: strin
   { file: 'clean-profile-lifecycle.test.ts', reason: 'Broker/process + process-creation-time liveness (spawns a real broker host).' },
   { file: 'control-plane-e2e.test.ts', reason: 'Broker/managed-child: real long-lived broker + live dashboard HTTP + worker_thread + real socket.' },
   { file: 'dashboard-agent-controls-e2e.test.ts', reason: 'Broker/managed-child: spawns a real long-lived broker host.' },
+  { file: 'doctor-activation-contract.test.ts', reason: 'Spawns the compiled dist CLI child (doctor --json); needs dist/.' },
   { file: 'degraded-secret-startup.test.ts', reason: 'Broker/process: spawns real child processes of compiled dist entrypoints.' },
   { file: 'four-replica-matrix.test.ts', reason: 'Broker/managed-child: real long-lived broker + real IPC; 120s budget, timing-sensitive.' },
   { file: 'idle-wake.test.ts', reason: 'Broker/managed-child: real long-lived broker + rewaker on real wall-clock polling.' },

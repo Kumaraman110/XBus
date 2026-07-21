@@ -32,6 +32,17 @@ import type { SendInput } from '../protocol/schemas.js';
  *  an optional operator-set subject for a NEW thread. */
 export type OperatorSendInput = SendInput & { threadId?: string; parentMessageId?: string; subject?: string };
 
+/** BETA.10 (ADR 0036) — result of a Stop-hook activation diagnosis (see diagnoseActivationOnce). */
+export interface ActivationDiagnosis {
+  state: 'CONNECTED' | 'PLUGIN_NOT_LOADED' | 'MCP_DISCONNECTED' | 'BROKER_UNAVAILABLE' | 'DEGRADED_HOOK_ONLY';
+  epoch: number | null;
+  mcpEver: boolean;
+  mcpLive: boolean;
+  hookPresent: boolean;
+  /** True iff THIS call emitted the once-only PLUGIN_NOT_LOADED audit for (session, epoch). */
+  firstEmission: boolean;
+}
+
 /** 15 EXACT days (not "15 calendar dates") — ADR 0012 Decision 5. A session's
  *  routing expires this long after its last MEANINGFUL activity. */
 export const MEANINGFUL_ACTIVITY_RETENTION_MS = 15 * 24 * 60 * 60_000;
@@ -392,6 +403,84 @@ export class BrokerStore {
     if (epoch === undefined) return false;
     const n = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp' AND state='live'`).get(sessionId, epoch) as { n: number }).n;
     return n > 0;
+  }
+
+  /**
+   * BETA.10 (ADR 0036) activation diagnostics — did an mcp component EVER register for this session
+   * in its current epoch (ANY state: live, superseded, or closed)? This is the plugin-loaded signal,
+   * and it is deliberately NOT `hasLiveMcp` (live-now): at the Stop hook we need "was the plugin ever
+   * loaded this session" to distinguish PLUGIN_NOT_LOADED (never — bare `claude`) from
+   * MCP_DISCONNECTED (loaded then the channel dropped). Read-only; no state change; usable by a
+   * hook-role query. Returns {ever, live} so callers can grade the state.
+   */
+  mcpComponentPresence(sessionId: string): { ever: boolean; live: boolean } {
+    const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e;
+    if (epoch === undefined) return { ever: false, live: false };
+    const ever = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp'`).get(sessionId, epoch) as { n: number }).n > 0;
+    const live = (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp' AND state='live'`).get(sessionId, epoch) as { n: number }).n > 0;
+    return { ever, live };
+  }
+
+  /** Has a HOOK component ever registered for this session (any state, current epoch)? Paired with
+   *  mcpComponentPresence to detect the DEGRADED_HOOK_ONLY split-state (hook announced, mcp never). */
+  hookComponentPresent(sessionId: string): boolean {
+    const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e;
+    if (epoch === undefined) return false;
+    return (this.db.prepare(`SELECT COUNT(*) AS n FROM component_instances WHERE session_id=? AND epoch=? AND role='hook'`).get(sessionId, epoch) as { n: number }).n > 0;
+  }
+
+  /**
+   * BETA.10 (ADR 0036) — Stop-hook activation diagnosis. Classifies the plugin/MCP activation state
+   * for a session at its CURRENT epoch from broker-owned facts (component_instances roles), and, when
+   * the plugin is absent (no mcp component EVER this epoch), records ONE best-effort
+   * PLUGIN_NOT_LOADED audit event — keyed on (session_id, epoch) so it fires at most once per
+   * activation attempt. This is the once-only source of truth (Adversarial's audit-derived design):
+   * derived from the EXISTING audit_events table, so it survives a broker restart (property 3) and a
+   * new epoch (a real `xclaude` relaunch bumps the epoch → a fresh plugin-absent epoch re-diagnoses,
+   * property 4), with NO new schema/state-file/wire field.
+   *
+   * Atomic + idempotent (properties 1+2): the classify → check-prior-audit → insert runs in ONE
+   * db.transaction, so concurrent/repeated Stop hooks serialize and produce AT MOST ONE audit +
+   * `firstEmission:true`. NEVER classifies at SessionStart — the caller (Stop hook) guarantees the
+   * hook-before-mcp race (store.ts registration-order note) is resolved by end of first turn.
+   *
+   * Pure diagnostic: no ownership/routing mutation, no ledger, no message loss. Returns the state +
+   * evidence for the caller (hook diagnostic / doctor) and whether THIS call emitted the audit.
+   */
+  diagnoseActivationOnce(sessionId: string): ActivationDiagnosis {
+    return this.db.transaction((): ActivationDiagnosis => {
+      const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
+      if (epoch === null) {
+        // No such session row — treat as plugin-not-loaded (nothing registered at all).
+        return { state: 'PLUGIN_NOT_LOADED', epoch: null, mcpEver: false, mcpLive: false, hookPresent: false, firstEmission: false };
+      }
+      const { ever: mcpEver, live: mcpLive } = this.mcpComponentPresence(sessionId);
+      const hookPresent = this.hookComponentPresent(sessionId);
+
+      // State: mcp EVER present distinguishes PLUGIN_NOT_LOADED (never) from MCP_DISCONNECTED
+      // (existed then channel dropped). CONNECTED requires a LIVE mcp component right now.
+      let state: ActivationDiagnosis['state'];
+      if (mcpLive) state = 'CONNECTED';
+      else if (mcpEver) state = 'MCP_DISCONNECTED';
+      else if (hookPresent) state = 'DEGRADED_HOOK_ONLY'; // hook announced, mcp never — the split-state
+      else state = 'PLUGIN_NOT_LOADED';
+
+      // Emit the plugin-absence audit AT MOST ONCE per (session, epoch). Only for the plugin-absent
+      // states (PLUGIN_NOT_LOADED / DEGRADED_HOOK_ONLY); CONNECTED/MCP_DISCONNECTED don't warn.
+      let firstEmission = false;
+      if (state === 'PLUGIN_NOT_LOADED' || state === 'DEGRADED_HOOK_ONLY') {
+        const prior = this.db.prepare(
+          `SELECT COUNT(*) AS n FROM audit_events
+             WHERE event_type='PLUGIN_NOT_LOADED' AND actor_session_id=?
+               AND json_extract(safe_metadata_json,'$.epoch')=?`,
+        ).get(sessionId, epoch) as { n: number };
+        if (prior.n === 0) {
+          this.audit('PLUGIN_NOT_LOADED', { sessionId, epoch, state });
+          firstEmission = true;
+        }
+      }
+      return { state, epoch, mcpEver, mcpLive, hookPresent, firstEmission };
+    });
   }
 
   /**
