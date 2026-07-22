@@ -1157,7 +1157,7 @@ export class BrokerStore {
    * mcp-role only (a hook must not rename). All in one transaction so a failure
    * leaves the prior name binding intact.
    */
-  renameSession(auth: SessionAuthority, rawName: string): SessionNameStatus & { ownerSecret?: string | null } {
+  renameSession(auth: SessionAuthority, rawName: string, ownerSecret?: string): SessionNameStatus & { ownerSecret?: string | null; reclaimOutcome?: ReclaimOutcomeCode } {
     if (auth.role !== ComponentRole.MCP) {
       throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'only the mcp component may name/rename a session');
     }
@@ -1166,10 +1166,39 @@ export class BrokerStore {
       const s = this.db.prepare('SELECT active_epoch, session_name_state AS state, expired_at AS expiredAt FROM sessions WHERE session_id=?').get(auth.sessionId) as { active_epoch: number; state: string; expiredAt: string | null } | undefined;
       if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
       if (s.active_epoch !== auth.epoch) throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
+      let reclaimOutcome: ReclaimOutcomeCode | undefined;
       const taken = this.db
         .prepare(`SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`)
         .get(norm.normalized, auth.sessionId) as { session_id: string } | undefined;
-      if (taken) throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      if (taken) {
+        // BETA.11 (ADR 0037): the manual escape hatch no longer collapses every taken-name into a
+        // blanket XBUS_SESSION_NAME_TAKEN. If the caller presents a VALID owner-secret for the name's
+        // durable identity AND the incumbent is NOT provably live, release the (dead/dormant)
+        // incumbent's name ownership so this session can take it — a credential-gated manual reclaim,
+        // same gates as the register path (never evict a proven-live incumbent, wrong secret refused).
+        const own = this.db
+          .prepare(`SELECT logical_identity_id AS lid, owner_secret_hash AS hash, current_session_id AS csid FROM name_ownership WHERE normalized_name=? AND name_state IN ('active','pending')`)
+          .get(norm.normalized) as { lid: string; hash: string | null; csid: string | null } | undefined;
+        const nowT = this.clock.nowIso();
+        if (ownerSecret === undefined || own?.hash == null) {
+          reclaimOutcome = own?.hash == null ? 'unrelated-owns' : 'credential-missing';
+          throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display, reclaimOutcome });
+        }
+        if (own.hash !== BrokerStore.hashSecret(ownerSecret)) {
+          throw new XBusError(XBusErrorCode.RECLAIM_CREDENTIAL_INVALID, 'ownership secret does not match the durable name owner', { name: norm.display, reclaimOutcome: 'credential-invalid' });
+        }
+        if (own.csid && this.hasProvenLiveMcp(own.csid)) {
+          throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name held by a live owner', { name: norm.display, reclaimOutcome: 'predecessor-live' });
+        }
+        // Valid secret + not-proven-live incumbent: release the incumbent's name ownership + its
+        // sessions-row name binding through the ONE release primitive, so the current session can
+        // claim the freed name below (no divergence between the two name representations).
+        this.releaseNameOwnership({ normalizedNameNot: { name: norm.normalized, exceptLogicalId: this.logicalIdOf(auth.sessionId) } }, true, nowT);
+        if (own.csid) {
+          this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='unnamed', updated_at=? WHERE session_id=? AND normalized_session_name=?`).run(nowT, own.csid, norm.normalized);
+        }
+        reclaimOutcome = 'reclaim-succeeded';
+      }
       const now = this.clock.nowIso();
       // Beta.4 (ADR 0012 D6): if this session was EXPIRED (the reaper set expired_at +
       // 'retired' while its connection stayed alive on non-meaningful heartbeats), a
@@ -1212,12 +1241,12 @@ export class BrokerStore {
       // Beta.8 (ADR 0027): mirror the (re)named identity into name_ownership — the durable name
       // authority — in the same transaction; mint a stable owner secret on first protected award
       // (reused, not rotated, on subsequent renames so the client cannot be self-locked-out).
-      const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
+      const { ownerSecret: mintedSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
       // Beta.10 Stage 0 (ADR-0027 D7): a rename is a committed name-authority transition → hash-chained
       // (was audit()). actor = the renaming session; payload carries the display name only (NEVER the
       // ownerSecret — D7 invariant: the plaintext secret must not appear in ledger_events/audit_events).
       this.ledger(wasExpired ? 'session.expired_resumed_via_rename' : 'session.rename', auth.sessionId, { sessionId: auth.sessionId }, { name: norm.display });
-      return { state: 'active', name: norm.display, ownerSecret };
+      return { state: 'active', name: norm.display, ownerSecret: mintedSecret, ...(reclaimOutcome ? { reclaimOutcome } : {}) };
     });
   }
 

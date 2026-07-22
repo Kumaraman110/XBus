@@ -37,6 +37,8 @@ import { DeliveryState } from '../../src/protocol/states.js';
 import { saveOwnerSecret, loadOwnerSecret, saveDurableName, resolveDurableName } from '../../src/channel/owner-secret-store.js';
 import { normalizeSessionName, suggestSessionName } from '../../src/identity/session-name.js';
 import { deriveWorkspaceSuggestion } from '../../src/identity/project.js';
+import { XBusError, XBusErrorCode } from '../../src/protocol/errors.js';
+import type { LivenessVerdict } from '../../src/broker/liveness-proof.js';
 
 let dir: string; let db: SqliteDriver; let store: BrokerStore; let clock: FakeClock; let reaper: Reaper;
 let dataDir: string;
@@ -141,5 +143,87 @@ describe('BETA.11 C1 — resumed session recovers its awarded name and auto-recl
     // New sends resolve to the (now-reclaimed, active) durable identity.
     const res2 = store.send(sender, { to: 'AccountLookUp', text: 'ping', kind: 'request', requiresAck: false, requiresReply: false });
     expect(res2.recipientSessionId).toBe(sidA);                // canonical durable id (== the reclaimed session)
+  });
+});
+
+/** Build a store whose reclaim liveness verdict is INJECTED (deterministic — no real OS probe). */
+function storeWithLiveness(verdict: LivenessVerdict): BrokerStore {
+  return new BrokerStore(db, clock, new SeqIdGen('m'), 'b', undefined, () => verdict);
+}
+function disconnectStaleLive(sessionId: string): void {
+  // A HARD crash: session→disconnected but the mcp component row is LEFT 'live' (onConnClose never fired).
+  db.prepare(`UPDATE sessions SET state='disconnected', bound_connection_id=NULL, last_seen_at=? WHERE session_id=?`).run(clock.nowIso(), sessionId);
+}
+
+describe('BETA.11 #2 — proven-liveness reclaim gate (crashed predecessor with stale-\'live\' mcp)', () => {
+  it('a PROVEN-DEAD predecessor whose mcp row is stale-\'live\' is reclaimed by the credential holder', () => {
+    const s = storeWithLiveness('proven_dead_or_recycled');
+    const sidA = sid();
+    const a = s.register({ sessionId: sidA, instanceId: 'i', connectionId: `c-${sidA}`, processId: 4242, projectId: PROJECT, cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    const rn = s.renameSession(a, 'CrashName');
+    disconnectStaleLive(sidA); // stale 'live' mcp row remains — beta.10 would refuse reclaim forever
+    const sidB = sid();
+    const b = s.register({ sessionId: sidB, instanceId: 'i', connectionId: `c-${sidB}`, processId: 5, projectId: PROJECT, cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'CrashName', ownerSecret: rn.ownerSecret as string });
+    expect(b.reclaimOutcome).toBe('reclaim-succeeded');
+    expect(b.sessionId).toBe(sidA);                    // redirected onto the (proven-dead) canonical id
+    expect(b.awardedSessionName).toBe('CrashName');
+  });
+
+  it('an INCONCLUSIVE-liveness predecessor is NOT evicted (fail-closed — never evict a possibly-live incumbent)', () => {
+    const s = storeWithLiveness('inconclusive');
+    const sidA = sid();
+    const a = s.register({ sessionId: sidA, instanceId: 'i', connectionId: `c-${sidA}`, processId: 4242, projectId: PROJECT, cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp' });
+    const rn = s.renameSession(a, 'MaybeAlive');
+    disconnectStaleLive(sidA);
+    const sidB = sid();
+    const b = s.register({ sessionId: sidB, instanceId: 'i', connectionId: `c-${sidB}`, processId: 5, projectId: PROJECT, cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', requestedSessionName: 'MaybeAlive', ownerSecret: rn.ownerSecret as string });
+    expect(b.reclaimOutcome).toBe('predecessor-live'); // refused — fail-closed
+    expect(b.sessionId).toBe(sidB);                    // NOT redirected; registers under its own id
+    expect(b.sessionNameState).not.toBe('active');
+  });
+});
+
+describe('BETA.11 B1 — rename secret-gated reclaim (the manual escape hatch, precise diagnostics)', () => {
+  function reg(over: Partial<Parameters<BrokerStore['register']>[0]> = {}): SessionAuthority {
+    const s = over.sessionId ?? sid();
+    return store.register({ sessionId: s, instanceId: 'i', connectionId: `c-${s}`, processId: 1, projectId: PROJECT, cwd: '/', receiveMode: 'hook_checkpoint', capabilities: ['ack', 'reply'], role: 'mcp', ...over });
+  }
+  it('a valid owner-secret lets a manual rename reclaim a DISCONNECTED durable owner\'s name', () => {
+    const sidA = sid();
+    const a = reg({ sessionId: sidA });
+    const rn = store.renameSession(a, 'ManualReclaim');
+    // A disconnects gracefully (mcp component closed → not live).
+    db.prepare(`UPDATE sessions SET state='disconnected', last_seen_at=? WHERE session_id=?`).run(clock.nowIso(), sidA);
+    db.prepare(`UPDATE component_instances SET state='closed', disconnected_at=? WHERE session_id=? AND state='live'`).run(clock.nowIso(), sidA);
+    // B is a fresh session that (for whatever reason) did not auto-reclaim; it manually renames WITH the secret.
+    const b = reg();
+    const r = store.renameSession(b, 'ManualReclaim', rn.ownerSecret as string);
+    expect(r.state).toBe('active');
+    expect(r.reclaimOutcome).toBe('reclaim-succeeded');
+    expect(nameState(b.sessionId).name).toBe('ManualReclaim');
+  });
+  it('a WRONG secret gets a precise RECLAIM_CREDENTIAL_INVALID, not a blanket NAME_TAKEN', () => {
+    const a = reg();
+    store.renameSession(a, 'Guarded');
+    db.prepare(`UPDATE sessions SET state='disconnected' WHERE session_id=?`).run(a.sessionId);
+    db.prepare(`UPDATE component_instances SET state='closed' WHERE session_id=? AND state='live'`).run(a.sessionId);
+    const b = reg();
+    let code: string | undefined; let reason: unknown;
+    try { store.renameSession(b, 'Guarded', 'not-the-secret'); }
+    catch (e) { code = (e as XBusError).code; reason = ((e as XBusError).detail as { reclaimOutcome?: string } | undefined)?.reclaimOutcome; }
+    expect(code).toBe(XBusErrorCode.RECLAIM_CREDENTIAL_INVALID);
+    expect(reason).toBe('credential-invalid');
+  });
+  it('a secret-LESS rename against a held name still fails (no weakening) — with a precise reason', () => {
+    const a = reg();
+    store.renameSession(a, 'StillHeld');
+    db.prepare(`UPDATE sessions SET state='disconnected' WHERE session_id=?`).run(a.sessionId);
+    db.prepare(`UPDATE component_instances SET state='closed' WHERE session_id=? AND state='live'`).run(a.sessionId);
+    const b = reg();
+    let code: string | undefined; let reason: unknown;
+    try { store.renameSession(b, 'StillHeld'); }
+    catch (e) { code = (e as XBusError).code; reason = ((e as XBusError).detail as { reclaimOutcome?: string } | undefined)?.reclaimOutcome; }
+    expect(code).toBe(XBusErrorCode.SESSION_NAME_TAKEN);
+    expect(reason).toBe('credential-missing');
   });
 });

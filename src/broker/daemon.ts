@@ -574,14 +574,18 @@ export class BrokerDaemon {
     // launched from the same project picked the same suggested name). mcp-role only;
     // SESSION_NAME_TAKEN / INVALID_SESSION_NAME surface to the model so it can retry.
     const auth = this.requireAuth(conn);
-    const p = (frame.payload ?? {}) as { name?: string };
-    const r = this.store.renameSession(auth, p.name as string);
+    // BETA.11 (ADR 0037): an OPTIONAL ownerSecret enables a credential-gated MANUAL reclaim of a name
+    // held by a disconnected/dormant durable owner (additive wire field; older brokers ignore it).
+    const p = (frame.payload ?? {}) as { name?: string; ownerSecret?: string };
+    const r = this.store.renameSession(auth, p.name as string, typeof p.ownerSecret === 'string' ? p.ownerSecret : undefined);
     this.reply(conn, 'rename_session_ack', {
       name: r.name, sessionNameState: r.state,
       // Beta.8 (ADR 0027): a freshly-minted ownership secret is returned ONLY on the first
       // protected award for this identity (reused, not rotated, on later renames). The client
       // persists it to reclaim the name+inbox after a session-id change.
       ...(r.ownerSecret != null ? { ownerSecret: r.ownerSecret } : {}),
+      // BETA.11 (ADR 0037): a precise reclaim outcome when the rename performed/attempted a reclaim.
+      ...(r.reclaimOutcome ? { reclaimOutcome: r.reclaimOutcome } : {}),
     }, frame.requestId);
   }
 
