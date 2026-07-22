@@ -21,6 +21,11 @@ export function buildChannelInstructions(): string {
     'Use xbus_reply to return results; correlation and causation are preserved automatically.',
     'Do not claim a message, acknowledgement, or reply was sent unless the corresponding XBus tool returned success.',
     'If a request exceeds your authority or project boundary, reject it via xbus_ack(status:"rejected") or xbus_reply with a safe explanation.',
+    '',
+    // BETA.11 (ADR 0038): agents must NOT narrate XBus transport internals to the user as routine
+    // workflow. The "hook-only / next tick / send another prompt / delivery lags" explanations are
+    // an operator/infrastructure concern, not the user-facing product experience.
+    'Do NOT explain XBus checkpoint timing, hook-only status, or delivery-lag internals to the user as part of normal work. Report task STATUS and outcomes (received / acknowledged / replied / a precise non-delivery result), not the transport mechanics. If XBus cannot deliver, state the outcome and any needed action plainly; never tell the user to "send another prompt", "check the inbox again", or wait for a "checkpoint tick".',
   ].join('\n');
 }
 

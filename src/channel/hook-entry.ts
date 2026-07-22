@@ -41,6 +41,10 @@ export async function main(): Promise<void> {
   try {
     const result = await runCheckpoint(hook, { endpoint, rootSecret, autoContinueOnStop: autoContinue });
     if (result.stdout) process.stdout.write(result.stdout);
+    // BETA.11 (ADR 0038): operator diagnostics go to STDERR — shown to the operator/logs, but NOT
+    // folded into the model's conversation context (that separation is what stops agents narrating
+    // XBus checkpoint internals to the end user). stdout alone is the model-facing additionalContext.
+    if (result.stderr) process.stderr.write(result.stderr + '\n');
     process.exit(result.exitCode);
   } catch {
     // Never block Claude on an XBus hook failure.
