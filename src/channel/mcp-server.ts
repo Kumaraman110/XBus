@@ -273,8 +273,15 @@ export class McpServer {
       this.send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Tool-level error: surface as a tool result (isError) so the model sees it.
-      this.send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: msg }) }] } });
+      // Tool-level error: surface as a tool result (isError) so the model sees it. BETA.11 (ADR 0037):
+      // include the error code + non-sensitive detail (e.g. reclaimOutcome) so the model gets the
+      // PRECISE, actionable reason (credential-missing / credential-invalid / predecessor-live / …)
+      // rather than a bare message string. detail is hash-only; no secret is ever serialized here.
+      const ee = e as { code?: string; detail?: Record<string, unknown> };
+      const body: Record<string, unknown> = { error: msg };
+      if (typeof ee?.code === 'string') body.code = ee.code;
+      if (ee?.detail !== undefined) body.detail = ee.detail;
+      this.send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify(body) }] } });
     }
   }
 
@@ -320,8 +327,23 @@ export class McpServer {
           const p = (f.payload ?? {}) as { ownerSecret?: string; name?: string };
           if (this.deps.dataDir !== undefined && typeof p.name === 'string') {
             const nowIso = new Date().toISOString();
+            const newNorm = normalizeSessionName(p.name);
             if (typeof p.ownerSecret === 'string') {
-              saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.name), p.ownerSecret, this.deps.sessionId, nowIso);
+              // Fresh secret minted this rename (first protected award) → persist under the new name.
+              saveOwnerSecret(this.deps.dataDir, this.deps.projectId, newNorm, p.ownerSecret, this.deps.sessionId, nowIso);
+            } else if (this.deps.requestedSessionName !== undefined) {
+              // BETA.11 (ADR 0037) — the broker REUSES the owner secret across renames (never re-mints,
+              // ADR 0027 D5), so the ack carries no plaintext here. The secret the client already holds
+              // is keyed under the PREVIOUS (auto-derived) name. RE-KEY it to the NEW name so a resumed
+              // session that recovers `p.name` (below) can loadOwnerSecret(p.name) and reclaim. Without
+              // this the durable-name pointer says "AccountLookUp" but the secret sits under the old
+              // auto-name anchor → loadOwnerSecret misses → reclaim never attempted (the dogfood bug).
+              // Client-side only; the plaintext never leaves the ACL-protected data dir or the wire.
+              const prevNorm = normalizeSessionName(this.deps.requestedSessionName);
+              if (prevNorm !== newNorm) {
+                const existing = loadOwnerSecret(this.deps.dataDir, this.deps.projectId, prevNorm);
+                if (existing !== undefined) saveOwnerSecret(this.deps.dataDir, this.deps.projectId, newNorm, existing, this.deps.sessionId, nowIso);
+              }
             }
             saveDurableName(this.deps.dataDir, this.deps.projectId, this.deps.agentType ?? 'claude', p.name, this.deps.sessionId, nowIso);
           }
@@ -339,8 +361,15 @@ export class McpServer {
 
   private unwrap(frame: { frameType: string; payload: unknown }): unknown {
     if (frame.frameType === 'error') {
-      const p = frame.payload as { code: string; message: string };
-      throw new Error(`${p.code}: ${p.message}`);
+      const p = frame.payload as { code: string; message: string; detail?: Record<string, unknown> };
+      // BETA.11 (ADR 0037): preserve the non-sensitive structured `detail` (e.g. the discriminated
+      // `reclaimOutcome` on a rename reclaim refusal) so the model/client sees the PRECISE reason
+      // instead of a bare "code: message". Attached to the Error so toolCall surfaces it in the
+      // tool-result JSON. detail never carries a secret (owner secret is hash-only, D7).
+      const err = new Error(`${p.code}: ${p.message}`) as Error & { code?: string; detail?: Record<string, unknown> };
+      err.code = p.code;
+      if (p.detail !== undefined) err.detail = p.detail;
+      throw err;
     }
     return frame.payload;
   }
