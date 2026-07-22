@@ -591,3 +591,4 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
 .constellation-legend span{ display:inline-flex; align-items:center; gap:6px; }
 .constellation-legend i{ width:10px; height:10px; border-radius:50%; display:inline-block; box-shadow:0 0 6px currentColor; }
 .constellation-note{ font-size:12px; margin-top:var(--sp2); }
+.constellation-fallback{ padding:var(--sp6); text-align:center; }

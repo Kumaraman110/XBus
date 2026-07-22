@@ -31,7 +31,13 @@ async function activateConstellation() {
     if (feedTimer) clearInterval(feedTimer);
     feedTimer = setInterval(feedConstellation, 2000);
   } catch (e) {
-    host.innerHTML = '<p class="constellation-note muted" style="padding:24px">3D view unavailable in this browser (WebGL required). The Console tab has the full data.</p>';
+    // WebGL unavailable / three.js failed to load: honest fallback. Build via DOM (no innerHTML with
+    // an inline style — the strict CSP forbids inline styles; the padding comes from a CSS class).
+    host.textContent = '';
+    const p = document.createElement('p');
+    p.className = 'constellation-note constellation-fallback muted';
+    p.textContent = '3D view unavailable in this browser (WebGL required). The Console tab has the full data.';
+    host.appendChild(p);
   }
 }
 

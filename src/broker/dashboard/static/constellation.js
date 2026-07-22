@@ -125,42 +125,52 @@ function rebuildGraph(sessions) {
   scene.add(edgeLines);
 }
 
+/** Render exactly one frame (used by the reduced-motion static path + on-orbit re-render). */
+function renderStaticFrame() {
+  if (!renderer || disposed) return;
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+/** One physics step (force-directed relaxation) applied to node positions + edge geometry. */
+function relaxOnce() {
+  const N = nodes.length;
+  if (N === 0) return;
+  for (let i = 0; i < N; i++) {
+    const a = nodes[i];
+    const r = Math.hypot(a.x, a.y, a.z) || 1; const target = 55;
+    const pull = (target - r) * 0.002;
+    a.vx += (a.x / r) * pull; a.vy += (a.y / r) * pull; a.vz += (a.z / r) * pull;
+    for (let j = i + 1; j < N; j++) {
+      const b = nodes[j]; let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+      let d2 = dx * dx + dy * dy + dz * dz; if (d2 < 1) d2 = 1;
+      const f = 12 / d2; const inv = 1 / Math.sqrt(d2);
+      dx *= inv; dy *= inv; dz *= inv;
+      a.vx += dx * f; a.vy += dy * f; a.vz += dz * f;
+      b.vx -= dx * f; b.vy -= dy * f; b.vz -= dz * f;
+    }
+  }
+  const m = new THREE.Matrix4();
+  for (let i = 0; i < N; i++) {
+    const n = nodes[i]; n.vx *= 0.86; n.vy *= 0.86; n.vz *= 0.86;
+    n.x += n.vx; n.y += n.vy; n.z += n.vz;
+    m.setPosition(n.x, n.y, n.z); nodeMesh.setMatrixAt(i, m);
+  }
+  nodeMesh.instanceMatrix.needsUpdate = true;
+  if (edgeLines && edges.length) {
+    const pos = edgeLines.geometry.getAttribute('position');
+    edges.forEach((e, k) => {
+      const a = nodes[e.a], b = nodes[e.b]; if (!a || !b) return;
+      pos.setXYZ(k * 2, a.x, a.y, a.z); pos.setXYZ(k * 2 + 1, b.x, b.y, b.z);
+    });
+    pos.needsUpdate = true;
+  }
+}
+
 /** One physics + render tick: light force-directed relaxation (repel all, spring edges to hub). */
 function tick() {
   if (!running || disposed) return;
-  const N = nodes.length;
-  if (N > 0) {
-    for (let i = 0; i < N; i++) {
-      const a = nodes[i];
-      // gentle pull toward a sphere shell (keeps the cloud bounded + readable)
-      const r = Math.hypot(a.x, a.y, a.z) || 1; const target = 55;
-      const pull = (target - r) * 0.002;
-      a.vx += (a.x / r) * pull; a.vy += (a.y / r) * pull; a.vz += (a.z / r) * pull;
-      for (let j = i + 1; j < N; j++) {
-        const b = nodes[j]; let dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-        let d2 = dx * dx + dy * dy + dz * dz; if (d2 < 1) d2 = 1;
-        const f = 12 / d2; const inv = 1 / Math.sqrt(d2);
-        dx *= inv; dy *= inv; dz *= inv;
-        a.vx += dx * f; a.vy += dy * f; a.vz += dz * f;
-        b.vx -= dx * f; b.vy -= dy * f; b.vz -= dz * f;
-      }
-    }
-    const m = new THREE.Matrix4();
-    for (let i = 0; i < N; i++) {
-      const n = nodes[i]; n.vx *= 0.86; n.vy *= 0.86; n.vz *= 0.86;
-      n.x += n.vx; n.y += n.vy; n.z += n.vz;
-      m.setPosition(n.x, n.y, n.z); nodeMesh.setMatrixAt(i, m);
-    }
-    nodeMesh.instanceMatrix.needsUpdate = true;
-    if (edgeLines && edges.length) {
-      const pos = edgeLines.geometry.getAttribute('position');
-      edges.forEach((e, k) => {
-        const a = nodes[e.a], b = nodes[e.b]; if (!a || !b) return;
-        pos.setXYZ(k * 2, a.x, a.y, a.z); pos.setXYZ(k * 2 + 1, b.x, b.y, b.z);
-      });
-      pos.needsUpdate = true;
-    }
-  }
+  relaxOnce();
   controls.update();
   renderer.render(scene, camera);
 }
@@ -190,7 +200,10 @@ function onResize() {
 }
 
 export const Constellation = {
-  /** Activate the tab: lazy-load three, build the scene, start the loop. Idempotent. */
+  /** Activate the tab: lazy-load three, build the scene, start the loop. Idempotent.
+   *  Accessibility: if the user prefers reduced motion, we do NOT run the continuous
+   *  physics/animation loop — we render a single static frame (still fully orbit-able on demand),
+   *  honoring prefers-reduced-motion exactly like the CSS animations do. */
   async activate(host) {
     disposed = false;
     await ensureThree();
@@ -198,7 +211,15 @@ export const Constellation = {
     if (!renderer) { buildScene(host); window.addEventListener('resize', onResize); }
     if (pendingSessions) { rebuildGraph(pendingSessions); pendingSessions = null; }
     running = true;
-    renderer.setAnimationLoop(tick);
+    const reduceMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduceMotion) {
+      // Relax the layout a few steps synchronously (so it's readable), then render ONE static frame.
+      for (let i = 0; i < 60 && nodes.length; i++) { relaxOnce(); }
+      renderStaticFrame();
+      controls.addEventListener('change', renderStaticFrame); // re-render only on user orbit input
+    } else {
+      renderer.setAnimationLoop(tick);
+    }
   },
   /** Latest live data (called by app.js on every /api/sessions refresh). */
   update(sessions) {
