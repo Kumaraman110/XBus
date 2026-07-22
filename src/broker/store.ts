@@ -502,8 +502,16 @@ export class BrokerStore {
    * Pure diagnostic: no ownership/routing mutation, no ledger, no message loss. Returns the state +
    * evidence for the caller (hook diagnostic / doctor) and whether THIS call emitted the audit.
    */
-  diagnoseActivationOnce(sessionId: string): ActivationDiagnosis {
+  diagnoseActivationOnce(rawSessionId: string): ActivationDiagnosis {
     return this.db.transaction((): ActivationDiagnosis => {
+      // BETA.11 (ADR 0037): resolve the raw (hook-supplied) session id to its CANONICAL durable id
+      // via physical_session_map BEFORE classifying. A resumed/reclaimed session's hook keys on
+      // CLAUDE_CODE_SESSION_ID while the mcp registered under the canonical id; diagnosing the raw id
+      // would see "no mcp" and emit a FALSE PLUGIN_NOT_LOADED / DEGRADED_HOOK_ONLY on a genuinely
+      // connected session (the session-id-skew defect). Following the map makes diagnosis operate on
+      // the identity the mcp actually registered under. A session with no map edge resolves to itself.
+      const mapped = (this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(rawSessionId) as { c: string } | undefined)?.c;
+      const sessionId = (mapped && (this.db.prepare('SELECT 1 AS x FROM sessions WHERE session_id=?').get(mapped) as { x: number } | undefined)) ? mapped : rawSessionId;
       const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
       if (epoch === null) {
         // No such session row — treat as plugin-not-loaded (nothing registered at all).

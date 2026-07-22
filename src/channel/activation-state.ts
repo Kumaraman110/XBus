@@ -50,6 +50,11 @@ export interface ActivationSignals {
   mcpChannelConnected?: boolean | undefined;
   /** Did a hook announce this session (hook-role component present)? */
   hookAnnounced?: boolean | undefined;
+  /** BETA.11 (ADR 0037): is persistent activation enabled (enabledPlugins.xbus=true in the user
+   *  settings)? When true, a plain `claude` SHOULD load the plugin, so the remedy must NOT tell the
+   *  user to switch to the `xclaude` launcher — the honest guidance is to restart the session
+   *  (persistent config only takes effect for newly-launched processes) rather than change launcher. */
+  persistentEnabled?: boolean | undefined;
 }
 
 /**
@@ -59,7 +64,13 @@ export interface ActivationSignals {
  * never "connected".
  */
 export function classifyActivation(s: ActivationSignals): ActivationVerdict {
-  const relaunch = `run \`${CANONICAL_LAUNCH}\` to launch Claude Code with the XBus plugin loaded`;
+  // BETA.11 (ADR 0037): when persistent activation is enabled, plain `claude` SHOULD load the plugin,
+  // so recommending the `xclaude` launcher is misleading — a plugin-absent session then means the
+  // persistent config has not taken effect for THIS (already-running) process. The honest remedy is
+  // to start a NEW session. Only when persistence is OFF do we recommend the `xclaude` launcher.
+  const relaunch = s.persistentEnabled === true
+    ? 'start a NEW Claude Code session — XBus persistent activation (enabledPlugins.xbus) is enabled, so a freshly launched `claude` loads the plugin; this already-running session started before it took effect'
+    : `run \`${CANONICAL_LAUNCH}\` to launch Claude Code with the XBus plugin loaded (or enable persistent activation with \`xbus install --persistent\` so plain \`claude\` loads it)`;
 
   // 1. No broker at all → BROKER_UNAVAILABLE takes precedence only when the plugin DID load
   //    (an mcp component tried); a bare-claude session with no broker is still PLUGIN_NOT_LOADED,
