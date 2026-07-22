@@ -41,6 +41,33 @@ state, threads, audit ledger, config) is preserved. See ADR 0037.
   strict CSP + offline use, lazy-loaded only when opened). The "No routable sessions" state some users
   saw was a downstream symptom of the reclaim defect and clears once resumed sessions reconnect.
 
+### Delivery honesty — durable queueing is not autonomous delivery (ADR 0038)
+
+A second beta.11 correctness change (also **no schema/wire change** — stays `xbus-p1-stp1-s11`; all
+additions are derived-at-read-time or additive response fields): AgenTel no longer presents a
+checkpoint-capable-but-idle session as if it will autonomously consume a message, and agents no longer
+narrate transport internals ("hook-only … delivery lags … surfaces on the next tick") to the user.
+
+- **Outward routing class.** `ready_live` / `ready_wakeable` / `degraded_checkpoint_only` /
+  `unavailable` / `pending_activation`, derived by one pure function on every surface (dashboard,
+  `xbus_sessions`, `xbus_status`, `send_message_ack`) so they always agree. `ready_wakeable` is
+  granted **only** when a broker-owned, version-bound host wake-probe proves the resident `asyncRewake`
+  wake actually fires; the honest default is `degraded_checkpoint_only`. This fixes a real bug where a
+  disconnected session still reported `ready_checkpoint`/routable.
+- **Sender-facing delivery signal.** `queued → wake_requested → wake_failed → injected →
+  acknowledged → replied` (or `failed`/`expired`) — never "delivered" for a merely-stored message.
+- **Routing policy.** Delay-tolerant messages queue durably as before; time-sensitive work is never
+  silently queued to a non-autonomously-routable target (the sender gets a precise signal). Peer sends
+  never auto-trigger `managed_spawn`, and the broker never auto-reroutes a message body.
+- **Bounded self-heal.** On an executing path, a dropped MCP channel triggers a bounded, backed-off
+  reconnect through the existing gated register/reclaim path; on exhaustion the session degrades
+  (routing stops) rather than storming or faking liveness.
+- **No user-facing infra narration.** The activation diagnostic moved from the model's context to the
+  hook's stderr (operator/logs); instructions forbid agents from explaining checkpoint timing.
+- **Platform honesty.** True zero-touch wake of a cold-idle *interactive* session is not guaranteed by
+  the Claude Code platform; the strongest real autonomous path is the opt-in `managed_spawn`. AgenTel
+  states this rather than faking a wake.
+
 ## [0.1.0-beta.10] — durable role identity, workspace data model, and honest activation
 
 The first net-new capability release since the durable-identity foundation. **This release carries an
