@@ -12,7 +12,7 @@
  */
 import type { SqliteDriver } from '../../database/connection.js';
 import { verifyLedger } from '../ledger.js';
-import { deriveRoutingClass, isAutonomouslyRoutable, type RoutingClass } from '../routing-class.js';
+import { deriveRoutingClass, isAutonomouslyRoutable, hasConsumptionPath, type RoutingClass } from '../routing-class.js';
 import type { Readiness } from '../readiness.js';
 import { OPERATOR_SESSION_ID } from '../operator.js';
 import { BUILD_ID, SCHEMA_VERSION } from '../../protocol/handshake.js';
@@ -286,11 +286,14 @@ export class DashboardReadModel {
         readiness: (r.readiness as string) ?? 'disconnected',
         expiredAt: (r.expiredAt as string | null) ?? null,
       });
-      // BETA.11 (ADR 0038): the routing class is the SINGLE source of truth for routability. The
-      // legacy `routable` is now a PROJECTION of it (isAutonomouslyRoutable), so the dashboard no
-      // longer contradicts itself — a checkpoint-only session is NOT advertised as routable unless
-      // a proven host wake path exists (arch review A1). Inputs mirror the daemon's routingClassOf
-      // EXACTLY (readiness / connection / expired / receiveControl) so the two surfaces agree.
+      // BETA.11 (ADR 0038): the routing class is the SINGLE source of truth. `routable` keeps its
+      // LEGACY meaning — "has a consumption path / is addressable" (hasConsumptionPath) — so the
+      // operator console + delay-tolerant senders can still target a checkpoint-reachable session
+      // (it DOES receive at a checkpoint). The STRICT, new `autonomouslyRoutable` flag gates
+      // time-sensitive autonomous routing (ready_live/ready_wakeable only). Honesty comes from the
+      // routing-class WORD ("Reachable at next checkpoint" ≠ "Ready") + autonomouslyRoutable, NOT
+      // from making a reachable session look unaddressable (arch review A1). Inputs mirror the
+      // daemon's routingClassOf EXACTLY so the two surfaces agree.
       const receiveControl = receiveControlFromCode(r.receiving as number | null);
       const routingClass = deriveRoutingClass({
         readiness: ((r.readiness as string) ?? 'disconnected') as Readiness,
@@ -303,7 +306,8 @@ export class DashboardReadModel {
         autoDeliveryEnabled: receiveControl === 'active',
         receiveControl,
       });
-      const routable = isAutonomouslyRoutable(routingClass);
+      const routable = hasConsumptionPath(routingClass);
+      const autonomouslyRoutable = isAutonomouslyRoutable(routingClass);
       const st = deliveryByState.get(sid) ?? {};
       // Map raw delivery states → the user-facing breakdown (queued/delivered/acked/replied/failed).
       const delivery = {
@@ -317,7 +321,7 @@ export class DashboardReadModel {
         sessionId: sid,
         name: (r.name as string | null) ?? null,
         sessionNameState: (r.nameState as string) ?? 'unnamed',
-        label, routable, routingClass, autonomouslyRoutable: routable,
+        label, routable, routingClass, autonomouslyRoutable,
         managementState: (r.mgmt as string) ?? 'active',
         source: (r.source as string | null) ?? null,
         identifyConfidence: (r.conf as string) ?? 'signal',

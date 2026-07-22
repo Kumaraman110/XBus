@@ -134,9 +134,24 @@ export function deriveRoutingClass(i: RoutingInputs): RoutingClass {
 
 /** Is this routing class one AgenTel may AUTONOMOUSLY route a time-sensitive request to?
  *  ready_live / ready_wakeable ONLY — a degraded_checkpoint_only session is NOT (it may need a
- *  user-generated checkpoint or an operator manual drain). */
+ *  user-generated checkpoint or an operator manual drain). This is the STRICT, new-in-beta.11
+ *  concept used to gate autonomous time-sensitive routing. */
 export function isAutonomouslyRoutable(rc: RoutingClass): boolean {
   return rc === 'ready_live' || rc === 'ready_wakeable';
+}
+
+/**
+ * Does this session have ANY consumption path — i.e. can it be addressed and will it receive (at a
+ * checkpoint, at worst)? This is the LEGACY `routable` semantics (backward-compatible): an operator
+ * or a delay-tolerant sender may address a `degraded_checkpoint_only` session — it DOES receive at a
+ * checkpoint (the operator/checkpoint drives the pull). Only `unavailable` (no live owner / expired /
+ * incompatible / paused / DND) and `pending_activation` (not ready yet) have no path. This is
+ * DELIBERATELY broader than `isAutonomouslyRoutable`: honesty about *autonomous* delivery comes from
+ * the routing-class WORD + `isAutonomouslyRoutable`, NOT from making a checkpoint-reachable session
+ * look unaddressable (which would break the operator console + delay-tolerant queuing).
+ */
+export function hasConsumptionPath(rc: RoutingClass): boolean {
+  return rc === 'ready_live' || rc === 'ready_wakeable' || rc === 'degraded_checkpoint_only';
 }
 
 /**

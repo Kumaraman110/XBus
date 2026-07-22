@@ -51,20 +51,30 @@ function regB(): SessionAuthority {
 function dashRoutingClass(sid: string): string | undefined {
   return rm.sessions().find((s) => s.sessionId === sid)?.routingClass;
 }
+/** The STRICT autonomous-routing flag (ready_live/ready_wakeable only). */
 function dashRoutable(sid: string): boolean | undefined {
   return rm.sessions().find((s) => s.sessionId === sid)?.autonomouslyRoutable;
+}
+/** The LEGACY addressability flag (has a consumption path — incl. degraded_checkpoint_only). */
+function dashAddressable(sid: string): boolean | undefined {
+  return rm.sessions().find((s) => s.sessionId === sid)?.routable;
 }
 
 beforeEach(setup);
 afterEach(() => { db.close(); try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
 
 describe('routing honesty — dashboard surface derives the OUTWARD routing class', () => {
-  it('a connected ready_checkpoint recipient with NO proven wake reads degraded_checkpoint_only, NOT routable (#1/#2)', () => {
+  it('a connected ready_checkpoint recipient with NO proven wake reads degraded_checkpoint_only, NOT autonomously routable (#1/#2)', () => {
     const b = regB();
     store.signalReadiness(b, { ackAvailable: true, versionOk: true }); // → ready_checkpoint
     // connected + ready_checkpoint + no host wake-probe on the read handle → degraded_checkpoint_only.
     expect(dashRoutingClass(B)).toBe('degraded_checkpoint_only');
+    // STRICT autonomous routing is FALSE (needs a proven wake) …
     expect(dashRoutable(B)).toBe(false);
+    // … but it is still ADDRESSABLE (legacy `routable`): an operator / delay-tolerant sender can
+    // target it; it receives at a checkpoint. This distinction is what keeps the operator console
+    // working while being honest about autonomous delivery (regression guard — arch review A1).
+    expect(dashAddressable(B)).toBe(true);
   });
 
   it('THE LIVE BUG: a DISCONNECTED session with stale readiness=ready_checkpoint is `unavailable` on the surface', () => {
