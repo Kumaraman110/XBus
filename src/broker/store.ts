@@ -1954,6 +1954,36 @@ export class BrokerStore {
     return row !== undefined;
   }
 
+  /**
+   * BETA.11 (ADR 0038): record an automatic WAKE ATTEMPT outcome for a message, so the sender can
+   * be told the honest delivery signal (queued → wake_requested → wake_failed → injected). Recorded
+   * on the EXISTING audit_events table (safe-metadata only; NO schema change, tuple unchanged — arch
+   * review C). The current outcome for a message is the LATEST such row (ordered by audit_id, which
+   * is monotonic per broker — a stable tiebreak the TEXT created_at lacks). Never carries a body.
+   *
+   * SECURITY (review MINOR-1): this is a broker-internal record keyed to the message's recipient;
+   * it exposes no cross-session data and honors the tombstone guard (a wake is never attempted for
+   * an expired session — hasEligibleDelivery already gates on readiness/tombstone upstream).
+   */
+  recordWakeAttempt(messageId: string, sessionId: string, outcome: 'requested' | 'accepted' | 'failed', detail?: string): void {
+    this.audit('WAKE_ATTEMPT', { messageId, sessionId, wakeOutcome: outcome, ...(detail !== undefined ? { detail } : {}) });
+  }
+
+  /** The latest recorded wake outcome for a message ('none' if never attempted). Ordered by the
+   *  monotonic audit_id so same-millisecond rows resolve deterministically (arch review C). */
+  latestWakeOutcome(messageId: string): 'requested' | 'accepted' | 'failed' | 'none' {
+    const row = this.db.prepare(
+      `SELECT safe_metadata_json AS j FROM audit_events
+        WHERE event_type='WAKE_ATTEMPT' AND message_id=?
+        ORDER BY audit_id DESC LIMIT 1`,
+    ).get(messageId) as { j: string } | undefined;
+    if (!row) return 'none';
+    try {
+      const o = (JSON.parse(row.j) as { wakeOutcome?: string }).wakeOutcome;
+      return o === 'requested' || o === 'accepted' || o === 'failed' ? o : 'none';
+    } catch { return 'none'; }
+  }
+
   // ─────────────────────── beta.7 schedules (ADR 0025) ───────────────────────
 
   /**
