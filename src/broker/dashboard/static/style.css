@@ -363,7 +363,9 @@ td .status.status-expired{ text-decoration:none; }
   padding:5px 10px; border-radius:var(--r-pill); border:1px solid transparent; font:500 12px/1 var(--font-mono); font-variant-numeric:tabular-nums; color:var(--text-2); }
 .pill::before{ content:""; width:6px; height:6px; border-radius:50%; background:currentColor; flex:none; }
 .pill-queued{ color:var(--st-queued); background:var(--st-queued-bg); border-color:var(--st-queued-ln); }
-.pill-delivered{ color:var(--st-delivered); background:var(--st-delivered-bg); border-color:var(--st-delivered-ln); }
+.pill-delivered,
+/* BETA.11 (ADR 0038): "injected" replaces the conflating "delivered" wording (same hue). */
+.pill-injected{ color:var(--st-delivered); background:var(--st-delivered-bg); border-color:var(--st-delivered-ln); }
 .pill-ack{ color:var(--st-ack); background:var(--st-ack-bg); border-color:var(--st-ack-ln); }
 .pill-replied{ color:var(--st-replied); background:var(--st-replied-bg); border-color:var(--st-replied-ln); }
 .pill-failed{ color:var(--st-failed); background:var(--st-failed-bg); border-color:var(--st-failed-ln); }
@@ -589,6 +591,14 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
 .constellation-canvas canvas{ display:block; }
 .constellation-legend{ display:flex; flex-wrap:wrap; gap:var(--sp4); margin-top:var(--sp3); font-size:12px; color:var(--text-3); }
 .constellation-legend span{ display:inline-flex; align-items:center; gap:6px; }
-.constellation-legend i{ width:10px; height:10px; border-radius:50%; display:inline-block; box-shadow:0 0 6px currentColor; }
+.constellation-legend i{ width:10px; height:10px; border-radius:50%; display:inline-block; box-shadow:0 0 6px currentColor; background:currentColor; }
+/* BETA.11 (ADR 0038): legend swatch colors as CSS CLASSES — NOT inline style= (the strict CSP is
+   `style-src 'self'`, which refuses inline styles; the previous inline-style legend rendered
+   colorless). One class per outward RoutingClass, matching constellation.js STATE_COLOR. */
+.rc-ready-live{ color:#4ade80; }         /* live — green */
+.rc-ready-wakeable{ color:#2dd4bf; }     /* proven auto-wake — teal */
+.rc-degraded-checkpoint{ color:#fbbf24; }/* checkpoint-only — amber */
+.rc-pending{ color:#38bdf8; }            /* pending activation — blue */
+.rc-unavailable{ color:#6b7280; }        /* unavailable — grey */
 .constellation-note{ font-size:12px; margin-top:var(--sp2); }
 .constellation-fallback{ padding:var(--sp6); text-align:center; }

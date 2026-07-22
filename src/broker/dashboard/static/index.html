@@ -131,7 +131,7 @@
               <th scope="col">Status</th>
               <th scope="col">Last activity</th>
               <th scope="col">Queued</th>
-              <th scope="col">Delivered</th>
+              <th scope="col" title="Body entered the recipient's context — not yet acknowledged">Injected</th>
               <th scope="col">ACK</th>
               <th scope="col">Replied</th>
               <th scope="col">Failed</th>
@@ -180,10 +180,11 @@
     <section class="constellation-panel">
       <div id="constellation-canvas" class="constellation-canvas" aria-label="3D visualization of durable identities and message flow"></div>
       <div class="constellation-legend" aria-hidden="true">
-        <span><i style="background:#4ade80"></i> connected · routable</span>
-        <span><i style="background:#fbbf24"></i> durable · disconnected</span>
-        <span><i style="background:#38bdf8"></i> starting</span>
-        <span><i style="background:#8b5cf6"></i> dormant/expired</span>
+        <span><i class="rc-ready-live"></i> ready · live</span>
+        <span><i class="rc-ready-wakeable"></i> ready · auto-wake</span>
+        <span><i class="rc-degraded-checkpoint"></i> reachable at next checkpoint</span>
+        <span><i class="rc-pending"></i> starting</span>
+        <span><i class="rc-unavailable"></i> unavailable</span>
       </div>
       <p class="constellation-note muted">Drag to orbit · scroll to zoom. This is a visualization only — the Console tab remains the operational surface.</p>
     </section>

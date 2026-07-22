@@ -113,9 +113,22 @@ const FRIENDLY_STATUS = {
   'unmanaged': 'Unmanaged',
   'expired': 'Expired',
 };
+/** BETA.11 (ADR 0038): human-friendly status per OUTWARD RoutingClass — the honest words that never
+ *  over-claim. `degraded_checkpoint_only` must NOT read as "Ready". Preferred when the row carries a
+ *  routingClass (it always does post-beta.11); falls back to the SessionLabel map for older payloads. */
+const FRIENDLY_ROUTING = {
+  'ready_live': 'Ready — live',
+  'ready_wakeable': 'Ready — auto-wake',
+  'degraded_checkpoint_only': 'Reachable at next checkpoint',
+  'unavailable': 'Not routable — queuing',
+  'pending_activation': 'Starting…',
+};
 function friendlyStatus(label) { return FRIENDLY_STATUS[label] || label; }
+/** Prefer the honest routing-class wording when present; else the legacy label wording. */
+function friendlyRouting(routingClass, label) { return (routingClass && FRIENDLY_ROUTING[routingClass]) || friendlyStatus(label); }
 // Beta.10 (Train B): expose for the agent inspector (agents.js) so status wording stays consistent.
 window.XBusFriendlyStatus = friendlyStatus;
+window.XBusFriendlyRouting = friendlyRouting;
 
 /** A colored delivery-count cell (a "state pill"): the number carries the value, the
  *  column header + pill class carry the state (never color-alone). Zero renders muted. */
@@ -193,7 +206,10 @@ function buildSessionRow(s) {
   main.appendChild(el('span', 'svc-name', nameStr));
   if (s.project) main.appendChild(el('span', 'svc-desc', s.project));
   svc.appendChild(ico); svc.appendChild(main); label.appendChild(svc); r.appendChild(label);
-  const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyStatus(s.label))); r.appendChild(st);
+  // BETA.11 (ADR 0038): the status pill uses the HONEST routing-class wording (never over-claims —
+  // a checkpoint-only session reads "Reachable at next checkpoint", not "Ready"). The label class
+  // is retained for the avatar/CSS tint; the WORD comes from the routing class.
+  const st = document.createElement('td'); st.appendChild(el('span', 'status status-' + s.label, friendlyRouting(s.routingClass, s.label))); r.appendChild(st);
   // Last-activity column from lastSeenSourceAt (compact relative time; exact ISO in title).
   const la = document.createElement('td'); la.className = 'last-activity';
   const laSpan = el('span', 'muted', relativeTime(s.lastSeenSourceAt));
@@ -201,7 +217,10 @@ function buildSessionRow(s) {
   la.appendChild(laSpan); r.appendChild(la);
   const d = s.delivery || { queued: 0, delivered: 0, acknowledged: 0, replied: 0, failed: 0 };
   deliveryCell(r, d.queued, 'queued');
-  deliveryCell(r, d.delivered, 'delivered');
+  // BETA.11 (ADR 0038): "injected" = the body entered the recipient's context (transport_written).
+  // This is NOT "delivered/acted on" — the pill state + header now say "injected" to stop that
+  // conflation (the read-model still keys the count as `delivered` = transport_written).
+  deliveryCell(r, d.delivered, 'injected');
   deliveryCell(r, d.acknowledged, 'ack');
   deliveryCell(r, d.replied, 'replied');
   deliveryCell(r, d.failed, 'failed');

@@ -43,10 +43,15 @@ describe('dashboard UI — inert client assets', () => {
 
   it('beta.7: delivery renders as FIVE separate columns, never the combined q/d/ack/reply/fail string', async () => {
     const html = await (await fetch(`${base}/`)).text();
-    // The five separate column headers are present, in order.
-    for (const h of ['Queued', 'Delivered', 'ACK', 'Replied', 'Failed']) {
+    // The five separate column headers are present, in order. BETA.11 (ADR 0038): "Delivered" was
+    // renamed to "Injected" — transport_written means the body entered the recipient's context, NOT
+    // that it was delivered/acted on. The header carries a title= tooltip, so match the tag opener.
+    for (const h of ['Queued', 'ACK', 'Replied', 'Failed']) {
       expect(html, `missing delivery column header ${h}`).toContain(`>${h}<`);
     }
+    expect(html, 'Injected column header missing').toMatch(/<th[^>]*>Injected<\/th>/);
+    // The old conflating "Delivered" column word is GONE from the header row.
+    expect(html).not.toMatch(/<th[^>]*>Delivered<\/th>/);
     // The old combined header/string must be GONE from both the markup and the client.
     expect(html).not.toContain('q/d/ack/reply/fail');
     expect(html).not.toContain('Delivery (');
@@ -59,8 +64,12 @@ describe('dashboard UI — inert client assets', () => {
     expect(html).toContain('Internal sessions');
     expect(html).toContain('show-internal');
     const js = await (await fetch(`${base}/app.js`)).text();
-    // Friendly, human status wording (not raw labels) — the specific queued-case copy.
-    expect(js).toContain('Waiting for recipient checkpoint');
+    // Friendly, human status wording (not raw labels). BETA.11 (ADR 0038): the honest routing-class
+    // wording never over-claims — a checkpoint-only session reads "Reachable at next checkpoint",
+    // NOT "Ready". Pin the routing-class friendly map + the crucial honesty word.
+    expect(js).toContain('Reachable at next checkpoint'); // degraded_checkpoint_only — not "Ready"
+    expect(js).toContain('FRIENDLY_ROUTING');
+    expect(js).toContain('friendlyRouting');
     // The internal filter is client-enforced (hide by default) + reads the read-model flag.
     expect(js).toContain('isInternal');
     expect(js).toMatch(/show-internal/);
@@ -86,6 +95,11 @@ describe('dashboard UI — inert client assets', () => {
       expect(inner, 'inline executable script body present').toBe('');
     }
     expect(/\son\w+\s*=/.test(html), 'inline on* handler present').toBe(false);
+    // BETA.11 (ADR 0038): the CSP is `style-src 'self'` (no 'unsafe-inline'), so an inline `style=`
+    // attribute is REFUSED by the browser (it renders styleless). Guard against it — this is what
+    // let the constellation legend's inline `style="background:…"` swatches slip through as a latent
+    // CSP violation. All styling must live in style.css classes.
+    expect(/\sstyle\s*=/.test(html), 'inline style= attribute present (violates style-src \'self\')').toBe(false);
   });
 
   it('app.js is served + contains no baked-in secret/session data', async () => {

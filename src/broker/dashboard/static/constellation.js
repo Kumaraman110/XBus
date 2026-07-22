@@ -27,23 +27,25 @@ let nodeMesh = null, edgeLines = null, running = false, disposed = false;
 let nodes = []; // [{ id, name, state, x,y,z, vx,vy,vz }]
 let edges = []; // [{ a, b }] indices into nodes
 
-// Activation-state → color (matches the 2D roster label palette conceptually).
+// BETA.11 (ADR 0038): color by the OUTWARD RoutingClass — the SAME honest classification the roster
+// + xbus_status use (single source of truth), matching the legend swatch classes in index.html.
+// (Replaces the old per-label palette + the dead `s.expired`/`s.connState` branches — DashboardSession
+// carries `routingClass`, `routable`, `connection`, never `expired`/`connState`.)
 const STATE_COLOR = {
-  'active-ready': 0x4ade80,        // connected + routable — green
-  'active-disconnected': 0xfbbf24, // durable but offline — amber (the reclaim-relevant state)
-  'active-starting': 0x38bdf8,     // initializing — blue
-  dormant: 0x8b5cf6,               // dormant/expired identity — violet
-  expired: 0x6b7280,               // tombstoned — grey
-  unmanaged: 0x94a3b8,             // grey-blue
+  ready_live: 0x4ade80,               // live — green
+  ready_wakeable: 0x2dd4bf,           // proven auto-wake — teal
+  degraded_checkpoint_only: 0xfbbf24, // reachable at next checkpoint — amber
+  pending_activation: 0x38bdf8,       // starting — blue
+  unavailable: 0x6b7280,              // unavailable — grey
   _default: 0x64748b,
 };
 
 function colorForSession(s) {
-  // Derive a label the same way the roster does: routable+ready → active-ready; else by state.
-  if (s.routable) return STATE_COLOR['active-ready'];
-  if (s.expired) return STATE_COLOR.expired;
-  const label = s.label || (s.connState === 'disconnected' ? 'active-disconnected' : 'active-starting');
-  return STATE_COLOR[label] ?? STATE_COLOR._default;
+  // Read the routing class directly (single source of truth); fall back to the routable flag then
+  // default for any legacy payload without a routingClass.
+  if (s.routingClass && STATE_COLOR[s.routingClass] !== undefined) return STATE_COLOR[s.routingClass];
+  if (s.routable) return STATE_COLOR.ready_wakeable;
+  return STATE_COLOR._default;
 }
 
 /** Lazy-load three.js (vendored, same-origin). Resolves the module + OrbitControls once. */
