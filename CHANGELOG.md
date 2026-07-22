@@ -6,6 +6,41 @@ pre-1.0 Developer Preview, so the public surface may still change.
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] — reliable durable-identity reclaim for resumed sessions
+
+A correctness release: a resumed Claude Code session (new session id — resume / fork / clear /
+compact / crash-recreate) now **automatically reclaims its durable AgenTel identity** — name, queued
+inbox, and reply-pending authority — with no manual rename and no re-authentication. **No schema
+change** (stays schema 11 / `xbus-p1-stp1-s11`); all wire additions are optional and back-compatible;
+existing beta.10 data (SQLite, identities, names, ownership hashes, owner-secret files, inbox/delivery
+state, threads, audit ledger, config) is preserved. See ADR 0037.
+
+- **Resume recovers the durable name (root fix).** The reclaim owner secret is keyed by the durable
+  name, but a resumed session re-derived its requested name from the workspace, so it looked up the
+  wrong key and never presented the secret. AgenTel now persists the awarded/renamed name as a
+  per-`(project, agent)` recovery pointer (name only, never the secret) and re-requests it on resume,
+  so the credential is found and the broker reclaims automatically.
+- **A crashed predecessor no longer blocks reclaim.** The reclaim liveness gate now uses *proven*
+  liveness: a genuinely dead / recycled-PID predecessor (whose component row was left `live` by a hard
+  crash) yields the name to the legitimate credential holder, while a proven-live incumbent is never
+  evicted and an inconclusive check fails closed.
+- **Manual `xbus_rename` can reclaim with the owner secret.** The manual path accepts an optional
+  ownership secret and performs the same credential-gated reclaim instead of a blanket failure.
+- **Upgrade carries the credentials.** An upgrade that relocates the data dir now always carries the
+  durable-identity credential files, so a resumed session can reclaim even across the move.
+- **Precise diagnostics instead of a blanket "name taken".** Reclaim outcomes are discriminated —
+  reclaim-succeeded / credential-missing / credential-invalid / owner-anchor-mismatch / predecessor-
+  live / unrelated-owns — so a resumed session is never misled about why a name it owns appears taken.
+- **Honest activation diagnosis.** A resumed/reclaimed session is no longer falsely reported
+  hook-only (the diagnosis now resolves to the identity the plugin registered under), and when
+  persistent activation (`enabledPlugins.xbus`) is enabled the remedy is "start a new session" rather
+  than misleadingly telling the user to switch to the `xclaude` launcher.
+- **Dashboard.** Uses the full screen width (the roster table is no longer capped narrow; console and
+  roster sit side-by-side on wide viewports), and adds an optional **Constellation** tab — a three.js
+  companion visualization of durable identities and live message flow (vendored same-origin for the
+  strict CSP + offline use, lazy-loaded only when opened). The "No routable sessions" state some users
+  saw was a downstream symptom of the reclaim defect and clears once resumed sessions reconnect.
+
 ## [0.1.0-beta.10] — durable role identity, workspace data model, and honest activation
 
 The first net-new capability release since the durable-identity foundation. **This release carries an
