@@ -66,13 +66,24 @@ describe('dashboard UI — inert client assets', () => {
     expect(js).toMatch(/show-internal/);
   });
 
-  it('index.html has NO inline <script> or on* handlers (strict CSP compliance)', async () => {
+  it('index.html has NO inline EXECUTABLE <script> or on* handlers (strict CSP compliance)', async () => {
     const html = await (await fetch(`${base}/`)).text();
-    // No inline script bodies: every <script> must be a src= include with no inline content.
+    // No inline EXECUTABLE script bodies: every executable <script> must be a src= include with no
+    // inline content. A `type="importmap"` block is a DATA tag (module specifier map), not executable
+    // JS — it is explicitly permitted under `script-src 'self'` WITHOUT 'unsafe-inline' (BETA.11: the
+    // vendored three.js needs it to resolve OrbitControls' bare `three` import), so it is exempt.
     const scriptTags = html.match(/<script\b[^>]*>[\s\S]*?<\/script>/gi) ?? [];
     for (const tag of scriptTags) {
+      const openTag = (tag.match(/<script\b[^>]*>/i) ?? [''])[0];
+      const isImportmap = /type\s*=\s*["']importmap["']/i.test(openTag);
+      if (isImportmap) {
+        // Must be valid JSON (data), never contain executable constructs.
+        const body = tag.replace(/<script\b[^>]*>/i, '').replace(/<\/script>/i, '').trim();
+        expect(() => JSON.parse(body), 'importmap must be pure JSON data').not.toThrow();
+        continue;
+      }
       const inner = tag.replace(/<script\b[^>]*>/i, '').replace(/<\/script>/i, '').trim();
-      expect(inner, 'inline script body present').toBe('');
+      expect(inner, 'inline executable script body present').toBe('');
     }
     expect(/\son\w+\s*=/.test(html), 'inline on* handler present').toBe(false);
   });

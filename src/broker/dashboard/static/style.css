@@ -141,7 +141,22 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 }
 
 /* ── layout column (mock: narrow column + gutters so the aurora shows) ── */
-.wrap{ max-width:1080px; margin:0 auto; padding:var(--sp8) var(--sp8) var(--sp10); }
+/* BETA.11: use the real estate. The old 1080px cap made everything (esp. the roster table) feel
+   cramped on a wide monitor. Grow with the viewport up to a comfortable reading maximum, so a wide
+   screen gets a wide roster/console while ultrawide stays legible. */
+.wrap{ max-width:min(1600px, 94vw); margin:0 auto; padding:var(--sp8) clamp(var(--sp6), 4vw, var(--sp10)) var(--sp10); }
+/* The console/roster/table are the width-hungry surfaces — let them fill the widened wrap and give
+   the table generous row height + horizontal breathing room so columns don't collide. */
+.table-scroll{ width:100%; }
+#sessions{ width:100%; border-collapse:separate; border-spacing:0; }
+#sessions th, #sessions td{ padding:var(--sp3) var(--sp4); }
+#sessions tbody tr{ transition:background .12s ease; }
+#sessions tbody tr:hover{ background:color-mix(in srgb, var(--accent) 7%, transparent); }
+/* On a genuinely wide viewport, run the console (threads) and roster side-by-side so neither is a
+   narrow column stacked in a tall page — the operator sees conversations AND the fleet at once. */
+@media(min-width:1360px){
+  .console-grid{ grid-template-columns:320px 1fr; }
+}
 
 /* ── topbar ── */
 .topbar{ display:flex; align-items:center; justify-content:space-between; gap:var(--sp4);
@@ -554,3 +569,25 @@ button.primary{ background:var(--accent); color:var(--accent-ink); border:none; 
 /* Beta.10 (Train B): clear-all-filters affordance in the roster toolbar. */
 .roster-clear{ margin-left:auto; } /* push to the right end of the flex toolbar */
 .state-cell .link-btn{ margin-left:4px; }
+
+/* ── BETA.11: tab nav (Console ↔ Constellation) + three.js companion view ── */
+.tabnav{ display:flex; gap:4px; margin:var(--sp6) 0 var(--sp4); border-bottom:1px solid var(--glass-border); }
+.tabnav-btn{ appearance:none; background:none; border:none; cursor:pointer; color:var(--text-3);
+  font:inherit; font-size:14px; font-weight:600; padding:var(--sp3) var(--sp4); border-bottom:2px solid transparent;
+  display:inline-flex; align-items:center; gap:7px; transition:color .12s ease, border-color .12s ease; }
+.tabnav-btn:hover{ color:var(--text-1); }
+.tabnav-btn.is-active{ color:var(--text-1); border-bottom-color:var(--accent); }
+.tabnav-badge{ font-size:10px; font-weight:700; letter-spacing:.04em; color:#fff;
+  background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 60%, #8b5cf6));
+  border-radius:6px; padding:1px 6px; }
+[role="tabpanel"][hidden]{ display:none; }
+
+.constellation-panel{ position:relative; }
+.constellation-canvas{ width:100%; height:min(68vh, 640px); min-height:420px; border-radius:var(--r-md);
+  overflow:hidden; background:radial-gradient(ellipse at 50% 40%, color-mix(in srgb,var(--accent) 9%, transparent), transparent 70%),
+  color-mix(in srgb, var(--field) 22%, transparent); border:1px solid var(--glass-border); }
+.constellation-canvas canvas{ display:block; }
+.constellation-legend{ display:flex; flex-wrap:wrap; gap:var(--sp4); margin-top:var(--sp3); font-size:12px; color:var(--text-3); }
+.constellation-legend span{ display:inline-flex; align-items:center; gap:6px; }
+.constellation-legend i{ width:10px; height:10px; border-radius:50%; display:inline-block; box-shadow:0 0 6px currentColor; }
+.constellation-note{ font-size:12px; margin-top:var(--sp2); }
