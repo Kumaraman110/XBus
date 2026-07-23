@@ -25,6 +25,8 @@ export default tseslint.config(
   {
     ignores: [
       'dist/**',
+      'build/**', // transient release-artifact staging (package:win / release-zip) — compiled .js
+      // outside the TS project; present only after a local package build, never linted.
       'node_modules/**',
       'coverage/**',
       'spike/**',
