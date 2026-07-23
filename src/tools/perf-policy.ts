@@ -28,6 +28,17 @@
  *
  * NOT shipped: dist/tools/** is release-engineering only (package-win.ts excludes it), so this file
  * never enters the runtime artifact and does not affect the product or its deterministic hash-in-kind.
+ *
+ * KNOWN LIMITATION (operational contract, by design): the hosted lane tolerates a throughput dip into
+ * the (pathological, strict] band as host-load variance. That means the DEDICATED lane is the
+ * AUTHORITATIVE product-performance gate — it is the default (empty env → dedicated) and runs on
+ * developer + release machines, where a genuine perf regression into that band is blocking. The
+ * hosted lane is a supplementary clean-machine functional + sanity + pathological check for shared CI
+ * runners; a release must NOT be qualified SOLELY under the hosted lane. This is intentional
+ * environment-aware gating, not a weakening: the product objectives are unchanged and remain blocking
+ * on the authoritative lane. (Recorded per the beta.12 adversarial review; a future mechanical
+ * release-precondition asserting "a dedicated-lane perf pass was recorded for this SHA" would close
+ * the residual entirely — tracked for beta.13.)
  */
 import type { BenchReport } from './secure-transport-bench.js';
 
@@ -81,6 +92,30 @@ export function resolvePerfLane(env: NodeJS.ProcessEnv = process.env): PerfLane 
   return hostedCI ? 'hosted' : 'dedicated';
 }
 
+/**
+ * Bounded retry budget for TIMING-SENSITIVE test shards on the HOSTED (shared-CI) lane.
+ *
+ * The canonical verify:release runs the FULL integration + e2e suites, which include real-broker,
+ * IPC-timing, and process-liveness tests (broker-shutdown, four-replica-matrix, idle-wake, split-brain,
+ * churn-survival, control-plane-e2e, …). On a genuinely UNLOADED machine these pass single-pass; on a
+ * CPU-OVERSUBSCRIBED shared CI runner a wall-clock/scheduling race can make one flake intermittently
+ * (observed: a single integration test failing once, then passing on an immediate re-run).
+ *
+ * On the HOSTED lane ONLY, these shards get a small retry budget. This does NOT weaken any assertion
+ * or threshold — a retried test must STILL pass its exact checks; retries only absorb nondeterministic
+ * shared-runner scheduling. A genuine product failure fails ALL attempts (retries do not rescue it),
+ * so it is still caught. On the DEDICATED lane the budget is 0: single-pass, strict, unchanged.
+ * Non-timing shards (unit / security / adapter-sdk) get 0 retries in BOTH lanes — they are
+ * deterministic, and retrying them could mask a genuinely flaky assertion, so they are never retried.
+ */
+const HOSTED_RETRY_SHARDS = new Set(['integration', 'e2e']);
+export const HOSTED_RETRY_BUDGET = 2; // up to 3 attempts total, hosted lane, timing shards only
+
+export function shardRetries(shardName: string, lane: PerfLane = resolvePerfLane()): number {
+  if (lane !== 'hosted') return 0; // dedicated (dev/release machine) is always single-pass strict
+  return HOSTED_RETRY_SHARDS.has(shardName) ? HOSTED_RETRY_BUDGET : 0;
+}
+
 export interface PerfEvaluation {
   lane: PerfLane;
   ok: boolean;
@@ -123,8 +158,11 @@ export function measurementFailures(
   if (r.secureTransport !== true) f.push('benchmark did not run over the encrypted transport (secureTransport !== true)');
   // Sample-count completeness: the harness must have taken the samples the caller asked for. A
   // short count means the encrypted path errored partway (transport failure), NOT host slowness.
+  // All THREE latency dimensions are checked symmetrically (handshake + send + inbox round-trips)
+  // so a truncated run in any dimension is caught, not just the first two.
   if ((r.handshakeMs?.n ?? 0) < expected.handshakes) f.push(`handshake samples ${r.handshakeMs?.n ?? 0} < requested ${expected.handshakes} (transport failure / partial run)`);
   if ((r.sendRoundTripMs?.n ?? 0) < expected.roundTrips) f.push(`send-rt samples ${r.sendRoundTripMs?.n ?? 0} < requested ${expected.roundTrips} (transport failure / partial run)`);
+  if ((r.inboxRoundTripMs?.n ?? 0) < expected.roundTrips) f.push(`inbox-rt samples ${r.inboxRoundTripMs?.n ?? 0} < requested ${expected.roundTrips} (transport failure / partial run)`);
   return f;
 }
 

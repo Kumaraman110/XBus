@@ -11,6 +11,8 @@ import {
   resolvePerfLane,
   evaluatePerf,
   measurementFailures,
+  shardRetries,
+  HOSTED_RETRY_BUDGET,
   STRICT_THRESHOLDS,
   PATHOLOGICAL_BOUNDS,
   type PerfLane,
@@ -142,6 +144,11 @@ describe('measurement integrity — BOTH lanes, always blocking, never a silent 
     expect(ev.ok).toBe(false);
     expect(ev.failures.join(' ')).toMatch(/send-rt samples.*< requested/);
   });
+  it('FAILS on a short INBOX sample count too (symmetric completeness — no asymmetric gap)', () => {
+    const ev = evaluatePerf(report({ inboxN: EXPECTED.roundTrips - 50 }), EXPECTED, 'hosted');
+    expect(ev.ok).toBe(false);
+    expect(ev.failures.join(' ')).toMatch(/inbox-rt samples.*< requested/);
+  });
   it('FAILS when the encrypted transport was not exercised (secureTransport !== true)', () => {
     const ev = evaluatePerf(report({ secureTransport: false }), EXPECTED, 'hosted');
     expect(ev.ok).toBe(false);
@@ -154,5 +161,23 @@ describe('measurement integrity — BOTH lanes, always blocking, never a silent 
     const ev = evaluatePerf(report({ throughput: 1 }), EXPECTED, 'hosted' as PerfLane);
     expect(ev.metrics.throughputPerSec).toBe(1); // measured + recorded, not skipped
     expect(ev.ok).toBe(false);
+  });
+});
+
+describe('shardRetries — hosted-lane bounded retry for timing shards only, never weakens assertions', () => {
+  it('DEDICATED lane gets ZERO retries for every shard (single-pass strict)', () => {
+    for (const s of ['unit', 'security', 'integration', 'e2e', 'adapter-sdk']) {
+      expect(shardRetries(s, 'dedicated'), s).toBe(0);
+    }
+  });
+  it('HOSTED lane grants the retry budget ONLY to timing-sensitive shards (integration, e2e)', () => {
+    expect(shardRetries('integration', 'hosted')).toBe(HOSTED_RETRY_BUDGET);
+    expect(shardRetries('e2e', 'hosted')).toBe(HOSTED_RETRY_BUDGET);
+    expect(HOSTED_RETRY_BUDGET).toBeGreaterThan(0);
+  });
+  it('HOSTED lane gives DETERMINISTIC shards ZERO retries (never retry unit/security/adapter — could mask a flaky assertion)', () => {
+    for (const s of ['unit', 'security', 'adapter-sdk']) {
+      expect(shardRetries(s, 'hosted'), s).toBe(0);
+    }
   });
 });

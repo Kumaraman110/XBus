@@ -25,7 +25,7 @@ export interface Shard {
 
 /** Mutually exclusive, collectively exhaustive shards (relative to repo root). */
 export const SHARDS: Shard[] = [
-  { name: 'unit', dir: 'tests/unit', minTests: 558, minFiles: 58, maxSkipped: 0 },
+  { name: 'unit', dir: 'tests/unit', minTests: 562, minFiles: 58, maxSkipped: 0 },
   { name: 'security', dir: 'tests/security', minTests: 83, minFiles: 11, maxSkipped: 0 },
   { name: 'integration', dir: 'tests/integration', minTests: 500, minFiles: 80, maxSkipped: 12 },
   { name: 'e2e', dir: 'tests/e2e', minTests: 6, minFiles: 2, maxSkipped: 0 },

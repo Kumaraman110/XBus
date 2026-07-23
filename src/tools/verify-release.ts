@@ -27,6 +27,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash } from 'node:crypto';
 import { SHARDS, shardCoverage, listAllTestFiles } from './shards.js';
+import { resolvePerfLane, shardRetries } from './perf-policy.js';
 
 const REPO = process.env.XBUS_REPO_ROOT ?? process.cwd();
 const node = process.execPath;
@@ -105,6 +106,7 @@ async function main(): Promise<void> {
   }
 
   // 5) Test shards — combined totals.
+  const perfLane = resolvePerfLane();
   let totalFiles = 0, totalTests = 0, totalFailed = 0, totalSkipped = 0;
   for (const shard of SHARDS) {
     const reportFile = path.join(isoHome, `vitest-${shard.name}.json`);
@@ -115,31 +117,50 @@ async function main(): Promise<void> {
     // functional guarantee under test is identical either way; only the OS-permission side
     // effect — asserted solely in the security shard — differs. See src/ipc/acl.ts.
     const shardEnv = { ...testEnv, XBUS_SKIP_ACL_HARDENING: shard.name === 'security' ? '0' : '1' };
-    // 30min per shard: the install-heavy integration shard on a slow Windows runner
-    // (each real install 60-90s) can exceed the default 10min; bounded to catch a hang.
-    const r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], shardEnv, 1_800_000);
+
+    // HOSTED-LANE bounded retry for TIMING-SENSITIVE shards (integration / e2e) only. On a shared
+    // CI runner a real-broker/IPC-timing test can flake once and pass on an immediate re-run. Retries
+    // do NOT weaken any assertion — a retried test must still pass its exact checks + the shard must
+    // still meet its floors — they only absorb nondeterministic shared-runner scheduling. A genuine
+    // product failure fails ALL attempts and is still caught. DEDICATED lane budget is 0 (single-pass
+    // strict); deterministic shards (unit/security/adapter-sdk) get 0 retries in BOTH lanes. See
+    // src/tools/perf-policy.ts (shardRetries) + docs. The final attempt's counts are what's recorded.
+    const maxAttempts = 1 + shardRetries(shard.name, perfLane);
+    let r!: ReturnType<typeof npx>;
     let files = 0, tests = 0, passed = 0, failed = 0, skipped = 0;
-    try {
-      const j = JSON.parse(fs.readFileSync(reportFile, 'utf8')) as {
-        testResults?: unknown[]; numTotalTests?: number; numPassedTests?: number;
-        numFailedTests?: number; numPendingTests?: number; numTodoTests?: number;
-      };
-      files = (j.testResults ?? []).length;
-      tests = j.numTotalTests ?? 0; passed = j.numPassedTests ?? 0;
-      failed = j.numFailedTests ?? 0; skipped = (j.numPendingTests ?? 0) + (j.numTodoTests ?? 0);
-    } catch { /* parse error → treat as failure below */ }
+    let attempt = 1;
+    let shardPassed = false;
+    let floorViolations: string[] = [];
+    for (; attempt <= maxAttempts; attempt++) {
+      // 30min per shard: the install-heavy integration shard on a slow Windows runner
+      // (each real install 60-90s) can exceed the default 10min; bounded to catch a hang.
+      r = npx(['vitest', 'run', shard.dir, '--reporter=json', `--outputFile=${reportFile}`], shardEnv, 1_800_000);
+      files = 0; tests = 0; passed = 0; failed = 0; skipped = 0;
+      try {
+        const j = JSON.parse(fs.readFileSync(reportFile, 'utf8')) as {
+          testResults?: unknown[]; numTotalTests?: number; numPassedTests?: number;
+          numFailedTests?: number; numPendingTests?: number; numTodoTests?: number;
+        };
+        files = (j.testResults ?? []).length;
+        tests = j.numTotalTests ?? 0; passed = j.numPassedTests ?? 0;
+        failed = j.numFailedTests ?? 0; skipped = (j.numPendingTests ?? 0) + (j.numTodoTests ?? 0);
+      } catch { /* parse error → treat as failure below */ }
+      // QUALIFICATION FLOORS (beta.12): a required shard cannot silently shrink/disappear or over-skip.
+      // A green "0 failed" is NOT sufficient — the shard must also have RUN at least its minimum test +
+      // file counts and skipped no more than its ceiling. This makes "security 83/83", "required shards
+      // present", and "controlled skip counts" mechanically enforced, not merely observed.
+      floorViolations = [];
+      if (tests < shard.minTests) floorViolations.push(`tests ${tests} < min ${shard.minTests}`);
+      if (files < shard.minFiles) floorViolations.push(`files ${files} < min ${shard.minFiles}`);
+      if (skipped > shard.maxSkipped) floorViolations.push(`skipped ${skipped} > max ${shard.maxSkipped}`);
+      shardPassed = r.code === 0 && failed === 0 && floorViolations.length === 0;
+      if (shardPassed) break; // green (with floors met) → done; else retry if budget remains
+      if (attempt < maxAttempts) process.stdout.write(`  [retry] tests:${shard.name} attempt ${attempt} not green (${failed} failed${floorViolations.length ? ', ' + floorViolations.join(', ') : ''}) — hosted-lane re-run ${attempt + 1}/${maxAttempts}\n`);
+    }
     totalFiles += files; totalTests += tests; totalFailed += failed; totalSkipped += skipped;
-    // QUALIFICATION FLOORS (beta.12): a required shard cannot silently shrink/disappear or over-skip.
-    // A green "0 failed" is NOT sufficient — the shard must also have RUN at least its minimum test +
-    // file counts and skipped no more than its ceiling. This makes "security 83/83", "required shards
-    // present", and "controlled skip counts" mechanically enforced, not merely observed.
-    const floorViolations: string[] = [];
-    if (tests < shard.minTests) floorViolations.push(`tests ${tests} < min ${shard.minTests}`);
-    if (files < shard.minFiles) floorViolations.push(`files ${files} < min ${shard.minFiles}`);
-    if (skipped > shard.maxSkipped) floorViolations.push(`skipped ${skipped} > max ${shard.maxSkipped}`);
-    const shardOk = r.code === 0 && failed === 0 && floorViolations.length === 0;
     const floorNote = floorViolations.length ? ` — FLOOR: ${floorViolations.join(', ')}` : '';
-    record(`tests:${shard.name}`, shardOk, `${files} files, ${tests} tests, ${passed} passed, ${failed} failed, ${skipped} skipped${floorNote}`);
+    const attemptNote = attempt > 1 ? ` (hosted-lane attempt ${attempt}/${maxAttempts})` : '';
+    record(`tests:${shard.name}`, shardPassed, `${files} files, ${tests} tests, ${passed} passed, ${failed} failed, ${skipped} skipped${floorNote}${attemptNote}`);
   }
   const cov = shardCoverage(REPO);
   record('tests:combined', totalFailed === 0 && totalFiles === cov.total, `${totalFiles} test files, ${totalTests} tests, ${totalSkipped} skipped, 0 omitted files (manifest total=${cov.total}), 0 duplicated files`);
