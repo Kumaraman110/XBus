@@ -114,4 +114,40 @@ describe('#315 migration source immutability — inspection must not mutate the 
       expect((db.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check).toBe('ok');
     } finally { db.close(); }
   });
+
+  it('a REAL (non-dryRun) migrate of a crashed source promotes ALL rows, leaving the source unmutated', () => {
+    const base = freshDir();
+    const { root, dbPath, live } = crashedLegacy(1, 30);
+    const dest = path.join(base, 'data');
+    const before = { main: sha(dbPath), wal: walSize(dbPath) };
+    const r = migrateDataRoot({ legacyRoot: root, canonicalRoot: dest, fromVersion: 'legacy', toVersion: '0.1.0-beta.12', migrationId: 'real', backupDir: path.join(base, 'bk'), journalPath: path.join(base, 'j.json') });
+    expect(r.migrated, 'crashed-source migrate promotes').toBe(true);
+    // Complete promote: the destination has ALL committed rows (whole-root copy captured main + -wal).
+    const d = new DatabaseSync(path.join(dest, 'xbus.sqlite'));
+    try { expect((d.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }).c, 'promoted dest retains all committed rows').toBe(live); }
+    finally { d.close(); }
+    // Source is byte-identical (read-only inspect never checkpointed it).
+    expect(sha(dbPath), 'real migrate must not mutate the source main file').toBe(before.main);
+    expect(walSize(dbPath), 'real migrate must not truncate the source -wal').toBe(before.wal);
+  });
+
+  it('a CONFLICT abort leaves the legacy source byte-identical (no inspect-side mutation)', () => {
+    // Two DISTINCT populated roots → decideMigration returns a conflict (never auto-merge). The
+    // conflict path still summarizes both roots; that inspection must not mutate the legacy source.
+    const base = freshDir();
+    const { root: legacy, dbPath: legacyDb } = crashedLegacy(1, 30);
+    // canonical: a DIFFERENT populated root (distinct data → conflict, not identical_copy).
+    const canon = freshDir();
+    fs.mkdirSync(path.join(canon, 'auth'), { recursive: true });
+    fs.writeFileSync(path.join(canon, 'auth', 'root.secret'), Buffer.alloc(32, 0xBB));
+    const cdb = openDatabase(path.join(canon, 'xbus.sqlite'));
+    runMigrations(cdb, '2026-01-01T00:00:00.000Z');
+    try { cdb.prepare(`INSERT INTO sessions (session_id, automatic_alias, project_id, cwd, xbus_version, capabilities_json, receive_mode, state, last_seen_at, created_at, updated_at, active_epoch) VALUES ('canon-only','a-canon','p','/','x','[]','hook_checkpoint','connected','t','t','t',1)`).run(); } catch { /* tolerate */ }
+    cdb.close();
+    const before = { main: sha(legacyDb), wal: walSize(legacyDb) };
+    const r = migrateDataRoot({ legacyRoot: legacy, canonicalRoot: canon, fromVersion: 'l', toVersion: 'x', migrationId: 'conflict', backupDir: path.join(base, 'bk'), journalPath: path.join(base, 'j.json') });
+    expect(r.migrated, 'conflict is not auto-migrated').toBe(false);
+    expect(sha(legacyDb), 'conflict-path inspection must not mutate the legacy source').toBe(before.main);
+    expect(walSize(legacyDb), 'conflict-path inspection must not truncate the legacy -wal').toBe(before.wal);
+  });
 });

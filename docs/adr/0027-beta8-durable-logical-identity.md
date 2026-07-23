@@ -318,10 +318,31 @@ work:
   live secret (`hardenDir` runs first) and the legacy source retains the secret anyway, so
   there is no *additional* cross-user exposure — a hygiene gap, not a vuln. Reclaim/cleanup
   hardening deferred to avoid install-path surgery late in this cycle.
-- **DEFERRED (documented) — legacy-root broker not stopped before its DB is copied:** guarded
-  by a post-copy hash compare + `PRAGMA integrity_check` that abort fail-closed on a
-  detectably-inconsistent copy, and the legacy source is never mutated/deleted (recoverable by
-  retry). Narrow torn-copy window; fix deferred for the same reason.
+- **RESOLVED in beta.12 (#315) — legacy-source data-safety + the "never mutated" invariant.**
+  The original deferral (below) understated two things, corrected here after empirical study
+  (two independent drive-throughs of the real `migrateDataRoot`):
+  - *The "never mutated" claim was FALSE.* `summarizeRoot→inspectDb` opened the source DB
+    read-WRITE; when it was the sole holder of a crashed source (uncheckpointed `-wal`, no live
+    process) its close() checkpointed the `-wal` into the main file — a real byte mutation, and it
+    fired even on `dryRun` (a supposed no-op) and the conflict-abort path.
+  - *The mutation was semantically preserving — NO row was ever lost.* The checkpoint merges
+    committed WAL frames; migrations still promoted complete (verified 5× crashed-broker: 31/31).
+  beta.12 fix: **inspection is READ-ONLY** (`inspectDb` opens `{ readOnly: true }`). A read-only
+  handle reads all rows *through* an uncheckpointed `-wal` without checkpointing, so the legacy
+  source is byte-identical on every path (migrate / dryRun / conflict). Empirically established
+  data-safety (no broker-stop required — deliberately NOT added, to avoid new process-control risk):
+  - a **live/active-writing** legacy broker → migration promotes a COMPLETE copy (whole-root copy
+    captures main + `-wal`), source intact;
+  - a **separate-process live holder** keeping an unmerged `-wal` across the copy → the staged copy
+    (sole-held → checkpoints on close) hashes differently from the still-unmerged source → the
+    `staged==source` gate **fails closed** (rollback), never a torn/lossy promote;
+  - the legacy source is never mutated or deleted → always recoverable.
+  THE CONTRACT (precise, test-backed): *migration inspection and dry-run open the legacy database
+  read-only and modify none of its DB/WAL/SHM/ledger/secret/ownership bytes; a successful migration
+  promotes only a verified-complete destination snapshot; a live-holder race fails closed; failure
+  leaves the legacy installation independently usable.* (Original deferral, for history: "guarded by
+  a post-copy hash compare + integrity_check that abort fail-closed … narrow torn-copy window" —
+  accurate that it never lost data, but the source WAS mutated and the window was not the real risk.)
 
 ## Consequences
 
