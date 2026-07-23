@@ -21,7 +21,7 @@ const readJson = (p: string) => JSON.parse(fs.readFileSync(path.join(REPO, p), '
 // (beta.N) is a deliberate, reviewed act: change this literal and every surface
 // below must move with it. Compatibility + schema are INDEPENDENT of the product
 // version and must NOT move just because the prerelease label did.
-const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.11';
+const EXPECTED_PRODUCT_VERSION = '0.1.0-beta.12';
 // beta.10 is the current release: durable role identity + auto inbox, the workspace Collections +
 // conversation/work data model (WS3), the provider-neutral adapter boundary (WS4), the dashboard
 // agent-management slice, and honest plugin/MCP/hook activation diagnostics (ADR 0036). beta.9.1 is

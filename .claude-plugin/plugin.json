@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin.json",
   "name": "xbus",
-  "version": "0.1.0-beta.11",
+  "version": "0.1.0-beta.12",
   "description": "XBus — durable cross-session messaging between Claude Code sessions on one machine (hook_checkpoint delivery). Independent, unofficial; not affiliated with Anthropic.",
   "author": {
     "name": "Aman Kumar"
