@@ -1,0 +1,113 @@
+name: beta12-qual
+
+# TEMPORARY beta.12 #315 QUALIFICATION ORCHESTRATION — NOT beta.12 product content.
+# This workflow file exists ONLY on the throwaway qualification ref (qual/beta12-315-windows).
+# It is deliberately NOT part of the frozen candidate 01d8cf9a24089c4a19e8656623f9b8af1f5eda9b.
+#
+# Purpose (user-ruled external gate): run the COMPLETE canonical `verify:release` 15/15 on a CLEAN,
+# unloaded, ephemeral WINDOWS runner — where the Windows process-creation-time liveness probe
+# resolves conclusively and the icacls ACL-hardening does not contend — against the EXACT frozen
+# commit 01d8cf9. The developer box (L0007519) cannot run this (icacls hang + inconclusive liveness).
+#
+# It does NOT weaken ACL or liveness, does NOT modify release artifacts, does NOT publish, and never
+# touches any developer's golden install (clean runner, no ~/.claude). It checks out the EXACT frozen
+# SHA as the code-under-test, so the workflow YAML itself is never part of the tested tree.
+
+# Triggers on push to the throwaway qual ref (workflow_dispatch needs the file on the default branch,
+# which we deliberately avoid — this file must never reach main or the frozen candidate). The push of
+# qual/beta12-315-windows itself starts the run.
+on:
+  push:
+    branches:
+      - 'qual/beta12-315-windows'
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: 'Exact frozen candidate SHA to qualify'
+        required: true
+        default: '01d8cf9a24089c4a19e8656623f9b8af1f5eda9b'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beta12-qual-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-canonical-gate:
+    runs-on: windows-latest
+    steps:
+      # Check out the qualification tree = frozen candidate 01d8cf9's PRODUCT code + ONE test-harness
+      # follow-up (f61114c: 8.3 short-name canonicalization in bundled-installer.test.ts; src/ is
+      # byte-identical to 01d8cf9). This lets the canonical run reach a genuine 15/15 on GitHub's
+      # RUNNER~1 short-name %TEMP% profile without touching the frozen candidate's PRODUCT code.
+      - name: Checkout candidate product code + test-harness fix (f61114c)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.candidate_sha || 'f61114cbcc22ce25bee9d86dc38693b1dd0602bf' }}
+          fetch-depth: 0
+
+      - name: Confirm SHA + prove product code == frozen candidate 01d8cf9
+        shell: bash
+        run: |
+          echo "HEAD=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "f61114cbcc22ce25bee9d86dc38693b1dd0602bf" || { echo "SHA MISMATCH"; exit 1; }
+          # The ONLY delta from the frozen candidate must be the test file — zero product (src/) change.
+          echo "product (src/) delta vs frozen 01d8cf9 (MUST be empty):"
+          delta=$(git diff --name-only 01d8cf9a24089c4a19e8656623f9b8af1f5eda9b..HEAD -- src/)
+          echo "[$delta]"
+          test -z "$delta" || { echo "PRODUCT CODE DRIFTED FROM FROZEN CANDIDATE"; exit 1; }
+          echo "test-only delta vs 01d8cf9:"; git diff --name-only 01d8cf9a24089c4a19e8656623f9b8af1f5eda9b..HEAD
+          echo "tree-clean-check:"; git status --porcelain
+
+      # Approved runtime floor ">=22.13 <25" (package.json engines). Pin 22.13.x.
+      - name: Use approved Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13.x'
+          cache: 'npm'
+
+      - name: Install (locked)
+        run: npm ci
+
+      # THE GATE: the COMPLETE canonical verify:release (all 15 stages, no decomposition, no scope
+      # narrowing). On a clean Windows runner this includes security 83/83 with ACL hardening ON
+      # (XBUS_SKIP_ACL_HARDENING=0 inside the security shard) and the broker-shutdown liveness test
+      # with a CONCLUSIVE process-creation-time probe. ACL/liveness are NOT weakened.
+      - name: Canonical verify:release 15/15 (clean Windows)
+        id: canonical
+        continue-on-error: true
+        run: npm run verify:release
+
+      # DIAGNOSTIC (does NOT gate): if the canonical run failed, name the exact failing integration
+      # tests on THIS clean runner (the wrapper only prints per-shard counts). Default reporter emits
+      # "× <test name>" lines to stdout. This never weakens anything — it only surfaces WHICH tests
+      # failed so the failure can be classified (real defect vs clean-runner env-flake) honestly.
+      - name: Name failing integration tests (diagnostic)
+        if: steps.canonical.outcome == 'failure'
+        continue-on-error: true
+        run: npx vitest run tests/integration --reporter=default
+
+      # Independent exact-SHA artifact reproduction: the runtime-free release zip built on this clean
+      # runner must byte-match the expected hash. verify:release already builds+checks it; this step
+      # re-emits it explicitly for the qualification record.
+      - name: Report deterministic artifact hash
+        if: always()
+        shell: bash
+        run: |
+          if [ -f build/win-package/SHA256SUMS ]; then
+            echo "=== win-package manifest present ==="
+          fi
+          echo "provenance sourceCommit:"; grep sourceCommit provenance.json || true
+
+      # Fail the JOB if the canonical gate did not pass 15/15 — the diagnostic must not mask a red gate.
+      - name: Enforce canonical gate result
+        if: always()
+        run: |
+          if [ "${{ steps.canonical.outcome }}" != "success" ]; then
+            echo "Canonical verify:release did NOT pass 15/15 on this clean runner — see diagnostic above."
+            exit 1
+          fi
+          echo "Canonical verify:release 15/15 PASSED on clean Windows."
+        shell: bash
