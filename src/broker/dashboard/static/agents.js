@@ -390,7 +390,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     // Identity + runtime facts.
     const facts = el('div', 'insp-facts');
     const fact = (k, v) => { const d = el('div', 'insp-fact'); d.appendChild(el('span', 'insp-k', k)); d.appendChild(el('span', 'insp-v', v == null ? '—' : String(v))); facts.appendChild(d); };
-    fact('Status', (window.XBusFriendlyStatus && window.XBusFriendlyStatus(s.label)) || s.label);
+    // BETA.11 (ADR 0038): the inspector Status uses the same HONEST routing-class wording as the
+    // roster (never over-claims — a checkpoint-only session reads "Reachable at next checkpoint").
+    fact('Status', (window.XBusFriendlyRouting && window.XBusFriendlyRouting(s.routingClass, s.label)) || (window.XBusFriendlyStatus && window.XBusFriendlyStatus(s.label)) || s.label);
     fact('Session id', s.sessionId);
     fact('Logical identity', s.logicalIdentityId || s.sessionId);
     fact('Physical instances', s.physicalInstances);

@@ -17,7 +17,10 @@ import { Reaper, type SweepResult } from './reaper.js';
 import { Scheduler, type SchedulerTickResult } from './scheduler.js';
 import { DeadLetterStore } from './deadletter.js';
 import { ControlsStore, type ReceiveControl } from './controls.js';
-import type { ReadinessHints } from './readiness.js';
+import type { ReadinessHints, Readiness } from './readiness.js';
+import { deriveRoutingClass, isAutonomouslyRoutable, deriveDeliverySignal, type RoutingClass } from './routing-class.js';
+import { WakeProbeStore } from './wake-probe.js';
+import { DeliveryState } from '../protocol/states.js';
 import { XBusError, XBusErrorCode, isXBusError } from '../protocol/errors.js';
 import { validateSendInput } from '../protocol/schemas.js';
 import { ComponentRole, isComponentRole, assertAllowed, Operation } from '../identity/components.js';
@@ -60,6 +63,10 @@ export class BrokerDaemon {
   private store: BrokerStore;
   private delivery: DeliveryOps;
   private controls: ControlsStore;
+  /** BETA.11 (ADR 0038): broker-owned host wake-probe. Gates `ready_wakeable`; honest-default
+   *  unproven so a checkpoint session reads `degraded_hook_only` until a real host probe proves it.
+   *  Broker-owned — never client-asserted (security review MAJOR-2). */
+  private readonly wakeProbe = new WakeProbeStore();
   private reaper: Reaper;
   private scheduler: Scheduler;
   private deadLetters: DeadLetterStore;
@@ -607,11 +614,28 @@ export class BrokerDaemon {
     // which would imply the next checkpoint will deliver it).
     const recvMode = this.receiveModeOf(result.recipientSessionId);
     const readiness = this.store.readinessOf(result.recipientSessionId);
+    // BETA.11 (ADR 0038): derive the recipient's honest OUTWARD routing class from the SAME pure fn
+    // the dashboard + xbus_sessions use (so the sender is never told a disconnected/stale recipient
+    // is "queued_until_checkpoint" — the arch-review B bug where the send path used readiness-only).
+    const recipExpired = ((this.db.prepare('SELECT expired_at FROM sessions WHERE session_id=?').get(result.recipientSessionId) as { expired_at: string | null } | undefined)?.expired_at) != null;
+    const recipConn = (this.db.prepare('SELECT state FROM sessions WHERE session_id=?').get(result.recipientSessionId) as { state: string } | undefined)?.state ?? 'disconnected';
+    const routingClass = this.routingClassOf(result.recipientSessionId, readiness, recipConn, recipExpired);
+    // The sender-facing DELIVERY SIGNAL — honest lifecycle word, NEVER "delivered" for a merely
+    // stored message. A fresh send is 'queued'; the routing class tells the sender whether an
+    // autonomous wake path even exists (so it can decide to wait, reroute, or send delay-tolerant).
+    const deliverySignal = deriveDeliverySignal(result.state as DeliveryState, this.store.latestWakeOutcome(result.messageId));
     let state = result.state;
     if (readiness === 'initializing') state = 'queued_receiver_initializing';
     else if (readiness === 'degraded_ack_unavailable' || readiness === 'degraded_hook_unavailable') state = 'queued_receiver_degraded';
     else if (recvMode === 'hook_checkpoint') state = 'queued_until_checkpoint';
-    this.reply(conn, 'send_message_ack', { ...result, state, recipientReceiveMode: recvMode, recipientReadiness: readiness }, frame.requestId);
+    // Additive fields only (arch review D): keep raw `state` + `recipientReadiness` for older
+    // readers; ADD `routingClass`, `autonomouslyRoutable`, `deliverySignal`. A time-sensitive sender
+    // reads `autonomouslyRoutable:false` and can reroute/hold — AgenTel never silently implies a
+    // non-wakeable recipient will consume the message on its own.
+    this.reply(conn, 'send_message_ack', {
+      ...result, state, recipientReceiveMode: recvMode, recipientReadiness: readiness,
+      routingClass, autonomouslyRoutable: isAutonomouslyRoutable(routingClass), deliverySignal,
+    }, frame.requestId);
   }
 
   private onCheckpointPull(conn: ServerConn, frame: Frame): void {
@@ -1101,6 +1125,30 @@ export class BrokerDaemon {
     this.reply(conn, 'signal_readiness_ack', r, frame.requestId);
   }
 
+  /**
+   * BETA.11 (ADR 0038): the SINGLE outward routing-class derivation the broker read paths use
+   * (xbus_sessions + xbus_status). The dashboard read-model derives the SAME class from the same
+   * columns via the same pure `deriveRoutingClass`, so the two surfaces cannot disagree (parity —
+   * closes the today-bug where a DISCONNECTED session still reported readiness:ready_checkpoint).
+   * Inputs are computed here EXACTLY as the read-model computes them (readiness / connection /
+   * expired / autoDelivery / the broker-owned host wake-probe).
+   */
+  private routingClassOf(sessionId: string, readiness: string, connectionState: string, expired: boolean): RoutingClass {
+    // Parity (arch review B): compute EXACTLY the inputs the dashboard read-model computes — the
+    // control mode drives both autoDeliveryEnabled AND the manual_checkpoint distinction, so both
+    // surfaces must read it. getControl is the same source the read-model decodes from `receiving`.
+    const receiveControl = this.controls.getControl(sessionId);
+    return deriveRoutingClass({
+      readiness: readiness as Readiness,
+      receiveMode: '', // not consulted by deriveRoutingClass; readiness already encodes the mode
+      connectionState,
+      expired,
+      wakeProbe: this.wakeProbe.get(),
+      autoDeliveryEnabled: receiveControl === 'active',
+      receiveControl,
+    });
+  }
+
   private onListSessions(conn: ServerConn, frame: Frame): void {
     this.requireAuth(conn);
     const rows = this.db
@@ -1126,6 +1174,12 @@ export class BrokerDaemon {
         receiveMode: r.receive_mode as string,
         readiness: (r.readiness as string) ?? 'disconnected',
         readinessUpdatedAt: (r.readiness_updated_at as string) ?? null,
+        // BETA.11 (ADR 0038): the honest OUTWARD routing class, derived (not the raw readiness) so
+        // a disconnected/stale session is never advertised as routable. Same pure fn the dashboard
+        // uses → the two surfaces agree (parity). `autonomouslyRoutable` is the safe-to-auto-route
+        // signal (ready_live|ready_wakeable only — a degraded_hook_only session is NOT).
+        routingClass: this.routingClassOf(sid, (r.readiness as string) ?? 'disconnected', r.state as string, (r.expired_at as string | null) !== null),
+        autonomouslyRoutable: isAutonomouslyRoutable(this.routingClassOf(sid, (r.readiness as string) ?? 'disconnected', r.state as string, (r.expired_at as string | null) !== null)),
         lastCheckpoint: (r.last_checkpoint_at as string) ?? null,
         queued,
         unacknowledged: unacked,
@@ -1216,6 +1270,11 @@ export class BrokerDaemon {
         agentType: row?.agentType ?? null,
         cwd: row?.cwd ?? null,
         readiness: row?.readiness ?? null,
+        // BETA.11 (ADR 0038): the caller's own honest routing class — derived identically to
+        // xbus_sessions + the dashboard (same pure fn). The caller is on a live authenticated
+        // connection, so connection='connected'; the wake-probe + auto-delivery still decide
+        // whether it is ready_wakeable vs degraded_hook_only. Never over-claims.
+        routingClass: this.routingClassOf(auth.sessionId, row?.readiness ?? 'disconnected', 'connected', row?.expiredAt != null),
         lastMeaningfulActivityAt: row?.lastActivity ?? null,
         expiresAt: row?.expiresAt ?? null,
         expired: row?.expiredAt != null,

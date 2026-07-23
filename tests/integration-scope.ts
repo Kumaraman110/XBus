@@ -66,6 +66,7 @@ export const HOSTED_SAFE_INTEGRATION: readonly string[] = [
   'reliability-matrix.test.ts',
   'remove-record-no-orphan.test.ts',
   'reply-pending-orphan.test.ts',
+  'routing-honesty.test.ts', // BETA.11 (ADR 0038): in-process store + read-model + temp SQLite, no host spawn
   'scheduling-states.test.ts',
   'session-expiry.test.ts',
   'session-identity-reclaim.test.ts',

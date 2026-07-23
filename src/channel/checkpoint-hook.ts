@@ -44,8 +44,15 @@ export interface HookConfig {
 }
 
 export interface HookOutput {
-  /** JSON to print on stdout (hookSpecificOutput.additionalContext). */
+  /** JSON to print on stdout (hookSpecificOutput.additionalContext). MODEL-FACING — carries ONLY
+   *  peer-message payloads, never AgenTel infrastructure diagnostics (BETA.11 / ADR 0038). */
   stdout?: string;
+  /** BETA.11 (ADR 0038): OPERATOR-facing diagnostic text for stderr (activation/degradation
+   *  notices). Claude Code shows a hook's stderr to the operator/logs but does NOT fold it into the
+   *  model's conversation context — so this NEVER teaches the agent to narrate checkpoint internals
+   *  to the end user. The durable-delivery guidance stays a machine fact for operators, not model
+   *  chatter. */
+  stderr?: string;
   /** Exit code: 0 = normal, 2 = (Stop) continue the turn. */
   exitCode: number;
   /** Count of messages injected this checkpoint. */
@@ -101,7 +108,11 @@ export async function runCheckpoint(input: HookInput, cfg: HookConfig): Promise<
           let persistentEnabled = false;
           try { persistentEnabled = isPersistentEnabled(); } catch { /* default false → launcher remedy */ }
           const v = classifyActivation({ mcpComponentRegistered: false, hookAnnounced: p.state === 'DEGRADED_HOOK_ONLY', brokerReachable: true, persistentEnabled });
-          activationNotice = `\n\n[XBus] ${v.summary}${v.remedy ? ` To connect XBus: ${v.remedy}.` : ''} Queued messages (if any) remain durable and will deliver after a connected relaunch.`;
+          // BETA.11 (ADR 0038): this is an OPERATOR diagnostic, NOT model conversation context.
+          // Emitting it as model additionalContext (beta.10 behavior) is exactly what taught agents
+          // to narrate "my XBus is hook-only, delivery lags, surfaces on the next tick" to the user.
+          // It now goes to STDERR (operator/logs), never into the model's context.
+          activationNotice = `[XBus activation] ${v.summary}${v.remedy ? ` Remedy: ${v.remedy}.` : ''} Queued messages (if any) remain durably stored; they are NOT auto-delivered while XBus is not connected.`;
         }
       } catch { /* diagnosis is best-effort; never block Claude on it */ }
     }
@@ -110,16 +121,22 @@ export async function runCheckpoint(input: HookInput, cfg: HookConfig): Promise<
       return { exitCode: 0, injected: 0 };
     }
 
+    // MODEL-FACING additionalContext carries ONLY peer messages (untrusted-peer fence) — never the
+    // activation diagnostic. The operator notice, if any, is returned separately for stderr.
     const nonce = randomNonce();
-    // Combine any pending-message injection with the (once-only) activation notice. When there are
-    // no messages but there IS a notice, the notice alone is the additionalContext.
-    const injection = (messages.length > 0 ? buildCheckpointInjection(messages, nonce) : '') + activationNotice;
-    const out = JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: injection } });
+    const out = messages.length > 0
+      ? JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: buildCheckpointInjection(messages, nonce) } })
+      : undefined;
 
     // Stop continuation is bounded and opt-in. Never continue if stop already
     // active (anti-loop) and never when there was nothing to inject.
     const wantContinue = cfg.autoContinueOnStop === true && event === 'Stop' && input.stop_hook_active !== true && messages.length > 0;
-    return { stdout: out, exitCode: wantContinue ? 2 : 0, injected: messages.length };
+    return {
+      ...(out !== undefined ? { stdout: out } : {}),
+      ...(activationNotice !== '' ? { stderr: activationNotice } : {}),
+      exitCode: wantContinue ? 2 : 0,
+      injected: messages.length,
+    };
   } finally {
     client.close();
   }

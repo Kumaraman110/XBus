@@ -163,3 +163,51 @@ Key invariants (pinned by `tests/integration/session-readiness.test.ts`):
 - A genuine **supersede** (new epoch) resets readiness to `initializing`: the new
   owner must signal afresh, and a stale prior-epoch signal is rejected. This
   prevents a superseded owner's readiness from leaking into the new epoch.
+
+## Wakeability — checkpoint-capable is not autonomously-wakeable (beta.11, ADR 0038)
+
+Readiness answers "is it safe to inject?" A *third* question decides whether the
+message is **autonomously delivered** or merely **durably queued**: "will this
+session actually REACH a checkpoint on its own, with no human turn?"
+
+`ready_checkpoint` means the session takes delivery *at a checkpoint*. It does
+**not** mean the session will autonomously reach one. On the Claude Code platform
+an idle interactive session only advances when (a) the human types, or (b) the
+resident `asyncRewake` rewaker fires (exit 2 → the documented system reminder →
+a checkpoint pull). Whether (b) wakes a **truly cold-idle interactive** session is
+**host-dependent and not guaranteed by the docs** (it did not fire in
+headless/Bedrock testing). So a durable queue is the correctness FLOOR, but it is
+**not** the same as autonomous delivery.
+
+Beta.11 makes this explicit with an outward **RoutingClass** (`routing-class.ts`),
+derived — never stored — by the SAME pure function on every surface (dashboard,
+`xbus_sessions`, `xbus_status`, `send_message_ack`), so they never disagree:
+
+| RoutingClass | Meaning | Autonomously routable? |
+|---|---|---|
+| `ready_live` | push transport; consumes immediately (not on Bedrock today) | **yes** |
+| `ready_wakeable` | idle, but a **proven** host wake path exists | **yes** |
+| `degraded_checkpoint_only` | checkpoint hook works, but autonomous wake is unproven/unavailable (or manual-drain) | **no** |
+| `unavailable` | no verified consumption path (disconnected / incompatible / expired / ack-or-hook-missing / paused / DND) | no |
+| `pending_activation` | activation still establishing | no |
+
+`ready_wakeable` is granted **only** when a broker-owned, version-bound host
+**wake-probe** proves the wake fires (`wake-probe.ts`); the honest default is
+`degraded_checkpoint_only`. Wakeability is never a client assertion.
+
+### Sender-facing delivery signal
+
+The sender is told a truthful lifecycle word, never "delivered" for a stored
+message: `queued → wake_requested → wake_failed → injected → acknowledged →
+replied` (or `failed` / `expired`). `injected` = the body entered the recipient's
+context (`transport_written`); it is **not** "acted on". A stored, an injected,
+and an acknowledged message are always distinguishable.
+
+### Routing policy
+
+Delay-tolerant messages queue durably (unchanged). **Time-sensitive** work is
+**not** silently queued to a non-autonomously-routable target: the sender gets a
+precise non-delivery signal and may hold, opt into delay-tolerant delivery, or
+reroute (a sender decision). `managed_spawn` (headless `claude --bg`, ADR 0025) is
+the opt-in, operator-driven autonomous path; a peer send never auto-triggers a
+spawn, and the broker never auto-reroutes a message *body* to a different identity.
