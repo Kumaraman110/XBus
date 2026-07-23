@@ -10,6 +10,14 @@
  *
  * SAFETY INVARIANTS:
  *  - never delete the legacy source root during the initial upgrade;
+ *  - never MUTATE the legacy source — NOT its DB bytes, -wal, -shm, secret, or any file. BETA.12
+ *    (#315): this is now enforced by opening the source READ-ONLY for inspection (inspectDb below);
+ *    a prior build opened it read-write, which checkpointed a crashed source's -wal into the main
+ *    file on close (a real mutation, incl. on dryRun). Read-only inspection reads all rows (through
+ *    the -wal) without checkpointing, so the source is byte-identical on every path (migrate /
+ *    dryRun / conflict-abort). A consistent COPY is produced by copying the whole root (main + any
+ *    -wal/-shm) — never by mutating the original to force consistency.
+ *  - dryRun performs ZERO writes anywhere (source or destination) — it only inspects + plans;
  *  - never delete the destination pre-migration backup;
  *  - never auto-merge two SQLite databases;
  *  - never pick "newest" automatically;
@@ -69,14 +77,23 @@ function sha256File(p: string): string | null {
   try { return createHash('sha256').update(fs.readFileSync(p)).digest('hex'); } catch { return null; }
 }
 
-/** Inspect a SQLite db safely (read-only; tolerant of WAL). Returns null fields on
- *  any failure rather than throwing, so classification never crashes. */
+/** Inspect a SQLite db safely (READ-ONLY; tolerant of WAL). Returns null fields on
+ *  any failure rather than throwing, so classification never crashes.
+ *
+ *  BETA.12 (#315): opened READ-ONLY (`{ readOnly: true }`). A read-write open of a CRASHED source
+ *  (uncheckpointed -wal, no live holder) checkpoints the -wal into the main file on close — MUTATING
+ *  the legacy source (main-hash flips, -wal→0). That violated the "LEGACY SOURCE is never mutated"
+ *  invariant and made dryRun a source-writing no-op. A read-only handle reads ALL rows through the
+ *  -wal (verified: an uncheckpointed 30-row -wal reports the full count under readOnly) WITHOUT
+ *  checkpointing, so inspection is now byte-non-mutating on every path (migrate / dryRun / conflict).
+ *  SQLite refuses a read-only open only when the DB needs WAL *recovery* it cannot perform read-only;
+ *  we fall back to a byte-safe "unknown" classification (never a read-write open) rather than mutate. */
 function inspectDb(dbPath: string): { integrityOk: boolean | null; schemaVersion: number | null; sessions: number | null; messages: number | null; aliases: number | null; audit: number | null } {
   const out = { integrityOk: null as boolean | null, schemaVersion: null as number | null, sessions: null as number | null, messages: null as number | null, aliases: null as number | null, audit: null as number | null };
   if (!fs.existsSync(dbPath)) return out;
   let db: InstanceType<typeof DatabaseSync> | null = null;
   try {
-    db = new DatabaseSync(dbPath); // read-write open tolerates WAL replay
+    db = new DatabaseSync(dbPath, { readOnly: true }); // READ-ONLY: never checkpoints/mutates the source (#315)
     try { const r = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string }; out.integrityOk = r?.integrity_check === 'ok'; } catch { out.integrityOk = false; }
     const tables = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((r) => r.name));
     const count = (t: string): number | null => { if (!tables.has(t)) return null; try { return (db!.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get() as { c: number }).c; } catch { return null; } };
@@ -262,10 +279,20 @@ export interface MigrateResult {
 }
 
 /**
- * Perform the transactional migration (§7). Caller MUST ensure the broker is
- * stopped first. Steps are journaled at each durable transition; on failure the
- * destination is restored from its pre-migration backup and the journal records
- * the rollback. The LEGACY SOURCE is never deleted or mutated.
+ * Perform the transactional migration (§7). Steps are journaled at each durable transition; on
+ * failure the destination is restored from its pre-migration backup and the journal records the
+ * rollback.
+ *
+ * The LEGACY SOURCE is never deleted or mutated — verified byte-for-byte (BETA.12 #315): all source
+ * inspection is READ-ONLY (inspectDb), so even a crashed source with an uncheckpointed -wal is left
+ * byte-identical; the consistent copy is produced by copying the whole root (main + -wal/-shm), not
+ * by checkpointing the original.
+ *
+ * BROKER OWNERSHIP: for the SAME-root upgrade the caller (install.ts) proves-and-stops an OWNED
+ * broker before calling here. For a RELOCATING copy the source is read read-only, so a live legacy
+ * writer cannot corrupt the copy — a still-live legacy writer yields a fail-closed abort (staged
+ * hash != source), never a lossy promote (see migration-wal-consistency + source-immutability tests).
+ * This function never signals or kills any process (that stays the caller's proven-ownership path).
  */
 export function migrateDataRoot(opts: MigrateOptions): MigrateResult {
   const legacy = summarizeRoot(opts.legacyRoot);

@@ -65,6 +65,8 @@ export const HOSTED_SAFE_INTEGRATION: readonly string[] = [
   'ownership-primitive.test.ts',
   'reliability-matrix.test.ts',
   'remove-record-no-orphan.test.ts',
+  'migration-wal-consistency.test.ts', // beta.11.1 (#315): in-process migrate + temp SQLite WAL, no host spawn
+  'migration-source-immutability.test.ts', // beta.12 (#315): in-process migrate + temp SQLite, no host spawn
   'reply-pending-orphan.test.ts',
   'routing-honesty.test.ts', // BETA.11 (ADR 0038): in-process store + read-model + temp SQLite, no host spawn
   'scheduling-states.test.ts',
