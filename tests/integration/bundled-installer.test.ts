@@ -28,7 +28,14 @@ function sha256(file: string): string { return createHash('sha256').update(fs.re
 /** Build a synthetic release fixture. `withBundled` copies a real node into runtime/node.exe (so it
  *  can execute the stub CLI); `sums` controls whether/what SHA256SUMS says for runtime/node.exe. */
 function makeFixture(opts: { withBundled: boolean; tamper?: boolean; sumsEntry?: 'correct' | 'wrong' | 'missing' | 'noFile' }): { dir: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentel-inst-'));
+  // Canonicalize to the LONG-name form. On some Windows hosts (notably GitHub-hosted runners) the
+  // profile dir has a DOS 8.3 short name, so os.tmpdir() yields e.g. C:\Users\RUNNER~1\... while the
+  // installer (install.ps1 via $MyInvocation.MyCommand.Path) reports the long form C:\Users\runneradmin\...
+  // Both name the SAME directory, but the string comparisons below (path.normalize()+toLowerCase(),
+  // r.out.toContain(...)) are LEXICAL and do not fold 8.3 short names — so an un-canonicalized fixture
+  // path spuriously mismatches the installer's long-name output (a test-harness gap, not a product bug).
+  // realpathSync.native() runs GetLongPathName on Windows (no-op where already long / on POSIX).
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'agentel-inst-')));
   fs.copyFileSync(INSTALL_PS1, path.join(dir, 'install.ps1'));
   // Stub CLI: records argv + a marker into a file next to it, so the test can assert HOW it ran.
   fs.mkdirSync(path.join(dir, 'dist', 'cli'), { recursive: true });
