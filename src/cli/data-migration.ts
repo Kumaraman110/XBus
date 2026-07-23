@@ -10,14 +10,24 @@
  *
  * SAFETY INVARIANTS:
  *  - never delete the legacy source root during the initial upgrade;
- *  - never MUTATE the legacy source — NOT its DB bytes, -wal, -shm, secret, or any file. BETA.12
- *    (#315): this is now enforced by opening the source READ-ONLY for inspection (inspectDb below);
- *    a prior build opened it read-write, which checkpointed a crashed source's -wal into the main
- *    file on close (a real mutation, incl. on dryRun). Read-only inspection reads all rows (through
- *    the -wal) without checkpointing, so the source is byte-identical on every path (migrate /
- *    dryRun / conflict-abort). A consistent COPY is produced by copying the whole root (main + any
+ *  - never MUTATE the legacy source's AUTHORITATIVE bytes — its main DB file, the committed frames
+ *    in its -wal, its root secret, ledger, and ownership state are all left byte-identical. BETA.12
+ *    (#315): enforced by opening the source READ-ONLY for inspection (inspectDb below); a prior build
+ *    opened it read-write, which checkpointed a crashed source's -wal into the main file on close (a
+ *    real mutation of authoritative bytes, incl. on dryRun). Read-only inspection reads all rows
+ *    (through the -wal) without checkpointing, so the main DB file is byte-identical and no committed
+ *    row is lost on every path (migrate / dryRun / conflict-abort). CAVEAT — SQLite's EPHEMERAL
+ *    wal-index (-shm), and a zero-length -wal placeholder, may be CREATED or rewritten by the
+ *    read-only open: opening a DB with an uncheckpointed -wal builds the shared-memory wal-index so
+ *    the reader can see the WAL frames. These derived files hold NO committed data, are regenerated
+ *    by ANY reader (the user's next broker start, the sqlite3 CLI, etc.), and their change cannot
+ *    lose a row or render the source unusable — so this is not a mutation of authoritative state.
+ *    (Using SQLite immutable-mode to avoid even the -shm write is deliberately NOT done: it would
+ *    make the reader IGNORE the -wal and undercount rows — a correctness defect worse than a
+ *    regenerable index file.) A consistent COPY is produced by copying the whole root (main + any
  *    -wal/-shm) — never by mutating the original to force consistency.
- *  - dryRun performs ZERO writes anywhere (source or destination) — it only inspects + plans;
+ *  - dryRun performs ZERO writes to authoritative bytes (source or destination) — it only inspects +
+ *    plans; the sole file-system effect on the source is the regenerable wal-index noted above;
  *  - never delete the destination pre-migration backup;
  *  - never auto-merge two SQLite databases;
  *  - never pick "newest" automatically;
@@ -82,12 +92,16 @@ function sha256File(p: string): string | null {
  *
  *  BETA.12 (#315): opened READ-ONLY (`{ readOnly: true }`). A read-write open of a CRASHED source
  *  (uncheckpointed -wal, no live holder) checkpoints the -wal into the main file on close — MUTATING
- *  the legacy source (main-hash flips, -wal→0). That violated the "LEGACY SOURCE is never mutated"
- *  invariant and made dryRun a source-writing no-op. A read-only handle reads ALL rows through the
- *  -wal (verified: an uncheckpointed 30-row -wal reports the full count under readOnly) WITHOUT
- *  checkpointing, so inspection is now byte-non-mutating on every path (migrate / dryRun / conflict).
+ *  the legacy source's authoritative bytes (main-hash flips, -wal→0). That violated the "LEGACY
+ *  SOURCE is never mutated" invariant and made dryRun a source-writing no-op. A read-only handle
+ *  reads ALL rows through the -wal (verified: an uncheckpointed 30-row -wal reports the full count
+ *  under readOnly) WITHOUT checkpointing, so the main DB file is byte-identical and no committed row
+ *  is lost on every path (migrate / dryRun / conflict). (It may create/rewrite the regenerable -shm
+ *  wal-index and a 0-length -wal placeholder — derived files with no committed data; see the SAFETY
+ *  INVARIANTS note. We do NOT use immutable-mode, which would ignore the -wal and undercount rows.)
  *  SQLite refuses a read-only open only when the DB needs WAL *recovery* it cannot perform read-only;
- *  we fall back to a byte-safe "unknown" classification (never a read-write open) rather than mutate. */
+ *  on ANY open/inspect failure we leave integrityOk=false (→ `corrupt` → fail-closed `conflict`) and
+ *  NEVER retry with a read-write open, so a recovery-needed source is refused rather than mutated. */
 function inspectDb(dbPath: string): { integrityOk: boolean | null; schemaVersion: number | null; sessions: number | null; messages: number | null; aliases: number | null; audit: number | null } {
   const out = { integrityOk: null as boolean | null, schemaVersion: null as number | null, sessions: null as number | null, messages: null as number | null, aliases: null as number | null, audit: null as number | null };
   if (!fs.existsSync(dbPath)) return out;
@@ -283,16 +297,28 @@ export interface MigrateResult {
  * failure the destination is restored from its pre-migration backup and the journal records the
  * rollback.
  *
- * The LEGACY SOURCE is never deleted or mutated — verified byte-for-byte (BETA.12 #315): all source
- * inspection is READ-ONLY (inspectDb), so even a crashed source with an uncheckpointed -wal is left
- * byte-identical; the consistent copy is produced by copying the whole root (main + -wal/-shm), not
- * by checkpointing the original.
+ * The LEGACY SOURCE's authoritative bytes are never deleted or mutated — verified byte-for-byte
+ * (BETA.12 #315): all source inspection is READ-ONLY (inspectDb), so even a crashed source with an
+ * uncheckpointed -wal has its main DB file left byte-identical (only the regenerable -shm wal-index /
+ * 0-length -wal placeholder may appear — see inspectDb + the SAFETY INVARIANTS note); the consistent
+ * copy is produced by copying the whole root (main + -wal/-shm), not by checkpointing the original.
  *
  * BROKER OWNERSHIP: for the SAME-root upgrade the caller (install.ts) proves-and-stops an OWNED
  * broker before calling here. For a RELOCATING copy the source is read read-only, so a live legacy
  * writer cannot corrupt the copy — a still-live legacy writer yields a fail-closed abort (staged
  * hash != source), never a lossy promote (see migration-wal-consistency + source-immutability tests).
  * This function never signals or kills any process (that stays the caller's proven-ownership path).
+ *
+ * UPGRADE / INTERRUPTION SCOPE (honest limitations):
+ *  - beta.10→beta.12 and beta.11→beta.12 are all SCHEMA 11 with a byte-identical migrations.ts, so
+ *    the upgrade leaves the on-disk dataDir untouched (install.ts skips the DB snapshot when the
+ *    on-disk schema already equals SCHEMA_VERSION); "all data preserved" for those two upgrades is
+ *    guaranteed by that same-schema/untouched-dir argument, not by a schema-11 end-to-end upgrade
+ *    test (the install-db-rollback suite exercises the forward-migration path from s6/s7).
+ *  - Journaled transitions make an in-process throw roll back cleanly. A HARD process kill / power
+ *    loss in the momentary window after the destination backup and before the staging promotion has
+ *    NO journal-resume consumer; recovery relies on the #315 invariant that the pristine SOURCE is
+ *    never mutated, so re-running the migration reconstructs the canonical root from the source.
  */
 export function migrateDataRoot(opts: MigrateOptions): MigrateResult {
   const legacy = summarizeRoot(opts.legacyRoot);

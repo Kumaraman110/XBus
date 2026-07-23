@@ -13,8 +13,14 @@
  * (false invariant + side-effecting dryRun + mutate-before-backup), NOT data-loss. See ADR 0027.
  *
  * FIX (beta.12): inspect READ-ONLY (`{ readOnly: true }`) — proven to read all uncheckpointed-WAL
- * rows correctly WITHOUT checkpointing/mutating the source. These tests FAIL at 87f27a1f (source
- * mutated) and PASS after the read-only-inspect fix.
+ * rows correctly WITHOUT checkpointing/mutating the source. RED-first evidence @ 87f27a1f: 4 of the
+ * 6 cases below FAIL at baseline — the byte-mutation assertions (summarizeRoot / dryRun / real
+ * migrate / conflict-abort each mutate the crashed source under read-write inspect); the 2 row-count
+ * cases (repeated-dryRun idempotence, source-usable-after) are GREEN at BOTH baseline and fix because
+ * the checkpoint never lost a row (this is a byte-mutation defect, not a loss defect). All 6 PASS
+ * after the read-only-inspect fix. NOTE: byte-immutability here is scoped to the AUTHORITATIVE main
+ * DB file + -wal committed frames + secret; the ephemeral/regenerable -shm wal-index is deliberately
+ * not asserted (a read-only open of an uncheckpointed -wal builds it — see data-migration.ts).
  *
  * HOSTED_SAFE: in-process migrate + temp SQLite, no broker/host spawn.
  */
