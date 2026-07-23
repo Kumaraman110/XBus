@@ -11,6 +11,7 @@ import { loadOrCreateRootSecret } from '../ipc/root-secret.js';
 import { defaultEndpoint } from '../ipc/transport.js';
 import { computeProjectId, deriveWorkspaceSuggestion } from '../identity/project.js';
 import { suggestSessionName } from '../identity/session-name.js';
+import { resolveDurableName } from './owner-secret-store.js';
 import { ensureBrokerDefault } from '../broker/ensure.js';
 import { resolveDataDir as resolveCanonicalDataDir } from '../launcher/install-paths.js';
 import { readConfigEnv } from '../shared/env-config.js';
@@ -52,7 +53,16 @@ export function main(): void {
   // (git repo / dir / agent+project). The broker awards it if valid+unclaimed,
   // else the session enters pending_name and the model is prompted to choose one.
   const savedName = readConfigEnv('SESSION_NAME'); // explicit override / saved pref (AGENTEL_/XBUS_)
-  const suggestion = suggestSessionName(deriveWorkspaceSuggestion(cwd, { agentType, projectId, ...(savedName !== undefined ? { savedName } : {}) }));
+  // BETA.11 (ADR 0037): recover the DURABLE name this (projectId, agentType) last held, so a
+  // resumed session (new Claude session id) re-requests the name it actually owns — making
+  // loadOwnerSecret hit the correct anchor and the broker's reclaim run automatically. Precedence:
+  // an explicit SESSION_NAME override wins (a user deliberately pinning a name), then the recovered
+  // durable name, then the workspace suggestion (first-ever launch / never-named). Without this a
+  // resume requests the workspace suggestion, misses its own owner-secret, and lands pending.
+  const durableName = savedName === undefined ? resolveDurableName(dataDir, projectId, agentType) : undefined;
+  const suggestion = savedName !== undefined
+    ? suggestSessionName(deriveWorkspaceSuggestion(cwd, { agentType, projectId, savedName }))
+    : (durableName ?? suggestSessionName(deriveWorkspaceSuggestion(cwd, { agentType, projectId })));
 
   const server = new McpServer({
     sessionId,

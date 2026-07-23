@@ -348,6 +348,56 @@ export function migrateDataRoot(opts: MigrateOptions): MigrateResult {
   }
 }
 
+/**
+ * BETA.11 (ADR 0037): CARRY the durable-identity CREDENTIAL FILES from a legacy data root into the
+ * canonical one, INDEPENDENT of the runtime-DB migrate decision.
+ *
+ * decideMigration keys "should we migrate" on the presence of an authoritative runtime DB
+ * (classifyRoot). But `owner-secrets.json` (the reclaim credentials) and `durable-names.json` (the
+ * beta.11 name-recovery index) are durable-identity data that matter EVEN when the legacy root has
+ * no runtime DB (a secrets-only legacy dir classifies as "empty" → no migration → the credentials
+ * were stranded, so a resume could not reclaim even with the right name). This carries them anyway.
+ *
+ * MERGE semantics (never regress a fresher canonical record):
+ *   - per (anchorKey) entry, keep whichever side has the newer `updatedAt`;
+ *   - a canonical entry with no updatedAt is treated as authoritative (never clobbered);
+ *   - the file is JSON of Record<key, {..., updatedAt}>; malformed/absent sides degrade to no-op.
+ * Best-effort + idempotent: any IO/parse error leaves the canonical file untouched. Secrets are
+ * only ever COPIED between the two ACL-protected roots, never logged/returned. Returns which files
+ * changed (for the caller's audit/log — names only, never contents).
+ */
+export function carryDurableCredentials(legacyRoot: string, canonicalRoot: string): { carried: string[] } {
+  const carried: string[] = [];
+  if (path.resolve(legacyRoot) === path.resolve(canonicalRoot)) return { carried };
+  for (const file of ['owner-secrets.json', 'durable-names.json']) {
+    try {
+      const src = path.join(legacyRoot, file);
+      if (!fs.existsSync(src)) continue;
+      const legacy = JSON.parse(fs.readFileSync(src, 'utf8')) as Record<string, { updatedAt?: string }>;
+      if (!legacy || typeof legacy !== 'object') continue;
+      const dst = path.join(canonicalRoot, file);
+      let canonical: Record<string, { updatedAt?: string }> = {};
+      try { const raw = fs.readFileSync(dst, 'utf8'); const p = JSON.parse(raw) as unknown; if (p && typeof p === 'object') canonical = p as Record<string, { updatedAt?: string }>; } catch { /* absent/malformed → start empty */ }
+      let changed = false;
+      for (const [key, rec] of Object.entries(legacy)) {
+        const cur = canonical[key];
+        // Keep canonical when it exists AND is not strictly older than the legacy record.
+        const canonNewer = cur !== undefined && (cur.updatedAt === undefined || (rec.updatedAt !== undefined && cur.updatedAt >= rec.updatedAt) || rec.updatedAt === undefined);
+        if (!canonNewer) { canonical[key] = rec; changed = true; }
+      }
+      if (changed) {
+        fs.mkdirSync(canonicalRoot, { recursive: true });
+        const tmp = `${dst}.tmp-${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify(canonical), { mode: 0o600 });
+        fs.renameSync(tmp, dst);
+        try { fs.chmodSync(dst, 0o600); } catch { /* windows/no-chmod: dir ACL covers it */ }
+        carried.push(file);
+      }
+    } catch { /* best-effort per file: a failure just means no carry for that file this run */ }
+  }
+  return { carried };
+}
+
 /** Write the durable completion marker (§12) into the canonical root after the
  *  full upgrade (runtime installed + health verified) commits. No secret stored. */
 export interface MigrationMarker {

@@ -142,6 +142,18 @@ function readJson<T>(p: string): T | null {
 export function readClaudeConfig(configPath: string): ClaudeConfig | null { return readJson<ClaudeConfig>(configPath); }
 export function readClaudeSettings(settingsPath: string): ClaudeSettings | null { return readJson<ClaudeSettings>(settingsPath); }
 
+/**
+ * BETA.11 (ADR 0037): is XBus persistent activation enabled — enabledPlugins.xbus === true in the
+ * user settings.json? Used by the Stop-hook activation diagnostic to give an honest remedy: when
+ * persistence is on, a plugin-absent session should NOT be told to switch to the `xclaude` launcher
+ * (plain `claude` is meant to load the plugin). Best-effort read; any IO/parse error → false (fall
+ * back to the launcher remedy). Honors the settings path override (golden-boundary safe).
+ */
+export function isPersistentEnabled(settingsPath: string = defaultClaudeSettingsPath()): boolean {
+  const settings = readClaudeSettings(settingsPath);
+  return settings?.enabledPlugins?.[XBUS_PLUGIN_NAME] === true;
+}
+
 /** Our canonical MCP server entry. */
 function xbusMcpEntry(o: UserScopeOptions): McpServerEntry {
   return { type: 'stdio', command: o.nodePath, args: [o.serverEntry], env: { XBUS_DATA_DIR: o.dataDir }, [XBUS_OWNER_TAG]: o.installId };

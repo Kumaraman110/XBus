@@ -22,6 +22,7 @@ import { buildCheckpointInjection, type PeerMessageForInjection } from './instru
 import { doHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
 import { classifyActivation } from './activation-state.js';
+import { isPersistentEnabled } from '../cli/user-scope-config.js';
 
 export interface HookInput {
   hook_event_name?: string;
@@ -94,7 +95,12 @@ export async function runCheckpoint(input: HookInput, cfg: HookConfig): Promise<
         const diag = await client.request('activation_diagnose', {});
         const p = diag.payload as { state?: string; firstEmission?: boolean };
         if (diag.frameType !== 'error' && p.firstEmission === true && (p.state === 'PLUGIN_NOT_LOADED' || p.state === 'DEGRADED_HOOK_ONLY')) {
-          const v = classifyActivation({ mcpComponentRegistered: false, hookAnnounced: p.state === 'DEGRADED_HOOK_ONLY', brokerReachable: true });
+          // BETA.11 (ADR 0037): give an honest remedy — if persistent activation is enabled, a
+          // plugin-absent session must NOT be told to run `xclaude` (plain `claude` is meant to load
+          // the plugin); the remedy becomes "start a new session". Best-effort read, never blocks.
+          let persistentEnabled = false;
+          try { persistentEnabled = isPersistentEnabled(); } catch { /* default false → launcher remedy */ }
+          const v = classifyActivation({ mcpComponentRegistered: false, hookAnnounced: p.state === 'DEGRADED_HOOK_ONLY', brokerReachable: true, persistentEnabled });
           activationNotice = `\n\n[XBus] ${v.summary}${v.remedy ? ` To connect XBus: ${v.remedy}.` : ''} Queued messages (if any) remain durable and will deliver after a connected relaunch.`;
         }
       } catch { /* diagnosis is best-effort; never block Claude on it */ }

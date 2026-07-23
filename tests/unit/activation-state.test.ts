@@ -57,4 +57,19 @@ describe('classifyActivation — signal→state, honesty rules', () => {
       expect(classifyActivation(sig).connected).toBe(false);
     }
   });
+
+  it('BETA.11: with persistent activation ENABLED, a plugin-absent remedy does NOT tell the user to run xclaude', () => {
+    for (const state of [{ hookAnnounced: true }, { hookAnnounced: false }]) {
+      const v = classifyActivation({ mcpComponentRegistered: false, brokerReachable: true, persistentEnabled: true, ...state });
+      expect(v.connected).toBe(false);
+      expect(v.remedy).toBeDefined();
+      expect(v.remedy).not.toContain(CANONICAL_LAUNCH); // must NOT recommend the `xclaude` launcher
+      expect(v.remedy).toMatch(/new .*session/i);        // honest: start a new session
+    }
+  });
+
+  it('BETA.11: with persistent activation OFF (default), the remedy still recommends the xclaude launcher', () => {
+    const v = classifyActivation({ mcpComponentRegistered: false, hookAnnounced: true, brokerReachable: true });
+    expect(v.remedy).toContain(CANONICAL_LAUNCH);
+  });
 });

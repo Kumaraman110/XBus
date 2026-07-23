@@ -27,6 +27,7 @@
 export const HOSTED_SAFE_INTEGRATION: readonly string[] = [
   'activation-diagnose.test.ts',
   'adapter-conformance.test.ts',
+  'beta11-durable-reclaim.test.ts', // BETA.11: in-process BrokerStore + temp SQLite + owner-secret store, no host spawn
   'adapter-registration-enforcement.test.ts',
   'beta3-to-beta4-upgrade.test.ts',
   'beta4-pr4-composition.test.ts',

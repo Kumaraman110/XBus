@@ -122,4 +122,22 @@ describe('diagnoseActivationOnce — Stop-hook activation classification + once-
     registerMcp(s);
     expect(store.diagnoseActivationOnce(s).state).toBe('CONNECTED');
   });
+
+  it('BETA.11 session-id skew: a hook diagnosing under a REDIRECTED physical id resolves to the canonical mcp identity (NOT a false hook-only)', () => {
+    // Canonical durable identity Y has a live mcp (plugin genuinely loaded + connected).
+    const canonical = sid();
+    registerMcp(canonical);
+    expect(store.diagnoseActivationOnce(canonical).state).toBe('CONNECTED');
+    // A resumed physical id X is redirected onto Y (as a register-time reclaim records). The Stop hook
+    // fires under X (CLAUDE_CODE_SESSION_ID drift). On beta.10 diagnose(X) saw no mcp for X →
+    // false DEGRADED_HOOK_ONLY. BETA.11 follows the map → diagnoses Y → CONNECTED, no false emission.
+    const physical = sid();
+    db.prepare('INSERT INTO physical_session_map (physical_session_id, canonical_session_id, logical_identity_id, created_at) VALUES (?,?,?,?)')
+      .run(physical, canonical, canonical, clock.nowIso());
+    const d = store.diagnoseActivationOnce(physical);
+    expect(d.state).toBe('CONNECTED');           // resolved via the map — beta.10: DEGRADED_HOOK_ONLY
+    expect(d.firstEmission).toBe(false);         // no false plugin-absent audit
+    expect(auditCount(physical)).toBe(0);
+    expect(auditCount(canonical)).toBe(0);
+  });
 });

@@ -17,7 +17,7 @@ import { buildChannelInstructions } from './instructions.js';
 import { doHello } from '../ipc/hello.js';
 import { ComponentRole } from '../identity/components.js';
 import { normalizeSessionName } from '../identity/session-name.js';
-import { loadOwnerSecret, saveOwnerSecret } from './owner-secret-store.js';
+import { loadOwnerSecret, saveOwnerSecret, saveDurableName } from './owner-secret-store.js';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -185,10 +185,17 @@ export class McpServer {
     });
     // Beta.8: persist a freshly-minted owner secret (returned only on a new protected award /
     // successful reclaim) so future session ids can reclaim. Never logged.
+    // Beta.11 (ADR 0037): ALSO record the durable NAME under (projectId, agentType) whenever the
+    // session is active under a name — even on a reclaim where no fresh secret is minted — so a
+    // future resume re-requests the right name and its owner-secret lookup hits. Name only, no secret.
     try {
       const p = (ack.payload ?? {}) as { ownerSecret?: string; awardedSessionName?: string; logicalIdentityId?: string };
-      if (this.deps.dataDir !== undefined && typeof p.ownerSecret === 'string' && typeof p.awardedSessionName === 'string') {
-        saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.awardedSessionName), p.ownerSecret, p.logicalIdentityId, new Date().toISOString());
+      if (this.deps.dataDir !== undefined && typeof p.awardedSessionName === 'string') {
+        const nowIso = new Date().toISOString();
+        if (typeof p.ownerSecret === 'string') {
+          saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.awardedSessionName), p.ownerSecret, p.logicalIdentityId, nowIso);
+        }
+        saveDurableName(this.deps.dataDir, this.deps.projectId, this.deps.agentType ?? 'claude', p.awardedSessionName, p.logicalIdentityId, nowIso);
       }
     } catch { /* best-effort persistence */ }
     // §2: the MCP server is the component that can ack/reply, so once it has
@@ -266,8 +273,15 @@ export class McpServer {
       this.send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Tool-level error: surface as a tool result (isError) so the model sees it.
-      this.send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: msg }) }] } });
+      // Tool-level error: surface as a tool result (isError) so the model sees it. BETA.11 (ADR 0037):
+      // include the error code + non-sensitive detail (e.g. reclaimOutcome) so the model gets the
+      // PRECISE, actionable reason (credential-missing / credential-invalid / predecessor-live / …)
+      // rather than a bare message string. detail is hash-only; no secret is ever serialized here.
+      const ee = e as { code?: string; detail?: Record<string, unknown> };
+      const body: Record<string, unknown> = { error: msg };
+      if (typeof ee?.code === 'string') body.code = ee.code;
+      if (ee?.detail !== undefined) body.detail = ee.detail;
+      this.send({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify(body) }] } });
     }
   }
 
@@ -306,10 +320,32 @@ export class McpServer {
         // Beta.8 (ADR 0027): a rename can mint the first owner secret for this identity —
         // persist it (keyed by project_id + the new normalized name) so the name is
         // reclaimable after a session-id change. Best-effort; never logged.
+        // Beta.11 (ADR 0037): ALSO record the durable name under (projectId, agentType) so a resume
+        // re-requests THIS name (a user-chosen rename is exactly the name that never matches the
+        // workspace suggestion — the defect this closes). Name only; never the secret.
         try {
           const p = (f.payload ?? {}) as { ownerSecret?: string; name?: string };
-          if (this.deps.dataDir !== undefined && typeof p.ownerSecret === 'string' && typeof p.name === 'string') {
-            saveOwnerSecret(this.deps.dataDir, this.deps.projectId, normalizeSessionName(p.name), p.ownerSecret, this.deps.sessionId, new Date().toISOString());
+          if (this.deps.dataDir !== undefined && typeof p.name === 'string') {
+            const nowIso = new Date().toISOString();
+            const newNorm = normalizeSessionName(p.name);
+            if (typeof p.ownerSecret === 'string') {
+              // Fresh secret minted this rename (first protected award) → persist under the new name.
+              saveOwnerSecret(this.deps.dataDir, this.deps.projectId, newNorm, p.ownerSecret, this.deps.sessionId, nowIso);
+            } else if (this.deps.requestedSessionName !== undefined) {
+              // BETA.11 (ADR 0037) — the broker REUSES the owner secret across renames (never re-mints,
+              // ADR 0027 D5), so the ack carries no plaintext here. The secret the client already holds
+              // is keyed under the PREVIOUS (auto-derived) name. RE-KEY it to the NEW name so a resumed
+              // session that recovers `p.name` (below) can loadOwnerSecret(p.name) and reclaim. Without
+              // this the durable-name pointer says "AccountLookUp" but the secret sits under the old
+              // auto-name anchor → loadOwnerSecret misses → reclaim never attempted (the dogfood bug).
+              // Client-side only; the plaintext never leaves the ACL-protected data dir or the wire.
+              const prevNorm = normalizeSessionName(this.deps.requestedSessionName);
+              if (prevNorm !== newNorm) {
+                const existing = loadOwnerSecret(this.deps.dataDir, this.deps.projectId, prevNorm);
+                if (existing !== undefined) saveOwnerSecret(this.deps.dataDir, this.deps.projectId, newNorm, existing, this.deps.sessionId, nowIso);
+              }
+            }
+            saveDurableName(this.deps.dataDir, this.deps.projectId, this.deps.agentType ?? 'claude', p.name, this.deps.sessionId, nowIso);
           }
         } catch { /* best-effort */ }
         return this.unwrap(f);
@@ -325,8 +361,15 @@ export class McpServer {
 
   private unwrap(frame: { frameType: string; payload: unknown }): unknown {
     if (frame.frameType === 'error') {
-      const p = frame.payload as { code: string; message: string };
-      throw new Error(`${p.code}: ${p.message}`);
+      const p = frame.payload as { code: string; message: string; detail?: Record<string, unknown> };
+      // BETA.11 (ADR 0037): preserve the non-sensitive structured `detail` (e.g. the discriminated
+      // `reclaimOutcome` on a rename reclaim refusal) so the model/client sees the PRECISE reason
+      // instead of a bare "code: message". Attached to the Error so toolCall surfaces it in the
+      // tool-result JSON. detail never carries a secret (owner secret is hash-only, D7).
+      const err = new Error(`${p.code}: ${p.message}`) as Error & { code?: string; detail?: Record<string, unknown> };
+      err.code = p.code;
+      if (p.detail !== undefined) err.detail = p.detail;
+      throw err;
     }
     return frame.payload;
   }

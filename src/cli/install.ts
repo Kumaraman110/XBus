@@ -23,7 +23,7 @@ import { BUILD_ID } from '../protocol/handshake.js';
 import { XBUS_VERSION } from '../protocol/version.js';
 import { defaultInstallRoot, manifestPath, readInstallManifest, defaultDataDir, type InstallManifest } from '../launcher/install-paths.js';
 import { validateArtifact } from '../shared/artifact-contract.js';
-import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, type MigrationDecision } from './data-migration.js';
+import { summarizeRoot, decideMigration, migrateDataRoot, writeMarker, readMarker, carryDurableCredentials, type MigrationDecision } from './data-migration.js';
 import { registerUserScope, unregisterUserScope, defaultClaudeConfigPath, defaultClaudeSettingsPath, setPersistentEnable, clearPersistentEnable } from './user-scope-config.js';
 import { SCHEMA_VERSION } from '../protocol/handshake.js';
 import { snapshotDbCheckpointed, restoreDbSnapshot, discardSnapshot, type SnapshotManifest } from './db-snapshot.js';
@@ -332,6 +332,16 @@ export async function install(opts: InstallOptions = {}): Promise<InstallResult>
 
     fs.mkdirSync(dataDir, { recursive: true });
     try { hardenDir(dataDir); } catch { /* best effort */ }
+
+    // BETA.11 (ADR 0037): CARRY durable-identity credentials (owner-secrets.json + durable-names.json)
+    // from the legacy data root into the canonical one, INDEPENDENT of the runtime-DB migrate verdict
+    // above. A secrets-only legacy dir classifies as "no migration" → without this the reclaim
+    // credentials would be stranded in the old dir and a resumed session could not reclaim its name
+    // even with the correct anchor. Merge prefers a newer canonical record (never regresses a fresh
+    // secret). Best-effort; never fails the install. (Skipped for a full 'migrate' that already copied
+    // the whole legacy root — carrying again is a harmless idempotent no-op in that case.)
+    try { carryDurableCredentials(plan.legacyDataRoot, dataDir); }
+    catch { /* best-effort: credential carry never blocks install */ }
 
     // Generate the per-installation secret SAFELY in the data dir (first use) —
     // a NO-OP when migration already promoted the authoritative secret.

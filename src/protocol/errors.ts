@@ -15,8 +15,15 @@ export const XBusErrorCode = {
   /** A human-readable session name was rejected (charset, reserved, generic,
    *  UUID-like, path-like, length). Beta.4 named-session validation. */
   INVALID_SESSION_NAME: 'XBUS_INVALID_SESSION_NAME',
-  /** The requested name is already owned by another ACTIVE session. Beta.4. */
+  /** The requested name is already owned by another ACTIVE session. Beta.4.
+   *  BETA.11 (ADR 0037): the error `detail.reclaimOutcome` now carries a PRECISE reason
+   *  (predecessor-live / unrelated-owns / credential-invalid / credential-missing / anchor-mismatch)
+   *  so a resumed session is never misled into thinking a durable name it owns is simply "taken". */
   SESSION_NAME_TAKEN: 'XBUS_SESSION_NAME_TAKEN',
+  /** BETA.11 (ADR 0037): a rename presented an ownership secret to reclaim a name, but it did not
+   *  match the durable owner's stored hash. Distinct from SESSION_NAME_TAKEN so the client knows the
+   *  credential was wrong (not that the name is merely held). Never leaks the secret. */
+  RECLAIM_CREDENTIAL_INVALID: 'XBUS_RECLAIM_CREDENTIAL_INVALID',
   /** A send targeted a session that has expired (>15 days without meaningful
    *  activity); its name was released. FINAL / non-retryable. Beta.4 retention. */
   RECIPIENT_SESSION_EXPIRED: 'XBUS_RECIPIENT_SESSION_EXPIRED',

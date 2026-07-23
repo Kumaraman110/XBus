@@ -8,6 +8,18 @@
        saved choice (or the OS preference) so there is no light/dark flash on load.
        External file only (strict CSP: script-src 'self'; no inline script). -->
   <script src="/theme.js"></script>
+  <!-- BETA.11: importmap so the vendored three.js (same-origin, under /vendor/three — satisfies the
+       strict CSP `script-src 'self'` and works fully offline) resolves the bare `three` specifier
+       that OrbitControls imports. three.js is loaded LAZILY by constellation.js only when the 3D tab
+       is opened. An importmap tag is not executable script, so it is CSP-safe. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/vendor/three/three.module.js",
+      "three/addons/": "/vendor/three/"
+    }
+  }
+  </script>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -47,6 +59,14 @@
     </div>
   </section>
 
+  <!-- BETA.11: tab nav — the dense 2D operator console (default) + a three.js Constellation view.
+       Buttons are wired by tabs.js (external; strict CSP). Keyboard + ARIA: role=tablist/tab. -->
+  <nav class="tabnav" role="tablist" aria-label="Dashboard views">
+    <button class="tabnav-btn is-active" id="tabbtn-console" role="tab" aria-selected="true" aria-controls="tab-console" type="button">Console</button>
+    <button class="tabnav-btn" id="tabbtn-constellation" role="tab" aria-selected="false" aria-controls="tab-constellation" type="button">Constellation <span class="tabnav-badge">3D</span></button>
+  </nav>
+
+  <div id="tab-console" role="tabpanel" aria-labelledby="tabbtn-console">
   <main>
     <!-- Communication console (beta.6 Phase 2): operator ↔ session threads. -->
     <div class="sec-head"><h2>Console</h2><span class="sec-note">operator ↔ session threads</span></div>
@@ -151,6 +171,23 @@
       </div>
     </div>
   </main>
+  </div><!-- /#tab-console -->
+
+  <!-- BETA.11: Constellation — a three.js companion view of the live bus. Hidden until selected;
+       three.js is lazy-imported by constellation.js on first activation. -->
+  <div id="tab-constellation" role="tabpanel" aria-labelledby="tabbtn-constellation" hidden>
+    <div class="sec-head"><h2>Constellation</h2><span class="sec-note">durable identities · state-colored nodes · live flow — a companion view of the same data</span></div>
+    <section class="constellation-panel">
+      <div id="constellation-canvas" class="constellation-canvas" aria-label="3D visualization of durable identities and message flow"></div>
+      <div class="constellation-legend" aria-hidden="true">
+        <span><i style="background:#4ade80"></i> connected · routable</span>
+        <span><i style="background:#fbbf24"></i> durable · disconnected</span>
+        <span><i style="background:#38bdf8"></i> starting</span>
+        <span><i style="background:#8b5cf6"></i> dormant/expired</span>
+      </div>
+      <p class="constellation-note muted">Drag to orbit · scroll to zoom. This is a visualization only — the Console tab remains the operational surface.</p>
+    </section>
+  </div><!-- /#tab-constellation -->
   </div>
 
   <!-- Load order: helper ES modules (collections/timeline/capabilities/prestage) publish their
@@ -163,5 +200,8 @@
   <script type="module" src="/prestage.js"></script>
   <script src="/app.js"></script>
   <script type="module" src="/agents.js"></script>
+  <!-- BETA.11: tab controller (console↔constellation) + the 3D view. tabs.js feeds the latest
+       /api/sessions payload (published by app.js on XBusApi) into Constellation.update(). -->
+  <script type="module" src="/tabs.js"></script>
 </body>
 </html>

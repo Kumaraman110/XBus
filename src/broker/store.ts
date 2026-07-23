@@ -23,6 +23,7 @@ import { ComponentRole } from '../identity/components.js';
 import { ControlsStore } from './controls.js';
 import { resolveReadiness, isReadiness, acceptsInjection, type Readiness, type ReadinessHints } from './readiness.js';
 import { ledgerAppend, type LedgerSubject } from './ledger.js';
+import { classifyLiveness, type LivenessVerdict, type LivenessDeps } from './liveness-proof.js';
 import type { ImportedSessionMeta } from './session-import.js';
 import { OPERATOR_SESSION_ID, OPERATOR_ALIAS, OPERATOR_ACTOR_KIND, OPERATOR_LEDGER_ACTOR } from './operator.js';
 import type { SendInput } from '../protocol/schemas.js';
@@ -160,7 +161,25 @@ export interface SessionAuthority {
    *  refused (wrong secret, or the incumbent still has a live mcp component). The session is
    *  left 'pending' exactly as beta.7. Lets the client/model know the name was not recovered. */
   nameReclaimFailed?: boolean;
+  /** BETA.11 (ADR 0037): a PRECISE reclaim outcome code (replaces the blanket boolean/NAME_TAKEN so
+   *  the client can tell the user exactly what happened). One of the ReclaimReason values, or
+   *  'reclaim-succeeded'. Additive + optional; older clients ignore it. */
+  reclaimOutcome?: ReclaimOutcomeCode;
 }
+
+/**
+ * BETA.11 (ADR 0037): the discriminated reason a reclaim did or did not happen. Surfaced to the
+ * client so a resumed session can distinguish (and the user is never misled by a blanket
+ * XBUS_SESSION_NAME_TAKEN). 'unrelated-owns' is derived at the caller (a valid-format request whose
+ * credential proves a DIFFERENT identity than the name's owner). The activation-axis codes
+ * (mcp-not-loaded / broker-unavailable / incompatible-build) live on the activation/handshake path,
+ * not here — this type is the RECLAIM axis only.
+ */
+export type ReclaimReason = 'not-attempted' | 'credential-missing' | 'credential-invalid' | 'anchor-mismatch' | 'predecessor-live' | 'unrelated-owns';
+export type ReclaimOutcomeCode = 'reclaim-succeeded' | ReclaimReason;
+export type ReclaimOutcome =
+  | { ok: true; canonicalSessionId: string; logicalIdentityId: string }
+  | { ok: false; reason: ReclaimReason };
 
 export interface SendResult {
   messageId: string;
@@ -191,6 +210,12 @@ export class BrokerStore {
     // minted secret predictable, but omitting it ALWAYS yields cryptographic entropy — there is
     // no production code path that reaches a non-CSPRNG default.
     private readonly randomFn: () => string = cryptoCredentialSecret,
+    // BETA.11 (ADR 0037): injectable liveness classifier so the reclaim gate can distinguish a
+    // genuinely-live incumbent from a crashed one whose mcp component row is still 'live' (a hard
+    // crash / OOM / recycled-PID never fires the socket-close handler that flips it to 'closed').
+    // DEFAULT is the production classifyLiveness; tests inject a deterministic verdict. The seam
+    // takes (pid, recordedCreationMs, endpoint) and returns a LivenessVerdict.
+    private readonly classifyLivenessFn: (pid: number, recordedCreationMs: number | null | undefined, endpoint?: string, deps?: LivenessDeps) => LivenessVerdict = classifyLiveness,
   ) {
     this.controls = new ControlsStore(db, clock);
   }
@@ -406,6 +431,36 @@ export class BrokerStore {
   }
 
   /**
+   * BETA.11 (ADR 0037): does `sessionId` hold a mcp component that is PROVABLY still live?
+   *
+   * The raw hasLiveMcp() trusts a component row's state='live'. But a HARD crash / OOM-kill /
+   * recycled-PID never fires daemon.onConnClose (which flips the row to 'closed'), so a genuinely
+   * dead predecessor can keep a stale 'live' row and permanently block a legitimate secret-bearing
+   * reclaim (the beta.11 stale-live defect). This gate cross-checks the OS: it refuses the reclaim
+   * (returns true = "treat as live, do not evict") ONLY when the incumbent is proven_live_broker OR
+   * liveness is inconclusive (fail-CLOSED — never evict a possibly-live incumbent, ADR-0027 D3).
+   * A proven_dead_or_recycled incumbent is NOT blocking → the credential-bearing successor reclaims.
+   * When there is no live-marked mcp row at all, it is trivially not live-blocking (false).
+   */
+  private hasProvenLiveMcp(sessionId: string): boolean {
+    const s = this.db.prepare('SELECT active_epoch AS e, state AS st FROM sessions WHERE session_id=?').get(sessionId) as { e: number; st: string } | undefined;
+    if (s === undefined) return false;
+    const row = this.db.prepare(`SELECT process_id AS pid FROM component_instances WHERE session_id=? AND epoch=? AND role='mcp' AND state='live' ORDER BY connected_at DESC LIMIT 1`).get(sessionId, s.e) as { pid: number } | undefined;
+    if (!row) return false; // no live-marked mcp → not blocking
+    // A CONNECTED session with a live mcp component is authoritatively live — the broker holds its
+    // open connection RIGHT NOW; never second-guess that with an OS probe (the connection IS the
+    // proof, and the recorded pid may legitimately not round-trip in a test/injected context).
+    if (s.st !== 'disconnected') return true;
+    // DISCONNECTED but the mcp row is still 'live' = a graceless exit (hard crash / OOM / recycled-PID)
+    // that never fired daemon.onConnClose. THIS is the beta.11 stale-'live' case: cross-check the OS.
+    // Proven dead/recycled ⇒ NOT blocking (allow the credential-bearing reclaim). Proven-live (an OS
+    // process whose creation-time/handshake still matches) or INCONCLUSIVE ⇒ still blocking (fail-
+    // closed — never evict a possibly-live incumbent, ADR 0027 D3).
+    const verdict = this.classifyLivenessFn(row.pid, null, undefined, {});
+    return verdict !== 'proven_dead_or_recycled';
+  }
+
+  /**
    * BETA.10 (ADR 0036) activation diagnostics — did an mcp component EVER register for this session
    * in its current epoch (ANY state: live, superseded, or closed)? This is the plugin-loaded signal,
    * and it is deliberately NOT `hasLiveMcp` (live-now): at the Stop hook we need "was the plugin ever
@@ -447,8 +502,16 @@ export class BrokerStore {
    * Pure diagnostic: no ownership/routing mutation, no ledger, no message loss. Returns the state +
    * evidence for the caller (hook diagnostic / doctor) and whether THIS call emitted the audit.
    */
-  diagnoseActivationOnce(sessionId: string): ActivationDiagnosis {
+  diagnoseActivationOnce(rawSessionId: string): ActivationDiagnosis {
     return this.db.transaction((): ActivationDiagnosis => {
+      // BETA.11 (ADR 0037): resolve the raw (hook-supplied) session id to its CANONICAL durable id
+      // via physical_session_map BEFORE classifying. A resumed/reclaimed session's hook keys on
+      // CLAUDE_CODE_SESSION_ID while the mcp registered under the canonical id; diagnosing the raw id
+      // would see "no mcp" and emit a FALSE PLUGIN_NOT_LOADED / DEGRADED_HOOK_ONLY on a genuinely
+      // connected session (the session-id-skew defect). Following the map makes diagnosis operate on
+      // the identity the mcp actually registered under. A session with no map edge resolves to itself.
+      const mapped = (this.db.prepare('SELECT canonical_session_id AS c FROM physical_session_map WHERE physical_session_id=?').get(rawSessionId) as { c: string } | undefined)?.c;
+      const sessionId = (mapped && (this.db.prepare('SELECT 1 AS x FROM sessions WHERE session_id=?').get(mapped) as { x: number } | undefined)) ? mapped : rawSessionId;
       const epoch = (this.db.prepare('SELECT active_epoch AS e FROM sessions WHERE session_id=?').get(sessionId) as { e: number } | undefined)?.e ?? null;
       if (epoch === null) {
         // No such session row — treat as plugin-not-loaded (nothing registered at all).
@@ -484,28 +547,39 @@ export class BrokerStore {
   }
 
   /**
-   * Resolve a reclaim attempt. Given a requested name + an ownership secret, decide whether
-   * this registration should be REDIRECTED onto an existing canonical session (the durable
-   * identity that owns the name + inbox). Returns the canonical session id to redirect to, or
-   * null if there is no legitimate reclaim (wrong/absent secret, or a live incumbent — the
-   * caller then falls through to the normal beta.7 claim/pending path).
+   * Resolve a reclaim attempt. Given a requested name + an ownership secret, decide whether this
+   * registration should be REDIRECTED onto an existing canonical session (the durable identity that
+   * owns the name + inbox).
+   *
+   * BETA.11 (ADR 0037): returns a DISCRIMINATED outcome (was bare `| null`) so callers can surface a
+   * PRECISE reason instead of collapsing every non-reclaim into XBUS_SESSION_NAME_TAKEN. It also:
+   *   • gates on PROVEN liveness (hasProvenLiveMcp), so a crashed predecessor whose mcp row is
+   *     stale-'live' no longer blocks a legitimate secret-bearing reclaim.
+   *
+   * Durability note (the "identity keeps expiring / re-authenticate" friction): an EXPIRED identity
+   * is ALREADY reclaimable here without any change — expiry is DORMANCY, not release (ADR 0033): the
+   * reaper keeps name_ownership.name_state='active' with the owner_secret_hash intact, so the
+   * credential holder resumes with NO manual re-auth. A wrong/absent secret still cannot.
    *
    * MUST be called inside the register transaction, BEFORE the row lookup.
    */
-  private resolveReclaim(requested: string | undefined, ownerSecret: string | undefined, newSessionId: string): { canonicalSessionId: string; logicalIdentityId: string } | null {
-    if (requested === undefined || ownerSecret === undefined) return null;
+  private resolveReclaim(requested: string | undefined, ownerSecret: string | undefined, newSessionId: string): ReclaimOutcome {
+    if (requested === undefined && ownerSecret === undefined) return { ok: false, reason: 'not-attempted' };
+    if (ownerSecret === undefined) return { ok: false, reason: 'credential-missing' };
+    if (requested === undefined) return { ok: false, reason: 'anchor-mismatch' };
     let norm: NormalizedSessionName;
-    try { norm = validateSessionName(requested); } catch { return null; }
+    try { norm = validateSessionName(requested); } catch { return { ok: false, reason: 'anchor-mismatch' }; }
     const own = this.db
       .prepare(`SELECT logical_identity_id AS lid, owner_secret_hash AS hash, current_session_id AS csid, name_state AS state FROM name_ownership WHERE normalized_name=? AND name_state IN ('active','pending')`)
       .get(norm.normalized) as { lid: string; hash: string | null; csid: string | null; state: string } | undefined;
-    if (!own || own.hash === null) return null; // no protected owner → normal path (legacy-unprotected)
-    if (own.hash !== BrokerStore.hashSecret(ownerSecret)) return null; // wrong secret → no reclaim
-    if (!own.csid) return null;
-    if (own.csid === newSessionId) return null; // same id already owns it → normal path
-    // Liveness gate: never evict a LIVE incumbent by a cross-id reclaim.
-    if (this.hasLiveMcp(own.csid)) return null;
-    return { canonicalSessionId: own.csid, logicalIdentityId: own.lid };
+    if (!own || own.hash === null) return { ok: false, reason: 'anchor-mismatch' }; // no protected owner (legacy-unprotected/absent)
+    if (own.hash !== BrokerStore.hashSecret(ownerSecret)) return { ok: false, reason: 'credential-invalid' }; // wrong secret
+    if (!own.csid) return { ok: false, reason: 'anchor-mismatch' };
+    if (own.csid === newSessionId) return { ok: false, reason: 'not-attempted' }; // same id already owns it → normal path
+    // Liveness gate: never evict a PROVABLY-live incumbent by a cross-id reclaim (ADR 0027 D3).
+    // Proven-dead / recycled ⇒ allow; proven-live or inconclusive ⇒ refuse (fail-closed).
+    if (this.hasProvenLiveMcp(own.csid)) return { ok: false, reason: 'predecessor-live' };
+    return { ok: true, canonicalSessionId: own.csid, logicalIdentityId: own.lid };
   }
 
   /** Upsert the name_ownership row for a logical identity when a name goes ACTIVE. Mints the
@@ -632,9 +706,12 @@ export class BrokerStore {
         }
       }
       // A fresh secret-bearing reclaim (mcp only): decide the canonical target + liveness gate.
-      const reclaim = role === ComponentRole.MCP
+      // BETA.11 (ADR 0037): resolveReclaim now returns a DISCRIMINATED outcome so the reason a
+      // reclaim did not happen is surfaced precisely (not swallowed into a blanket TAKEN).
+      const reclaimResult: ReclaimOutcome = role === ComponentRole.MCP
         ? this.resolveReclaim(inputRaw.requestedSessionName, inputRaw.ownerSecret, physicalSessionId)
-        : null;
+        : { ok: false, reason: 'not-attempted' };
+      const reclaim = reclaimResult.ok ? reclaimResult : null;
       const reclaimAttempted = inputRaw.ownerSecret !== undefined && inputRaw.requestedSessionName !== undefined;
       // The canonical id this registration targets: a fresh reclaim wins; else a prior mapping;
       // else the physical id itself. A fresh reclaim is a NEW lifecycle (supersede); a mapped
@@ -811,6 +888,11 @@ export class BrokerStore {
       // blocked the redirect. Tell the client the reclaim failed so it does not believe it owns
       // the name. (A legitimate reclaim redirected above, so nameStatus is 'active' there.)
       const nameReclaimFailed = reclaimAttempted && nameStatus.state !== 'active';
+      // BETA.11 (ADR 0037): a PRECISE reclaim outcome — succeeded, or the specific reason it did not.
+      // Only surfaced when a reclaim was attempted (secret+name presented); a plain first-claim has none.
+      const reclaimOutcome: ReclaimOutcomeCode | undefined = reclaimResult.ok
+        ? 'reclaim-succeeded'
+        : (reclaimAttempted && reclaimResult.reason !== 'not-attempted' ? reclaimResult.reason : undefined);
 
       this.audit('COMPONENT_REGISTERED', { sessionId: input.sessionId, instanceId: componentInstanceId, role, epoch, sessionNameState: nameStatus.state });
       return {
@@ -820,6 +902,7 @@ export class BrokerStore {
         logicalIdentityId: this.logicalIdOf(input.sessionId),
         ...(nameStatus.ownerSecret != null ? { ownerSecret: nameStatus.ownerSecret } : {}),
         ...(nameReclaimFailed ? { nameReclaimFailed: true } : {}),
+        ...(reclaimOutcome ? { reclaimOutcome } : {}),
       };
     });
   }
@@ -1082,7 +1165,7 @@ export class BrokerStore {
    * mcp-role only (a hook must not rename). All in one transaction so a failure
    * leaves the prior name binding intact.
    */
-  renameSession(auth: SessionAuthority, rawName: string): SessionNameStatus & { ownerSecret?: string | null } {
+  renameSession(auth: SessionAuthority, rawName: string, ownerSecret?: string): SessionNameStatus & { ownerSecret?: string | null; reclaimOutcome?: ReclaimOutcomeCode } {
     if (auth.role !== ComponentRole.MCP) {
       throw new XBusError(XBusErrorCode.FORBIDDEN_ROLE, 'only the mcp component may name/rename a session');
     }
@@ -1091,10 +1174,39 @@ export class BrokerStore {
       const s = this.db.prepare('SELECT active_epoch, session_name_state AS state, expired_at AS expiredAt FROM sessions WHERE session_id=?').get(auth.sessionId) as { active_epoch: number; state: string; expiredAt: string | null } | undefined;
       if (!s) throw new XBusError(XBusErrorCode.SESSION_NOT_REGISTERED, 'session not registered');
       if (s.active_epoch !== auth.epoch) throw new XBusError(XBusErrorCode.EPOCH_MISMATCH, 'stale epoch; re-register');
+      let reclaimOutcome: ReclaimOutcomeCode | undefined;
       const taken = this.db
         .prepare(`SELECT session_id FROM sessions WHERE normalized_session_name=? AND session_name_state IN ('active','pending') AND session_id<>?`)
         .get(norm.normalized, auth.sessionId) as { session_id: string } | undefined;
-      if (taken) throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display });
+      if (taken) {
+        // BETA.11 (ADR 0037): the manual escape hatch no longer collapses every taken-name into a
+        // blanket XBUS_SESSION_NAME_TAKEN. If the caller presents a VALID owner-secret for the name's
+        // durable identity AND the incumbent is NOT provably live, release the (dead/dormant)
+        // incumbent's name ownership so this session can take it — a credential-gated manual reclaim,
+        // same gates as the register path (never evict a proven-live incumbent, wrong secret refused).
+        const own = this.db
+          .prepare(`SELECT logical_identity_id AS lid, owner_secret_hash AS hash, current_session_id AS csid FROM name_ownership WHERE normalized_name=? AND name_state IN ('active','pending')`)
+          .get(norm.normalized) as { lid: string; hash: string | null; csid: string | null } | undefined;
+        const nowT = this.clock.nowIso();
+        if (ownerSecret === undefined || own?.hash == null) {
+          reclaimOutcome = own?.hash == null ? 'unrelated-owns' : 'credential-missing';
+          throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name already in use', { name: norm.display, reclaimOutcome });
+        }
+        if (own.hash !== BrokerStore.hashSecret(ownerSecret)) {
+          throw new XBusError(XBusErrorCode.RECLAIM_CREDENTIAL_INVALID, 'ownership secret does not match the durable name owner', { name: norm.display, reclaimOutcome: 'credential-invalid' });
+        }
+        if (own.csid && this.hasProvenLiveMcp(own.csid)) {
+          throw new XBusError(XBusErrorCode.SESSION_NAME_TAKEN, 'session name held by a live owner', { name: norm.display, reclaimOutcome: 'predecessor-live' });
+        }
+        // Valid secret + not-proven-live incumbent: release the incumbent's name ownership + its
+        // sessions-row name binding through the ONE release primitive, so the current session can
+        // claim the freed name below (no divergence between the two name representations).
+        this.releaseNameOwnership({ normalizedNameNot: { name: norm.normalized, exceptLogicalId: this.logicalIdOf(auth.sessionId) } }, true, nowT);
+        if (own.csid) {
+          this.db.prepare(`UPDATE sessions SET session_name=NULL, normalized_session_name=NULL, session_name_state='unnamed', updated_at=? WHERE session_id=? AND normalized_session_name=?`).run(nowT, own.csid, norm.normalized);
+        }
+        reclaimOutcome = 'reclaim-succeeded';
+      }
       const now = this.clock.nowIso();
       // Beta.4 (ADR 0012 D6): if this session was EXPIRED (the reaper set expired_at +
       // 'retired' while its connection stayed alive on non-meaningful heartbeats), a
@@ -1137,12 +1249,12 @@ export class BrokerStore {
       // Beta.8 (ADR 0027): mirror the (re)named identity into name_ownership — the durable name
       // authority — in the same transaction; mint a stable owner secret on first protected award
       // (reused, not rotated, on subsequent renames so the client cannot be self-locked-out).
-      const { ownerSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
+      const { ownerSecret: mintedSecret } = this.setNameOwnershipActive(this.logicalIdOf(auth.sessionId), auth.sessionId, norm, now);
       // Beta.10 Stage 0 (ADR-0027 D7): a rename is a committed name-authority transition → hash-chained
       // (was audit()). actor = the renaming session; payload carries the display name only (NEVER the
       // ownerSecret — D7 invariant: the plaintext secret must not appear in ledger_events/audit_events).
       this.ledger(wasExpired ? 'session.expired_resumed_via_rename' : 'session.rename', auth.sessionId, { sessionId: auth.sessionId }, { name: norm.display });
-      return { state: 'active', name: norm.display, ownerSecret };
+      return { state: 'active', name: norm.display, ownerSecret: mintedSecret, ...(reclaimOutcome ? { reclaimOutcome } : {}) };
     });
   }
 
