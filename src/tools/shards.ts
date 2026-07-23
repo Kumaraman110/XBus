@@ -7,15 +7,29 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export interface Shard { name: string; dir: string; }
+export interface Shard {
+  name: string;
+  dir: string;
+  /**
+   * QUALIFICATION FLOORS (beta.12 qualification-correctness). A required shard cannot silently
+   * shrink or disappear: verify:release fails the shard unless it ran at least `minTests` and
+   * `minFiles`, and skipped no more than `maxSkipped`. This catches a required shard vanishing
+   * (glob/rename breakage), a mass .skip that drops the count, or a truncated run — all of which
+   * would otherwise still show a green "0 failed". Values are conservative floors (current counts
+   * are higher); bump them intentionally when the suite grows, never lower them to get green.
+   */
+  minTests: number;
+  minFiles: number;
+  maxSkipped: number;
+}
 
 /** Mutually exclusive, collectively exhaustive shards (relative to repo root). */
 export const SHARDS: Shard[] = [
-  { name: 'unit', dir: 'tests/unit' },
-  { name: 'security', dir: 'tests/security' },
-  { name: 'integration', dir: 'tests/integration' },
-  { name: 'e2e', dir: 'tests/e2e' },
-  { name: 'adapter-sdk', dir: 'tests/adapter-sdk' },
+  { name: 'unit', dir: 'tests/unit', minTests: 558, minFiles: 58, maxSkipped: 0 },
+  { name: 'security', dir: 'tests/security', minTests: 83, minFiles: 11, maxSkipped: 0 },
+  { name: 'integration', dir: 'tests/integration', minTests: 500, minFiles: 80, maxSkipped: 12 },
+  { name: 'e2e', dir: 'tests/e2e', minTests: 6, minFiles: 2, maxSkipped: 0 },
+  { name: 'adapter-sdk', dir: 'tests/adapter-sdk', minTests: 93, minFiles: 4, maxSkipped: 0 },
 ];
 
 /** vitest excludes (must match vitest.config.ts). */

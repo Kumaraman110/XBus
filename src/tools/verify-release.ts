@@ -129,7 +129,17 @@ async function main(): Promise<void> {
       failed = j.numFailedTests ?? 0; skipped = (j.numPendingTests ?? 0) + (j.numTodoTests ?? 0);
     } catch { /* parse error → treat as failure below */ }
     totalFiles += files; totalTests += tests; totalFailed += failed; totalSkipped += skipped;
-    record(`tests:${shard.name}`, r.code === 0 && failed === 0, `${files} files, ${tests} tests, ${passed} passed, ${failed} failed, ${skipped} skipped`);
+    // QUALIFICATION FLOORS (beta.12): a required shard cannot silently shrink/disappear or over-skip.
+    // A green "0 failed" is NOT sufficient — the shard must also have RUN at least its minimum test +
+    // file counts and skipped no more than its ceiling. This makes "security 83/83", "required shards
+    // present", and "controlled skip counts" mechanically enforced, not merely observed.
+    const floorViolations: string[] = [];
+    if (tests < shard.minTests) floorViolations.push(`tests ${tests} < min ${shard.minTests}`);
+    if (files < shard.minFiles) floorViolations.push(`files ${files} < min ${shard.minFiles}`);
+    if (skipped > shard.maxSkipped) floorViolations.push(`skipped ${skipped} > max ${shard.maxSkipped}`);
+    const shardOk = r.code === 0 && failed === 0 && floorViolations.length === 0;
+    const floorNote = floorViolations.length ? ` — FLOOR: ${floorViolations.join(', ')}` : '';
+    record(`tests:${shard.name}`, shardOk, `${files} files, ${tests} tests, ${passed} passed, ${failed} failed, ${skipped} skipped${floorNote}`);
   }
   const cov = shardCoverage(REPO);
   record('tests:combined', totalFailed === 0 && totalFiles === cov.total, `${totalFiles} test files, ${totalTests} tests, ${totalSkipped} skipped, 0 omitted files (manifest total=${cov.total}), 0 duplicated files`);
